@@ -174,14 +174,26 @@ __all__ = [
 # the ~100 small kernels of a verify round) used to slow prefill too, and m1.1
 # turned it off. The mfa_attn native extension can change the limits at run
 # time; decode raises them and every prefill puts the startup values back.
-# MTPLX_DECODE_CB_LIMITS="ops,mb" (e.g. "150,1000") turns it on.
+# On by default on the M1 family (150 ops / 1,000 MB); MTPLX_DECODE_CB_LIMITS
+# ="ops,mb" sets other limits, "0" turns it off.
 
 _startup_cb_limits: tuple[int, int] | None = None
 
 
+#: M1-family default (2026-10-12): decode +3.8% at 2K, +3.2% at 32K.
+M1_DECODE_CB_LIMITS = (150, 1000)
+
+
 def _decode_cb_limits_from_env() -> tuple[int, int] | None:
     raw = (os.environ.get("MTPLX_DECODE_CB_LIMITS") or "").strip()
-    if not raw or raw.lower() in {"0", "off", "false", "no"}:
+    if not raw:
+        try:
+            from .cache_state import m1_long_context_defaults
+
+            return M1_DECODE_CB_LIMITS if m1_long_context_defaults() else None
+        except Exception:
+            return None
+    if raw.lower() in {"0", "off", "false", "no"}:
         return None
     try:
         ops, mb = (int(x) for x in raw.split(","))
