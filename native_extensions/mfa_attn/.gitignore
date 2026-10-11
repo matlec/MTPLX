@@ -1,0 +1,7 @@
+mtplx_mfa_attn/*.so
+mtplx_mfa_attn/*.dylib
+mtplx_mfa_attn/*.metallib
+mtplx_mfa_attn/*.air
+mtplx_mfa_attn/*.ll
+mtplx_mfa_attn/*.metal
+*.egg-info/

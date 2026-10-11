@@ -640,6 +640,14 @@ def sdpa_gqa_mma_prefill(
         return _bail("batch_size")
     if d % 32 or d > 256 or int(keys.shape[3]) != d or int(values.shape[3]) != d:
         return _bail("head_dim")
+    if int(prefix) >= 8192 and int(queries.shape[0]) == 1:
+        from .mfa_prefill import mfa_prefill_attention
+
+        out = mfa_prefill_attention(
+            queries=queries, keys=keys, values=values, prefix=int(prefix), scale=float(scale)
+        )
+        if out is not None:
+            return out
     hk = int(num_kv_heads)
     if hk <= 0 or hq % hk or int(keys.shape[1]) != hk:
         return _bail("gqa_heads")
