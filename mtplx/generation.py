@@ -4677,8 +4677,21 @@ def _prefill_restored_prompt_suffix(
         and 0 < int(stable_prefix_len) - int(cached_tokens) < max(0, len(suffix) - 1)
     ):
         _stable_edge_rel = int(stable_prefix_len) - int(cached_tokens)
+    # The system edge (checkpoint_anchors) gets the same treatment: a restore
+    # that resumed below it captures the recurrent state exactly there.
+    _system_edge = _sink_system_edge(gdn_boundary_sink)
+    _system_edge_rel: int | None = None
+    if (
+        _system_edge is not None
+        and _sink_cuts_forwards(gdn_boundary_sink)
+        and 0 < _system_edge - int(cached_tokens) < max(0, len(suffix) - 1)
+    ):
+        _system_edge_rel = _system_edge - int(cached_tokens)
+    _suffix_edges = tuple(
+        edge for edge in (_stable_edge_rel, _system_edge_rel) if edge is not None
+    )
     fused_max = _small_suffix_fused_max()
-    if 0 < len(suffix) <= fused_max and _stable_edge_rel is None:
+    if 0 < len(suffix) <= fused_max and not _suffix_edges:
         fused_array = mx.array([suffix])
         fused_embeddings = _suffix_chunk_embeddings(fused_array)
         started = time.perf_counter()
@@ -4754,9 +4767,7 @@ def _prefill_restored_prompt_suffix(
             capture_boundaries=shape_boundaries,
             inforward=_inforward_hooks is not None,
             tail_interval=_gdn_boundary_tail_interval(),
-            mandatory_edges=(
-                (_stable_edge_rel,) if _stable_edge_rel is not None else ()
-            ),
+            mandatory_edges=_suffix_edges,
         )
     # PLE n-gram prefill lookahead (MTPLX_QWEN4_PLE_PREFILL_LOOKAHEAD, off by
     # default), wired to the warm loop exactly as to the cold one: chunk k+1's
@@ -5503,6 +5514,7 @@ def _restore_near_prefix_prompt_state(
                     session_bank=session_bank,
                     prompt_len=len(prompt_ids),
                     restore_point=restore_point,
+                    system_edge=_system_prefix_edge(rt, prompt_ids),
                     stable_prefix_len=stable_prefix_len,
                     image_spans=checkpoint_image_spans,
                 )
@@ -5632,6 +5644,52 @@ def _sink_cuts_forwards(sink: Any) -> bool:
     return bool(getattr(sink, "cuts_forwards", True))
 
 
+def _system_prefix_edge(rt: Any, prompt_ids: Sequence[int] | None) -> int | None:
+    """Where the prompt's leading system turn ends, in tokens, or None.
+
+    The position of the second ``<|im_start|>`` when the prompt opens with
+    ``<|im_start|>system``. An agent that compacts its conversation (omp's
+    handoff) sends a new prompt under the same system prompt, which matches
+    the old conversation's entry up to about here; the checkpoint kept at
+    this edge is what lets that prompt skip re-reading the system prompt.
+    ``MTPLX_SYSTEM_EDGE_ANCHOR=0`` turns it off.
+    """
+
+    if not prompt_ids or _env_falsey("MTPLX_SYSTEM_EDGE_ANCHOR"):
+        return None
+    tokenizer = getattr(rt, "tokenizer", None)
+    if tokenizer is None:
+        return None
+    try:
+        im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        system_ids = list(tokenizer.encode("system", add_special_tokens=False))
+    except Exception:
+        return None
+    if not isinstance(im_start, int) or im_start < 0 or not system_ids:
+        return None
+    head = 1 + len(system_ids)
+    if (
+        len(prompt_ids) <= head
+        or int(prompt_ids[0]) != im_start
+        or [int(token) for token in prompt_ids[1:head]] != system_ids
+    ):
+        return None
+    try:
+        edge = list(prompt_ids).index(im_start, head)
+    except ValueError:
+        return None
+    return edge if 0 < edge < len(prompt_ids) - 1 else None
+
+
+def _sink_system_edge(sink: Any) -> int | None:
+    """The system edge a checkpoint sink's plan carries (None for a plain
+    list or a sink built without one)."""
+
+    plan = getattr(sink, "plan", None)
+    edge = getattr(plan, "system_edge", None)
+    return None if edge is None else int(edge)
+
+
 def _retain_boundary_sink(sink: list) -> None:
     """Trim a checkpoint list to its anchors and byte budget (see
     ``mtplx.checkpoint_anchors``). A plain list, one built outside
@@ -5652,15 +5710,16 @@ def _checkpoint_sink(
     session_bank: Any,
     prompt_len: int,
     restore_point: int | None = None,
+    system_edge: int | None = None,
     stable_prefix_len: int | None = None,
     ceiling: int | None = None,
     image_spans: Sequence[tuple[int, int]] = (),
     cuts_forwards: bool = True,
 ) -> CheckpointSink:
     """The checkpoint list one prefill fills, with everything its retention
-    needs known up front: the prompt end, the restore point, the stable edge,
-    the ceiling, an image prompt's image spans and the session bank's byte
-    budget."""
+    needs known up front: the prompt end, the restore point, the system
+    edge, the stable edge, the ceiling, an image prompt's image spans and the
+    session bank's byte budget."""
 
     sink = CheckpointSink(
         records or (),
@@ -5669,6 +5728,7 @@ def _checkpoint_sink(
             prompt_end=max(0, int(prompt_len) - 1),
             tail_backoff=_gdn_boundary_tail_backoff(),
             restore_point=None if restore_point is None else int(restore_point),
+            system_edge=None if system_edge is None else int(system_edge),
             stable_prefix=(
                 None if stable_prefix_len is None else int(stable_prefix_len)
             ),
@@ -7055,6 +7115,7 @@ def restore_or_prefill_prompt_state(
                         session_bank=session_bank,
                         prompt_len=len(prompt_ids),
                         restore_point=restored.entry.prefix_len,
+                        system_edge=_system_prefix_edge(rt, prompt_ids),
                         stable_prefix_len=stable_prefix_len,
                         image_spans=checkpoint_image_spans,
                         cuts_forwards=vision_splice is None,
@@ -7174,6 +7235,7 @@ def restore_or_prefill_prompt_state(
             [],
             session_bank=session_bank,
             prompt_len=len(prompt_ids),
+            system_edge=_system_prefix_edge(rt, prompt_ids),
             stable_prefix_len=stable_prefix_len,
             image_spans=checkpoint_image_spans,
             cuts_forwards=vision_splice is None,
@@ -8356,6 +8418,13 @@ def _prefill(
             and 0 < int(stable_prefix_len) < len(body)
         ):
             _cold_edges = (int(stable_prefix_len),)
+        _system_edge = _sink_system_edge(gdn_boundary_sink)
+        if (
+            _system_edge is not None
+            and shape_boundaries
+            and 0 < _system_edge < len(body)
+        ):
+            _cold_edges = (*_cold_edges, _system_edge)
         _inforward_hooks = (
             _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
             if shape_boundaries
@@ -8505,6 +8574,13 @@ def _prefill_committed_mtp_history_streaming(
         and 0 < int(stable_prefix_len) < len(body)
     ):
         _cold_edges = (int(stable_prefix_len),)
+    _system_edge = _sink_system_edge(gdn_boundary_sink)
+    if (
+        _system_edge is not None
+        and shape_boundaries
+        and 0 < _system_edge < len(body)
+    ):
+        _cold_edges = (*_cold_edges, _system_edge)
     _inforward_hooks = (
         _resolve_inforward_boundary_hooks(rt, vision_splice=vision_splice)
         if shape_boundaries

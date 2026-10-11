@@ -21,6 +21,11 @@ frontier advances, in this order:
 * for an image prompt, the pre-image anchor: the newest checkpoint at or
   before its first image, where a turn that changes that image resumes;
 * the restore point this prefill resumed from (the previous prompt's end);
+* the system edge: where a leading system turn ends. An agent that compacts
+  its conversation starts a new one under the same system prompt, so the new
+  prompt matches the old entry up to here and no further (omp, 2026-10-11:
+  three compactions matched 20.7-21.0K tokens and restored at 512, because
+  the grid had thinned the 16,896 anchor away at 200K);
 * the stable prompt-prefix edge (the turn the tool-continuation hint rides);
 * the newest checkpoint;
 * a fixed absolute grid: the first checkpoint in every ``grid_tokens`` cell,
@@ -96,6 +101,8 @@ class AnchorPlan:
     ``prompt_end``: the last position this prefill can checkpoint (the prompt
     length minus one; None when unknown, and the newest checkpoint stands in).
     ``restore_point``: where the prefill resumed from a stored entry.
+    ``system_edge``: where the prompt's leading system turn ends, when it has
+    one (the position of the next turn's ``<|im_start|>``).
     ``stable_prefix``: the stable prompt-prefix edge, when the prompt has one.
     ``ceiling``: no checkpoint past this position.
     ``image_spans``: ``[start, end)`` of each image's rows in an image prompt;
@@ -111,6 +118,7 @@ class AnchorPlan:
     prompt_end: int | None = None
     tail_backoff: int = DEFAULT_TAIL_BACKOFF
     restore_point: int | None = None
+    system_edge: int | None = None
     stable_prefix: int | None = None
     ceiling: int | None = None
     image_spans: tuple[tuple[int, int], ...] = ()
@@ -215,6 +223,7 @@ def retain_checkpoints(records: Iterable[Any], plan: AnchorPlan) -> list:
         below_limit[-1] if below_limit else None,
         pre_image[-1] if pre_image else None,
         plan.restore_point,
+        plan.system_edge,
         plan.stable_prefix,
         newest,
     ):
