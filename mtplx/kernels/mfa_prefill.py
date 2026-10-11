@@ -16,8 +16,8 @@ A chunk of L queries after P cached keys splits in two:
 
 and the two are merged exactly by their log-sum-exps. M1 Max, 2,048-row
 chunk (2026-10-12): 1.17x at P = 32K, 1.18x at 128K and 196K; outputs within
-fp16 rounding of the fork kernel's (2-3e-4). Below P = 8K the fork kernel is
-as fast and runs alone. ``MTPLX_MFA_PREFILL=0`` turns it off.
+fp16 rounding of the fork kernel's (2-3e-4). Below P = 8K, or for fewer than
+256 new tokens, the fork kernel is as fast or faster and runs alone. ``MTPLX_MFA_PREFILL=0`` turns it off.
 """
 
 from __future__ import annotations
@@ -33,6 +33,12 @@ import mlx.core as mx
 from . import sdpa_gqa_mma as _mma
 
 MIN_PREFIX = 8192
+#: MFA parallelizes over query rows only: a short suffix leaves most of the GPU
+#: idle and pays a pipeline specialization per call (M1 Max, prefix 128K: 16
+#: rows 73 vs 33 ms per layer, 64 rows 80 vs 41; 256 rows 1.13x faster). A
+#: short agent turn on a long conversation kept the fork kernel's TTFT only
+#: with this floor (142K context: 2.2 s against 1.5 s without it).
+MIN_QUERY_ROWS = 256
 _LN2 = math.log(2.0)
 _failed: set[str] = set()
 
@@ -115,6 +121,7 @@ def mfa_prefill_attention(
     prefix = int(prefix)
     if (
         prefix < MIN_PREFIX
+        or q_len < MIN_QUERY_ROWS
         or d != 256
         or queries.dtype != mx.float16
         or keys.dtype != mx.float16

@@ -41,6 +41,8 @@ def test_declines_what_it_does_not_serve(monkeypatch):
     assert mfa_prefill.mfa_prefill_attention(queries=q, keys=k, values=v, prefix=4096, scale=1 / 16) is None
     assert mfa_prefill.mfa_prefill_attention(queries=q, keys=k, values=v, prefix=8192, scale=0.1) is None
     assert mfa_prefill.mfa_prefill_attention(
+        queries=q[:, :, :64], keys=k, values=v, prefix=8192, scale=1 / 16) is None
+    assert mfa_prefill.mfa_prefill_attention(
         queries=q.astype(mx.bfloat16), keys=k.astype(mx.bfloat16), values=v.astype(mx.bfloat16),
         prefix=8192, scale=1 / 16) is None
     monkeypatch.setenv("MTPLX_MFA_PREFILL", "0")
