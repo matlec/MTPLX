@@ -166,3 +166,57 @@ __all__ = [
     "apply_mlx_process_defaults",
     "resolve_command_buffer_mb",
 ]
+
+
+# --- Decode-only command-buffer limits (2026-10-12) -------------------------
+# MLX reads its per-command-buffer limits once, at device creation, so the
+# bound that helps decode (large buffers: fewer commits and GPU gaps between
+# the ~100 small kernels of a verify round) used to slow prefill too, and m1.1
+# turned it off. The mfa_attn native extension can change the limits at run
+# time; decode raises them and every prefill puts the startup values back.
+# MTPLX_DECODE_CB_LIMITS="ops,mb" (e.g. "150,1000") turns it on.
+
+_startup_cb_limits: tuple[int, int] | None = None
+
+
+def _decode_cb_limits_from_env() -> tuple[int, int] | None:
+    raw = (os.environ.get("MTPLX_DECODE_CB_LIMITS") or "").strip()
+    if not raw or raw.lower() in {"0", "off", "false", "no"}:
+        return None
+    try:
+        ops, mb = (int(x) for x in raw.split(","))
+    except ValueError:
+        return None
+    return (ops, mb) if ops > 0 and mb > 0 else None
+
+
+def _cb_ext():
+    try:
+        from .kernels.mfa_prefill import _ext
+
+        return _ext()
+    except Exception:
+        return None
+
+
+def enter_decode_command_buffer_limits() -> None:
+    """Raise MLX's command-buffer limits for a decode loop (opt-in)."""
+    global _startup_cb_limits
+    limits = _decode_cb_limits_from_env()
+    if limits is None:
+        return
+    ext = _cb_ext()
+    if ext is None:
+        return
+    prev = ext.set_command_buffer_limits(*limits)
+    if _startup_cb_limits is None:
+        _startup_cb_limits = tuple(prev)
+
+
+def enter_prefill_command_buffer_limits() -> None:
+    """Put MLX's startup command-buffer limits back before a prefill."""
+    if _startup_cb_limits is None:
+        return
+    ext = _cb_ext()
+    if ext is not None:
+        ext.set_command_buffer_limits(*_startup_cb_limits)

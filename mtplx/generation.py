@@ -4479,6 +4479,9 @@ def _prefill_restored_prompt_suffix(
     mirrors the oMLX-style prefill shape: cache-only or hidden-only chunks for
     the body, then a single final-token logits/hidden pass for decode startup.
     """
+    from .mlx_process_env import enter_prefill_command_buffer_limits as _enter_prefill_cb
+
+    _enter_prefill_cb()
 
     if not suffix:
         raise ValueError("suffix must not be empty")
@@ -8393,6 +8396,9 @@ def _prefill(
     gdn_boundary_sink: list[tuple[int, Any]] | None = None,
     stable_prefix_len: int | None = None,
 ):
+    from .mlx_process_env import enter_prefill_command_buffer_limits as _enter_prefill_cb
+
+    _enter_prefill_cb()
     _reject_unwired_ple_lookahead("_prefill")
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
@@ -8526,6 +8532,9 @@ def _prefill_committed_mtp_history_streaming(
     stable_prefix_len: int | None = None,
     prefill_chunk_size: int | None = None,
 ):
+    from .mlx_process_env import enter_prefill_command_buffer_limits as _enter_prefill_cb
+
+    _enter_prefill_cb()
     if not prompt_ids:
         raise ValueError("prompt_ids must not be empty")
 
@@ -12932,6 +12941,8 @@ def generate_mtpk(
             _sampled_chain_status = (
                 "installed" if _sampled_chain_plan is not None else f"declined:{_sc_reason}"
             )
+    from .mlx_process_env import enter_decode_command_buffer_limits as _enter_decode_cb
+    _enter_decode_cb()
     while len(tokens) < max_tokens:
         if first_round_snapshot is None and step >= 1:
             # Top of iteration 2: the cumulative timers now hold exactly

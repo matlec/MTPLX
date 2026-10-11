@@ -886,6 +886,10 @@ def load(
         if fuse_projections_enabled():
             fuse_report = configure_fused_projections(model)
             logger.info("[proj-fusion] %s", fuse_report)
+        from .prefill_dequant_gemm import enabled as _pdg_enabled, install as _pdg_install
+
+        if _pdg_enabled():
+            logger.info("[prefill-dequant-gemm] %s", _pdg_install())
         from .nax_verify import install_nax_qlinear_patch, nax_env_enabled
 
         if nax_env_enabled():
