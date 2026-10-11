@@ -535,6 +535,12 @@ def _quant_pages_adapter_enabled() -> bool:
     )
 
 
+def _kv_quant_prefill_dequant_enabled() -> bool:
+    """``MTPLX_KV_QUANT_PREFILL_DEQUANT``: run a q8 prefill chunk's attention
+    on fp16 rows dequantized once per layer (M1-family default)."""
+    return _env_flag_default_m1("MTPLX_KV_QUANT_PREFILL_DEQUANT")
+
+
 def _env_flag_default_m1(name: str) -> bool:
     """Tri-state feature flag: explicit env value wins, unset follows the M1 gate."""
     raw = os.environ.get(name, "").strip().lower()
@@ -2171,7 +2177,37 @@ class VllmMetalPagedKVCache:
         prefix = int(self.offset) - int(queries.shape[2])
         if prefix < 0:
             return None
-        from .kernels.sdpa_gqa_mma import sdpa_gqa_mma_prefill_q8_pages
+        from .kernels.sdpa_gqa_mma import (
+            dequant_q8_pages_dense,
+            sdpa_gqa_mma_prefill,
+            sdpa_gqa_mma_prefill_q8_pages,
+        )
+
+        if _kv_quant_prefill_dequant_enabled():
+            # One pass to fp16 rows, then the fp16 kernel: the q8 kernel
+            # dequantizes every key in its inner loop for only 24 query
+            # rows, so it runs at 4.4 TFLOPS against the fp16 kernel's 5.9
+            # (M1 Max, D=256, 2,048-row chunk, 8K-196K prefix, 2026-10-12:
+            # 1.32-1.34x per layer with the dequant pass included; outputs
+            # within 2e-6). The rows live for one layer's attention.
+            rows = int(self.offset)
+            keys = dequant_q8_pages_dense(
+                self.key_cache, self.key_scale_cache, rows, queries.dtype
+            )
+            values = dequant_q8_pages_dense(
+                self.value_cache, self.value_scale_cache, rows, queries.dtype
+            )
+            if keys is not None and values is not None:
+                out = sdpa_gqa_mma_prefill(
+                    queries=queries,
+                    keys=keys,
+                    values=values,
+                    prefix=prefix,
+                    scale=float(scale),
+                    num_kv_heads=int(keys.shape[1]),
+                )
+                if out is not None:
+                    return out
 
         return sdpa_gqa_mma_prefill_q8_pages(
             queries=queries,

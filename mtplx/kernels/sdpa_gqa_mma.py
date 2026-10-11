@@ -686,6 +686,62 @@ def sdpa_gqa_mma_prefill(
     return out
 
 
+_DEQUANT_Q8_PAGES_SOURCE = r"""
+    // One thread per 4 lanes of one (head, token) row: int8 x fp32 row scale,
+    // rounded once to the output type (as an fp16 KV cache would hold it).
+    uint lane4 = thread_position_in_grid.x;
+    uint token = thread_position_in_grid.y;
+    uint head = thread_position_in_grid.z;
+    if (token >= uint(rows[0])) return;
+    const uint d4 = D / 4;
+    const uint src_row = token * HK + head;
+    float s = scales[src_row];
+    char4 q = ((const device char4*)pages)[src_row * d4 + lane4];
+    ((device vec<OutT, 4>*)out)[(head * uint(rows[0]) + token) * d4 + lane4] =
+        vec<OutT, 4>(float4(q) * s);
+"""
+
+
+@lru_cache(maxsize=1)
+def _dequant_q8_pages_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name="mtplx_dequant_q8_pages_dense",
+        input_names=["pages", "scales", "rows"],
+        output_names=["out"],
+        source=_DEQUANT_Q8_PAGES_SOURCE,
+    )
+
+
+def dequant_q8_pages_dense(
+    pages: mx.array, scales: mx.array, rows: int, dtype
+) -> mx.array | None:
+    """The first ``rows`` token rows of q8 token-major pages as a dense
+    ``[1, Hk, rows, D]`` array of ``dtype``, in one pass.
+
+    ``pages`` is ``[num_blocks, block_size, Hk, D]`` int8 and ``scales`` the
+    matching fp32 ``[num_blocks, block_size, Hk, 1]`` row scales. Each value
+    is ``int8 * scale`` in fp32, rounded once to ``dtype``.
+    """
+    kernel = _dequant_q8_pages_kernel()
+    if kernel is None or pages.dtype != mx.int8 or pages.ndim != 4:
+        return None
+    hk, d = int(pages.shape[2]), int(pages.shape[3])
+    rows = int(rows)
+    if d % 4 or rows <= 0 or rows > int(pages.shape[0]) * int(pages.shape[1]):
+        return None
+    (out,) = kernel(
+        inputs=[pages, scales.astype(mx.float32), mx.array([rows], dtype=mx.int32)],
+        template=[("OutT", dtype), ("HK", hk), ("D", d)],
+        grid=(d // 4, rows, hk),
+        threadgroup=(min(d // 4, 64), max(1, 256 // min(d // 4, 64)), 1),
+        output_shapes=[(1, hk, rows, d)],
+        output_dtypes=[dtype],
+    )
+    return out
+
+
 def sdpa_gqa_mma_prefill_q8_pages(
     *,
     queries: mx.array,

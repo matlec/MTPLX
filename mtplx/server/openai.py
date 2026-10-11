@@ -21755,6 +21755,31 @@ def _m1_mma_prefill_scratch_fraction() -> float | None:
     return fraction
 
 
+def _m1_q8_prefill_dequant_bytes(text_args: Any, prompt_tokens: int) -> int:
+    """The fp16 K and V rows one layer's q8 prefill attention dequantizes.
+
+    With ``MTPLX_KV_QUANT_PREFILL_DEQUANT`` (M1-family default) each prefill
+    chunk's attention reads the whole q8 prefix as fp16 rows, one layer at a
+    time: 2 x tokens x KV heads x head_dim x 2 bytes (805 MB at 196K on the
+    27B). Zero without q8 KV, with the flag off, or when the config does not
+    say its KV geometry.
+    """
+    try:
+        from mtplx.cache_state import _kv_quant_prefill_dequant_enabled
+
+        if not _kv_quant_prefill_dequant_enabled():
+            return 0
+        if str(_effective_paged_kv_quantization()) != "q8":
+            return 0
+    except Exception:
+        return 0
+    heads = int(getattr(text_args, "num_key_value_heads", 0) or 0)
+    head_dim = int(getattr(text_args, "head_dim", 0) or 0)
+    if heads <= 0 or head_dim <= 0:
+        return 0
+    return 2 * max(1, int(prompt_tokens)) * heads * head_dim * 2
+
+
 def _admission_scratch_bytes(
     state: Any, *, rows: int, prompt_tokens: int, geometry: _AdmissionGeometry
 ) -> tuple[int, str]:
@@ -21833,9 +21858,14 @@ def _admission_scratch_bytes(
         # Measured on this family (``_DENSE_PREFILL_FIXED_BYTES``).
         fraction = _m1_mma_prefill_scratch_fraction()
         if fraction is not None:
+            dequant = _m1_q8_prefill_dequant_bytes(
+                _runtime_text_args(runtime), prompt_tokens
+            )
             return (
-                max(_DENSE_PREFILL_FIXED_BYTES, int(dense * fraction)) + attention,
-                "geometry_measured_m1_mma" + suffix,
+                max(_DENSE_PREFILL_FIXED_BYTES, int(dense * fraction))
+                + attention
+                + dequant,
+                "geometry_measured_m1_mma" + ("+dequant" if dequant else "") + suffix,
             )
         return dense + attention, "geometry_measured" + suffix
     return max(fixed + per_row * rows, flat_share) + attention, "geometry" + suffix
