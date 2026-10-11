@@ -27,7 +27,7 @@ std::string current_binary_dir() {
 constexpr int kHeadDim = 256;
 constexpr int kBlockRows = 32;     // parallelization block (gid * 32)
 constexpr int kThreads = 128;      // threadgroupSize
-constexpr int kThreadgroupMem = 2560;
+constexpr int kThreadgroupMem = 4096;  // blocks 32 x 64 x 32
 
 // Private-member access through explicit instantiation (the standard allows
 // naming private members in an explicit instantiation's template arguments).

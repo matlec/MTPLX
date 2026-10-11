@@ -15,8 +15,9 @@ A chunk of L queries after P cached keys splits in two:
   also writing its log2 log-sum-exp;
 
 and the two are merged exactly by their log-sum-exps. M1 Max, 2,048-row
-chunk (2026-10-12): 1.17x at P = 32K, 1.18x at 128K and 196K; outputs within
-fp16 rounding of the fork kernel's (2-3e-4). Below P = 8K, or for fewer than
+chunk (2026-10-12, MFA blocks 32 x 64 x 32): 1.28x at P = 8K, 1.33x at 32K,
+1.35-1.37x at 128K-196K (8.3 TFLOPS); outputs within fp16 rounding of the
+fork kernel's (4-5e-4). Below P = 8K, or for fewer than
 256 new tokens, the fork kernel is as fast or faster and runs alone. ``MTPLX_MFA_PREFILL=0`` turns it off.
 """
 
