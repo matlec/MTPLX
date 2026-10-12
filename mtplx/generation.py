@@ -5639,12 +5639,6 @@ def _sink_admits(sink: Any, position: int) -> bool:
     return True if admits is None else bool(admits(int(position)))
 
 
-def _m1_chain_default() -> bool:
-    from .cache_state import m1_long_context_defaults
-
-    return m1_long_context_defaults()
-
-
 def _sink_cuts_forwards(sink: Any) -> bool:
     """Whether the prefill may end forwards or add in-forward captures for
     this sink. False for image prompts' sinks: they record only where the
@@ -12908,17 +12902,15 @@ def generate_mtpk(
     _sampled_chain_status = "off"
     _sampled_chain_rounds = 0
     _sampled_chain_cuts = 0
-    # The dense 27B family's FR-Spec legacy lane runs the chain by default on
-    # the M1 family (its draft logits are the compact row; tokens identical to
-    # the serial reader per seed; draft -2.1 ms at 2K, -1.0 ms at 32K on M1
-    # Max, 2026-10-12). MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN=0 turns it off.
-    _sc_env = (os.environ.get("MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN") or "").strip().lower()
-    _sc_compact_default = (
-        _frspec_legacy_ids is not None
-        and not _sc_env
-        and _m1_chain_default()
-    )
-    if _qwen4_sampled_chain.is_enabled() or _sc_compact_default:
+    # The dense 27B family's FR-Spec legacy lane can run the chain on its
+    # compact row (MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN=1; tokens identical to the
+    # serial reader per seed). Not a default: on M1 Max it is -2.1 ms draft at
+    # 2K and -1.0 ms at 32K, but at 143K draft goes 19.8 -> 32 ms and verify
+    # 122 -> 126 ms (decode -13%), with or without the per-depth pipeline:
+    # with no sync between depths the fp16 MTP KV cache (~0.6 GB at 143K)
+    # cannot be updated in place and is copied every depth (2026-10-12,
+    # attn-s3 S3-11).
+    if _qwen4_sampled_chain.is_enabled():
         _sampled_chain_blockers = [
             _sc_name
             for _sc_name, _sc_blocked in (
