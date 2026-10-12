@@ -1512,6 +1512,29 @@ def _defer_repair_eval() -> bool:
     return env_bool("MTPLX_DEFER_REPAIR_EVAL", default=False)
 
 
+def _chain_early_verify_enabled() -> bool:
+    """``MTPLX_CHAIN_EARLY_VERIFY=1`` (default off): dispatch the verify right
+    after the sampled draft chain, on the device-predicted tokens.
+
+    The verify then queues behind the draft on the GPU instead of waiting for
+    the host to read every depth, rebuild the window and replay the compiled
+    graph (3-4 ms of GPU idle per round at 32K on M1 Max). The host still
+    derives every proposal distribution with the serial reader's float64
+    arithmetic; the token it keeps is the device's. They agree except when a
+    uniform lands within float32 rounding of a cdf edge (0 of 45,765 measured
+    rounds); then the device token is kept with the host's q for it, counted
+    in ``sampled_draft_chain_edge_keeps``.
+
+    Measured on M1 Max at 32K (10 paired seeds, byte-identical output): the
+    Metal trace's GPU idle drops 7.7 -> 4.9 ms per round, but the GPU's own
+    time grows by about as much and the round stays at 94.8 ms, so it stays
+    opt-in.
+    """
+    return str(os.environ.get("MTPLX_CHAIN_EARLY_VERIFY", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _skip_verify_snapshot() -> bool:
     """The single parse of ``MTPLX_SKIP_VERIFY_SNAPSHOT`` (default OFF).
 
@@ -3881,6 +3904,11 @@ class GenerationStats:
     sampled_draft_chain_rounds: int = 0
     sampled_draft_chain_cuts: int = 0
     sampled_draft_chain_status: str = "off"
+    # MTPLX_CHAIN_EARLY_VERIFY: rounds whose verify was dispatched straight
+    # after the chained draft on the device-predicted tokens, and rounds where
+    # the host's float64 pick disagreed with the kept device token.
+    sampled_draft_chain_early_verify_rounds: int = 0
+    sampled_draft_chain_edge_keeps: int = 0
     # Grammar-constrained decoding (response_format). constraint_completed is
     # None when no constraint was active, False when generation ended before
     # the grammar reached a complete document (truncation is never passed off
@@ -12938,6 +12966,9 @@ def generate_mtpk(
     _sampled_chain_status = "off"
     _sampled_chain_rounds = 0
     _sampled_chain_cuts = 0
+    _early_verify_rounds = 0
+    _early_verify_edge_keeps = 0
+    _early_verify_enabled = _chain_early_verify_enabled()
     # The dense 27B family's FR-Spec legacy lane can run the chain on its
     # compact row (MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN=1; tokens identical to the
     # serial reader per seed). Not a default: on M1 Max it is -2.1 ms draft at
@@ -14302,6 +14333,7 @@ def generate_mtpk(
         # stream are those of the serial compact-row reader for every seed.
         # See mtplx/qwen4_draft_device_chain.py.
         _sampled_chain_next_depth = 0
+        _early_verify = None
         if (
             _sampled_chain_plan is not None
             and not used_device_core
@@ -14358,6 +14390,45 @@ def generate_mtpk(
                         # while it runs.
                         mx.async_eval(*_sc_support, _sc_token, _sc_hidden)
             _sc_window = [int(next_token)]
+            if (
+                _sc_pipeline
+                and _early_verify_enabled
+                and verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+                and compiled_verify_bank is not None
+                and a3b_target_prefix_route is None
+                and not qsa_mtp_precompute_active
+                and not _lazy_bonus_verify_enabled()
+                and not target_prefix_verify
+                and constraint is None
+                and _skip_verify_snapshot()
+                and not family_capture_commit_active
+                and int(primary) == int(next_token)
+                and sampler.temperature > 0
+            ):
+                _ev_ids = mx.concatenate(
+                    [mx.array([[int(primary)]], dtype=mx.int32)]
+                    + [_t.reshape(1, 1).astype(mx.int32) for _t in _sc_predicted],
+                    axis=1,
+                )
+                set_native_mlp_context(len(tokens))
+                _ev_started = time.perf_counter()
+                with (
+                    _decode_trunk_scope(vision_splice),
+                    model_forward_kind("target_verify"),
+                    exact_verify(sampler.temperature <= 0),
+                ):
+                    _early_verify = compiled_verify_bank.forward_ar_capture(
+                        _ev_ids,
+                        cache=cache,
+                        return_hidden=True,
+                        hidden_variant=base_hidden_variant,
+                        committed_count=len(tokens) - 1,
+                    )
+                _early_verify_route = compiled_verify_bank.last_dispatch_route(
+                    "compiled_bank"
+                )
+                _early_verify_dispatch_s = time.perf_counter() - _ev_started
+                _early_verify_rounds += 1
             if _sc_pipeline:
                 # The verify window opens with the primary, known already:
                 # warm its n-gram rows under the GPU's draft steps.
@@ -14395,6 +14466,12 @@ def generate_mtpk(
                 _sc_host_token = _qwen4_sampled_chain.host_pick(
                     _sc_q, _sc_uniforms[_sc_depth]
                 )
+                if _early_verify is not None:
+                    # The verify already ran on the device's token: keep it.
+                    _sc_device_token = int(_sc_predicted[_sc_depth].item())
+                    if _sc_device_token != _sc_host_token:
+                        _early_verify_edge_keeps += 1
+                        _sc_host_token = _sc_device_token
                 draft_tokens.append(_sc_host_token)
                 draft_probs.append(_sc_q)
                 draft_hidden_for_update.append(_sc_hiddens[_sc_depth])
@@ -15124,7 +15201,17 @@ def generate_mtpk(
             family_capture_scope,
         ):
             if verify_strategy in {"capture_commit", "graphbank_capture_commit"}:
-                if compiled_verify_bank is not None:
+                if compiled_verify_bank is not None and _early_verify is not None:
+                    # Dispatched after the sampled chain on the same tokens
+                    # (MTPLX_CHAIN_EARLY_VERIFY); the window is unchanged.
+                    if verified_token_count != int(_ev_ids.shape[1]):
+                        raise RuntimeError(
+                            "early verify window does not match the drafted window"
+                        )
+                    verify_logits, verify_hidden, captures = _early_verify
+                    event["verify_route"] = _early_verify_route
+                    event["early_verify_dispatch_s"] = _early_verify_dispatch_s
+                elif compiled_verify_bank is not None:
                     verify_logits, verify_hidden, captures = (
                         compiled_verify_bank.forward_ar_capture(
                             verify_input_array,
@@ -16964,6 +17051,8 @@ def generate_mtpk(
         sampled_draft_chain_rounds=_sampled_chain_rounds,
         sampled_draft_chain_cuts=_sampled_chain_cuts,
         sampled_draft_chain_status=_sampled_chain_status,
+        sampled_draft_chain_early_verify_rounds=_early_verify_rounds,
+        sampled_draft_chain_edge_keeps=_early_verify_edge_keeps,
         graphbank={
             **(graphbank.to_dict() if graphbank is not None else {}),
             **(

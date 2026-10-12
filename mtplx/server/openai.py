@@ -17942,6 +17942,12 @@ def _metrics_envelope(
             stats.get("sampled_draft_chain_rounds") or 0
         ),
         "sampled_draft_chain_cuts": int(stats.get("sampled_draft_chain_cuts") or 0),
+        "sampled_draft_chain_early_verify_rounds": int(
+            stats.get("sampled_draft_chain_early_verify_rounds") or 0
+        ),
+        "sampled_draft_chain_edge_keeps": int(
+            stats.get("sampled_draft_chain_edge_keeps") or 0
+        ),
         "sampled_draft_chain_status": stats.get("sampled_draft_chain_status"),
         "verify_joint_eval_time_s": float(stats.get("verify_joint_eval_time_s") or 0.0),
         "verify_target_distribution_time_s": float(
@@ -25695,6 +25701,8 @@ PUBLIC_MTPLX_STATS_KEYS = (
     "sampled_draft_chain_rounds",
     "sampled_draft_chain_cuts",
     "sampled_draft_chain_status",
+    "sampled_draft_chain_early_verify_rounds",
+    "sampled_draft_chain_edge_keeps",
     # Grammar-constrained decoding (response_format) counters.
     "constraint_active",
     "constraint_completed",
