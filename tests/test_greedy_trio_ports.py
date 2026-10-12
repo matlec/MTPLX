@@ -67,6 +67,9 @@ def test_trio_fence_disarms_chain_above_context(monkeypatch, ):
     stays identical — the fence only routes, never changes tokens), and the
     graphbank stamp must read False for the fenced request."""
     _clear(monkeypatch)
+    # The paged-offsets stamp follows the trio fence off the M1 family.
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "0")
+    monkeypatch.delenv("MTPLX_PAGED_OFFSETS_MAX_CONTEXT", raising=False)
     monkeypatch.setenv("MTPLX_GREEDY_DRAFT_CHAIN", "1")
     monkeypatch.setenv("MTPLX_GREEDY_TRIO_MAX_CONTEXT", "1")
     fenced, _ = _run_tiny_mtpk(max_tokens=8, mtp_token=1)
@@ -90,6 +93,23 @@ def test_trio_fence_disarms_chain_above_context(monkeypatch, ):
         for e in (unfenced.stats.events or [])
         for d in e.get("drafts", [])
     ), "fence=0 must leave the chain lane armed"
+
+
+def test_paged_offsets_fence_is_its_own_on_m1(monkeypatch):
+    """M1 family: the #318 offsets read stays batched past the trio fence
+    (MTPLX_PAGED_OFFSETS_MAX_CONTEXT overrides); tokens never change."""
+    _clear(monkeypatch)
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "1")
+    monkeypatch.delenv("MTPLX_PAGED_OFFSETS_MAX_CONTEXT", raising=False)
+    monkeypatch.setenv("MTPLX_GREEDY_TRIO_MAX_CONTEXT", "1")
+    unfenced, _ = _run_tiny_mtpk(max_tokens=8, mtp_token=1)
+    import mtplx.graphbank as gb
+
+    assert gb.paged_offsets_context_ok() is True
+    monkeypatch.setenv("MTPLX_PAGED_OFFSETS_MAX_CONTEXT", "1")
+    fenced, _ = _run_tiny_mtpk(max_tokens=8, mtp_token=1)
+    assert gb.paged_offsets_context_ok() is False
+    assert list(fenced.tokens) == list(unfenced.tokens)
 
 
 def _fingerprint(out):

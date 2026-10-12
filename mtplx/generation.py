@@ -328,6 +328,33 @@ def _trio_max_context() -> int:
         return 12288
 
 
+def _paged_offsets_max_context(trio_fence: int) -> int:
+    """Prompt-token fence for the #318 batched paged-offset read (0 = none).
+
+    ``MTPLX_PAGED_OFFSETS_MAX_CONTEXT`` sets it on its own. Unset, the M1
+    family has no fence: past the trio fence each full-attention layer's
+    offset was read in its own submit-and-wait (16 x 0.28 ms per round at
+    32K on M1 Max, GPU idle between verify and the next draft). Elsewhere
+    it follows the trio fence.
+    """
+    raw = os.environ.get("MTPLX_PAGED_OFFSETS_MAX_CONTEXT", "").strip().lower()
+    if raw in ("0", "off", "none", "unlimited"):
+        return 0
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return trio_fence
+    try:
+        from .cache_state import m1_long_context_defaults
+
+        if m1_long_context_defaults():
+            return 0
+    except Exception:
+        pass
+    return trio_fence
+
+
 def _env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {
         "1",
@@ -12755,7 +12782,10 @@ def generate_mtpk(
     # for the paged-offsets read. Receipts in _trio_max_context's docstring.
     _trio_fence = _trio_max_context()
     _trio_context_ok = _trio_fence <= 0 or len(prompt_ids) < _trio_fence
-    set_paged_offsets_context_ok(_trio_context_ok)
+    _offsets_fence = _paged_offsets_max_context(_trio_fence)
+    set_paged_offsets_context_ok(
+        _offsets_fence <= 0 or len(prompt_ids) < _offsets_fence
+    )
     # Greedy-chain eligibility (#313 port), PRE-BOUND: every term here is
     # request-invariant, so it is decided once — the decode loop's prebound-
     # policy-surface contract (test_decode_loop_uses_prebound_policy_surfaces)
