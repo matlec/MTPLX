@@ -44,3 +44,5 @@ benchmark_outputs/
 .hf-home/
 .claude/
 .devspace/
+.build-venv/
+.build-*.log
