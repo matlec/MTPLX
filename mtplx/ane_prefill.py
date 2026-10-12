@@ -423,8 +423,10 @@ def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ss
     # Past MAX_CONTEXT keys one half's attention is a ~1 s GPU command at 128K, and with the ANE reading
     # memory beside it macOS can abort it for stalling the display (kIOGPUCommandBufferCallbackError
     # ImpactingInteractivity, seen once at 140K, 2026-10-13). There the gain is small anyway (attention
-    # dominates), so long prefixes take the sequential split, whose attention runs alone.
-    limit = int(os.environ.get("MTPLX_ANE_PREFILL_PIPELINE_MAX_CONTEXT", "65536"))
+    # dominates), so long prefixes take the sequential split, whose attention runs alone. The quarter
+    # split past the limit (~0.5 s commands) tripped it too at ~130K on a low battery, so the limit is
+    # 32K, where a half's attention stays near 0.25 s.
+    limit = int(os.environ.get("MTPLX_ANE_PREFILL_PIPELINE_MAX_CONTEXT", "32768"))
     try:
         offset = int(getattr(cache[inner.fa_idx], "offset", 0) or 0)
     except Exception:
