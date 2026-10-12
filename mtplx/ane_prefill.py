@@ -115,6 +115,21 @@ def _row_scales(self: Any, L: dict[str, Any]) -> list[mx.array]:
     return cached
 
 
+def _disable(exc: BaseException) -> None:
+    """Retire the ANE for the life of the process after a failure (the GPU computes its share)."""
+
+    _STATE["disabled"] = True
+    _STATE["error"] = f"{type(exc).__name__}: {exc}"
+    logger.warning("[ane-prefill] ANE disabled after a failure, the GPU runs the whole FFN: %s", _STATE["error"])
+
+
+def _gpu_tail(L: dict[str, Any], x2: mx.array) -> mx.array:
+    """The ANE's channels of the FFN, computed on the GPU (exact)."""
+
+    h = nn.silu(_qmm(x2, L["ga"])) * _qmm(x2, L["ua"])
+    return _qmm(h, L["da"])
+
+
 def install_gdn(model: Any) -> dict[str, Any]:
     """GDN in-projections split: the GPU computes in_proj_qkv's leading rows while the ANE computes its
     trailing ``MTPLX_ANE_PREFILL_GDN_QKV_TAIL`` rows (default 2048) and all of in_proj_z, in one program
@@ -218,7 +233,7 @@ def install(model: Any = None) -> dict[str, Any]:
 
     def call(self: Any, x: mx.array) -> mx.array:
         rows = math.prod(x.shape[:-1])
-        if rows < MIN_ROWS or not hasattr(self.gate_proj, "scales"):
+        if rows < MIN_ROWS or _STATE.get("disabled") or not hasattr(self.gate_proj, "scales"):
             return orig(self, x)
         H = x.shape[-1]
         inter = self.gate_proj.weight.shape[0]
@@ -226,7 +241,11 @@ def install(model: Any = None) -> dict[str, Any]:
         if ffn is None:
             with _LOCK:
                 if _STATE["ffn"] is None:
-                    _STATE["ffn"] = ext.AneFfn(H, channels, [512, 1024, 1536, 2048], w8=_w8())
+                    try:
+                        _STATE["ffn"] = ext.AneFfn(H, channels, [512, 1024, 1536, 2048], w8=_w8())
+                    except Exception as exc:
+                        _disable(exc)
+                        return orig(self, x)
                     logger.info("[ane-prefill] program ready (%.1f s)", _STATE["ffn"].compile_seconds)
                 ffn = _STATE["ffn"]
         if rows > ffn.max_rows:
@@ -255,7 +274,11 @@ def install(model: Any = None) -> dict[str, Any]:
         h = nn.silu(_qmm(x2, L["g"])) * _qmm(x2, L["u"])
         y_gpu = _qmm(h, L["d"])
         mx.async_eval(y_gpu)
-        ffn.run(rows)
+        try:
+            ffn.run(rows)
+        except Exception as exc:  # the ANE refused or stalled: this call and every later one on the GPU
+            _disable(exc)
+            return (y_gpu + _gpu_tail(L, x2)).reshape(x.shape)
         if trace:
             t3 = _time.perf_counter()
             mx.eval(y_gpu)
@@ -339,14 +362,15 @@ def _ffn_begin(ffn: Any, layer: Any, h2: mx.array, channels: int):
 
     th = _th.Thread(target=run, name="mtplx-ane-ffn", daemon=True)
     th.start()
-    return th, err, ffn, y_gpu, rows, h2
+    return th, err, ffn, y_gpu, rows, h2, L, x2
 
 
 def _ffn_end(handle: tuple) -> mx.array:
-    th, err, ffn, y_gpu, rows, h2 = handle
+    th, err, ffn, y_gpu, rows, h2, L, x2 = handle
     th.join()
     if err:
-        raise err[0]
+        _disable(err[0])
+        return h2 + (y_gpu + _gpu_tail(L, x2)).reshape(h2.shape)
     H = h2.shape[-1]
     o = ffn.output()
     y = y_gpu + (o[:H, :rows] * o[H : H + 1, :rows]).T.astype(y_gpu.dtype)
@@ -357,7 +381,7 @@ def _ffn_end(handle: tuple) -> mx.array:
 def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ssm_mask: Any) -> mx.array | None:
     """The decoder stack over one prefill chunk as two pipelined halves; None when it does not apply."""
 
-    if not pipeline_enabled() or cache is None or h.shape[0] != 1:
+    if not pipeline_enabled() or _STATE.get("disabled") or cache is None or h.shape[0] != 1:
         return None
     S = h.shape[1]
     half = (S // 2 // 32) * 32
@@ -369,7 +393,11 @@ def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ss
     if not all(hasattr(l.mlp, "gate_proj") and hasattr(l.mlp.gate_proj, "scales") for l in layers):
         return None
     channels = int(os.environ.get("MTPLX_ANE_PREFILL_PIPELINE_CHANNELS", "10240"))
-    ffa, ffb = _ffn_pair(h.shape[-1], channels)
+    try:
+        ffa, ffb = _ffn_pair(h.shape[-1], channels)
+    except Exception as exc:
+        _disable(exc)
+        return None
     ha, hb = h[:, :half], h[:, half:]
     pend_b = None
     for layer, c in zip(layers, cache):
