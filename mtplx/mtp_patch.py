@@ -846,6 +846,15 @@ def inject_mtp_support(
 
     mtp = _MTPModule(args, n_layers)
     _env_mtp_bits = os.environ.get("MTPLX_MTP_QUANT_BITS", "").strip()
+    if not _env_mtp_bits:
+        # M1 family default (2026-10-13): an fp16 sidecar's layer is 0.85 GB a draft step reads;
+        # q8 halves it (draft -3 ms/round, decode +0.9% at 2K, +1.9% at 32K on an M1 Max).
+        from .cache_state import m1_long_context_defaults
+
+        if m1_long_context_defaults():
+            _env_mtp_bits = "8"
+    if _env_mtp_bits in {"0", "16", "off"}:
+        _env_mtp_bits = ""
     if _env_mtp_bits and not contract.mtp_prequantized and contract.mtp_quant_bits is None:
         # Experiment switch: quantize an fp16/bf16 MTP sidecar at load. The draft
         # only proposes; speculative acceptance keeps the target distribution.

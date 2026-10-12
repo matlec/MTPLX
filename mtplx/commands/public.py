@@ -1282,7 +1282,15 @@ def resolved_default_profile_name_for_ref(model_ref: str | Path | None) -> str:
 
 
 def _artifact_recommended_profile(model_ref: str | Path | None) -> str | None:
-    """Read a local Forge artifact's measured launch profile, if present."""
+    """Read a local Forge artifact's measured launch profile, if present.
+
+    On the M1 family (fork default, 2026-10-13) a dense 4- or 8-bit affine
+    artifact with an MTP head resolves to turbo even when its stamp says
+    sustained: turbo's verify kernels (vk_k) and compiled verify cover exactly
+    those weights, and forged artifacts were stamped sustained only because
+    they are not on the upstream allow-list (huihui 27B: depth 3 turbo 27-33
+    tok/s vs sustained depth 2 20-22 at 2K on an M1 Max).
+    """
 
     if model_ref is None:
         return None
@@ -1290,7 +1298,29 @@ def _artifact_recommended_profile(model_ref: str | Path | None) -> str | None:
     if not isinstance(runtime, dict):
         return None
     profile = str(runtime.get("recommended_profile") or "").strip().lower()
+    if profile != "turbo" and _m1_dense_turbo_eligible(model_ref):
+        return "turbo"
     return profile if profile in {"stable", "sustained", "turbo"} else None
+
+
+def _m1_dense_turbo_eligible(model_ref: str | Path) -> bool:
+    if os.environ.get("MTPLX_M1_TURBO_DEFAULT", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    try:
+        from mtplx.cache_state import m1_long_context_defaults
+
+        if not m1_long_context_defaults():
+            return False
+        cfg = json.loads((Path(str(model_ref)).expanduser() / "config.json").read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+    if int(text.get("num_experts", 0) or 0) > 0 or "moe" in str(cfg.get("model_type", "")).lower():
+        return False
+    quant = cfg.get("quantization") or cfg.get("quantization_config") or {}
+    if not isinstance(quant, dict):
+        return False
+    return int(quant.get("bits", 0) or 0) in (4, 8) and str(quant.get("mode", "affine") or "affine") == "affine"
 
 
 def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None:

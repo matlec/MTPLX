@@ -2363,6 +2363,12 @@ def _prefill_chunk_size(context_tokens: int | None = None) -> int:
             chunk = max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_DENSE", 2048))
         else:
             chunk = max(1, _env_int("MTPLX_PREFILL_CHUNK_SIZE_REPAGE", 2048))
+        if chunk == 2048:
+            from .ane_prefill import wants_wide_chunks
+
+            if wants_wide_chunks():
+                # The ANE pipeline runs a chunk as two 2,048-row halves.
+                chunk = 4096
         return _long_context_prefill_chunk(chunk, context_tokens)
     try:
         return max(1, int(raw))

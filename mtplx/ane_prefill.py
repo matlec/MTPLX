@@ -41,7 +41,16 @@ _LOCK = threading.Lock()
 
 
 def enabled() -> bool:
-    return os.environ.get("MTPLX_ANE_PREFILL", "0") == "1"
+    """``MTPLX_ANE_PREFILL``: "1"/"0" force; unset follows the M1-family default (on)."""
+
+    raw = (os.environ.get("MTPLX_ANE_PREFILL") or "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    from .cache_state import m1_long_context_defaults
+
+    return m1_long_context_defaults()
 
 
 def _ext():
@@ -346,7 +355,13 @@ def stats() -> dict[str, Any]:
 
 
 def pipeline_enabled() -> bool:
-    return enabled() and os.environ.get("MTPLX_ANE_PREFILL_PIPELINE", "0") == "1"
+    return enabled() and os.environ.get("MTPLX_ANE_PREFILL_PIPELINE", "1") != "0"
+
+
+def wants_wide_chunks() -> bool:
+    """The pipeline splits a chunk in halves: an automatic chunk width becomes 4,096 rows."""
+
+    return bool(_STATE.get("installed")) and not _STATE.get("disabled") and pipeline_enabled()
 
 
 def _ffn_pair(H: int, channels: int):

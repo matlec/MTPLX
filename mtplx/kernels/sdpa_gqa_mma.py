@@ -449,7 +449,9 @@ def _wide_simdgroups(q_len: int, gqa: int, ceiling: int) -> int:
     split count starves the GPU (4K ceiling: 0.32 -> 0.47 ms per layer).
     """
 
-    nsg = _env_int("MTPLX_GQA_MMA_NSG", 4)
+    from ..cache_state import m1_long_context_defaults
+
+    nsg = _env_int("MTPLX_GQA_MMA_NSG", 8 if m1_long_context_defaults() else 4)
     if nsg != 8 or q_len < 2 or gqa * q_len > 32 or int(ceiling) < 16384:
         return 4
     return 8
