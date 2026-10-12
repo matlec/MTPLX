@@ -257,8 +257,12 @@ def install(model: Any = None) -> dict[str, Any]:
                     logger.info("[ane-prefill] program ready (%.1f s)", _STATE["ffn"].compile_seconds)
                 ffn = _STATE["ffn"]
         if rows > ffn.max_rows:
-            _STATE["fallbacks"] += 1
-            return orig(self, x)
+            # The FFN is row-wise: a wide chunk (4096 rows with the pipeline's chunk size, past its
+            # context limit) runs as blocks the program holds.
+            flat = x.reshape(rows, H)
+            step = ffn.max_rows
+            parts = [call(self, flat[a : a + step][None]) for a in range(0, rows, step)]
+            return mx.concatenate([p.reshape(-1, H) for p in parts], axis=0).reshape(x.shape)
         cut = inter - channels
         L = _layer(self, cut)
         trace = os.environ.get("MTPLX_ANE_PREFILL_TRACE") == "1"

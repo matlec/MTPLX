@@ -82,3 +82,13 @@ def test_failure_falls_back_to_the_gpu(installed, monkeypatch):
     assert err < 1e-2, err
     # later calls run the stock FFN
     assert mx.array_equal(mlp(x), _exact(mlp, x))
+
+
+def test_wide_chunks_run_in_blocks(installed):
+    mlp = _mlp()
+    x = mx.random.normal((1, 3000, 5120)).astype(mx.float16)
+    ref = _exact(mlp, x).astype(mx.float32)
+    out = mlp(x).astype(mx.float32)
+    assert out.shape == ref.shape
+    err = float(mx.sqrt(mx.mean((out - ref) ** 2)) / mx.sqrt(mx.mean(ref ** 2)))
+    assert err < 0.03, err
