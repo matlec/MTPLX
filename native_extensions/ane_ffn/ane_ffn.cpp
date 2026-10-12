@@ -94,6 +94,102 @@ kernel void ane_prep_w8(const device uint* w [[buffer(0)]], const device half* s
   const float n = 0.04419417382415922f / max(float(rs[row]), 1e-12f);
   for (uint i = t; i < 512; i += 256) dst[(q.w + row) * q.x + q.y + blk * 512 + i] = char(clamp(rint(v[i] * n), -127.0f, 127.0f));
 }
+
+// Faster weight prep: 64 threads per 512-block, 8 values each. Stages 1,2,4 in registers on 8 consecutive
+// values, then a transpose to stride 8 (stages 8,16,32) and to stride 64 (stages 64,128,256).
+template <typename OUT>
+inline void prep_block(const device uint* w, const device half* sc, const device half* bi, device OUT* dst,
+                       constant uint4& p, constant uint4& q, float post, uint row, uint blk, uint t,
+                       threadgroup float* v, bool to_int8) {
+  const uint per = 32 / p.z, words = p.x / per, groups = p.x / p.w;
+  float r[8];
+  const uint col0 = p.y + blk * 512 + t * 8;
+  const float s = float(sc[row * groups + col0 / p.w]), b = float(bi[row * groups + col0 / p.w]);
+  if (p.z == 4) {
+    const uint word = w[row * words + col0 / 8];
+    for (uint j = 0; j < 8; ++j) r[j] = float((word >> (4 * j)) & 15u) * s + b;
+  } else {
+    const uint w0 = w[row * words + col0 / 4], w1 = w[row * words + col0 / 4 + 1];
+    for (uint j = 0; j < 4; ++j) { r[j] = float((w0 >> (8 * j)) & 255u) * s + b; r[4 + j] = float((w1 >> (8 * j)) & 255u) * s + b; }
+  }
+  // stages 1, 2, 4 (within the 8 consecutive values)
+  for (uint h = 1; h < 8; h <<= 1)
+    for (uint j = 0; j < 8; ++j) if ((j & h) == 0) { const float a = r[j], c = r[j + h]; r[j] = a + c; r[j + h] = a - c; }
+  for (uint j = 0; j < 8; ++j) v[t * 8 + j] = r[j];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // stride 8: thread holds base + 8k, base = (t % 8) + (t / 8) * 64
+  const uint b8 = (t % 8) + (t / 8) * 64;
+  for (uint k = 0; k < 8; ++k) r[k] = v[b8 + 8 * k];
+  for (uint h = 1; h < 8; h <<= 1)
+    for (uint j = 0; j < 8; ++j) if ((j & h) == 0) { const float a = r[j], c = r[j + h]; r[j] = a + c; r[j + h] = a - c; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint k = 0; k < 8; ++k) v[b8 + 8 * k] = r[k];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // stride 64: thread holds t + 64k
+  for (uint k = 0; k < 8; ++k) r[k] = v[t + 64 * k];
+  for (uint h = 1; h < 8; h <<= 1)
+    for (uint j = 0; j < 8; ++j) if ((j & h) == 0) { const float a = r[j], c = r[j + h]; r[j] = a + c; r[j + h] = a - c; }
+  device OUT* o = dst + (q.w + row) * q.x + q.y + blk * 512;
+  for (uint k = 0; k < 8; ++k) {
+    const float val = r[k] * post;
+    if (to_int8) o[t + 64 * k] = OUT(clamp(rint(val), -127.0f, 127.0f));
+    else o[t + 64 * k] = OUT(val);
+  }
+}
+kernel void ane_prep_w2(const device uint* w [[buffer(0)]], const device half* sc [[buffer(1)]],
+                        const device half* bi [[buffer(2)]], device half* dst [[buffer(3)]],
+                        constant uint4& p [[buffer(4)]], constant uint4& q [[buffer(5)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
+  threadgroup float v[512];
+  if (tg.y >= q.z) return;
+  prep_block<half>(w, sc, bi, dst, p, q, 0.04419417382415922f, tg.y, tg.x, t, v, false);
+}
+kernel void ane_prep_w8b(const device uint* w [[buffer(0)]], const device half* sc [[buffer(1)]],
+                         const device half* bi [[buffer(2)]], device char* dst [[buffer(3)]],
+                         constant uint4& p [[buffer(4)]], constant uint4& q [[buffer(5)]],
+                         const device half* rs [[buffer(6)]],
+                         uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
+  threadgroup float v[512];
+  if (tg.y >= q.z) return;
+  prep_block<char>(w, sc, bi, dst, p, q, 0.04419417382415922f / max(float(rs[tg.y]), 1e-12f), tg.y, tg.x, t, v, true);
+}
+// Input prep: one threadgroup (256 threads) per token row of H = 5120 fp16 values: rotate every 512-block
+// (orthonormal Walsh-Hadamard), take the row's peak, quantize to int8 (x / (peak/127)) and write it
+// transposed into the segment surfaces (dst_k[j * ld + r]), and the token scale (peak/127 * 128) to tx.
+kernel void ane_prep_x(const device half* x [[buffer(0)]], device char* d0 [[buffer(1)]], device char* d1 [[buffer(2)]],
+                       device half* txo [[buffer(3)]], constant uint4& p [[buffer(4)]],
+                       uint r [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]],
+                       uint sl [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  // p: rows R, ld (bytes per surface row), 0, 0. H fixed at 5120 = 10 blocks; thread t owns 20 values.
+  threadgroup float v[5120];
+  threadgroup float pk[8];
+  if (r >= p.x) return;
+  for (uint i = t; i < 5120; i += 256) v[i] = float(x[r * 5120 + i]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint h = 1; h < 512; h <<= 1) {
+    for (uint pidx = t; pidx < 2560; pidx += 256) {  // 10 blocks x 256 pairs
+      const uint blk = pidx / 256, q = pidx % 256;
+      const uint i = blk * 512 + (q / h) * 2 * h + (q % h);
+      const float a = v[i], c = v[i + h];
+      v[i] = a + c; v[i + h] = a - c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  float m = 0.0f;
+  for (uint i = t; i < 5120; i += 256) m = max(m, fabs(v[i]));
+  m = simd_max(m);
+  if (sl == 0) pk[sg] = m;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float peak = 0.0f;
+  for (uint k = 0; k < 8; ++k) peak = max(peak, pk[k]);
+  peak = max(peak * 0.04419417382415922f, 1e-6f);
+  const float inv = 127.0f / peak, n = 0.04419417382415922f;
+  for (uint i = t; i < 5120; i += 256) {
+    const char qv = char(clamp(rint(v[i] * n * inv), -127.0f, 127.0f));
+    if (i < 2560) d0[i * p.y + r] = qv; else d1[(i - 2560) * p.y + r] = qv;
+  }
+  if (t == 0) txo[r] = half(peak / 127.0f * 128.0f);
+}
 )";
 }  // namespace
 
@@ -233,6 +329,13 @@ mx::array AneFfn::stage_weights_q(const std::vector<mx::array>& g, const std::ve
   return mx::array({1}, mx::int32, prim, std::move(in));
 }
 
+mx::array AneFfn::stage_x(const mx::array& x) {
+  auto s = mx::default_stream(mx::Device::gpu);
+  auto prim = std::make_shared<AneStage>(s, this, false);
+  prim->prep_x_ = true;
+  return mx::array({1}, mx::int32, prim, {mx::contiguous(mx::astype(x, mx::float16, s), false, s)});
+}
+
 mx::array AneFfn::stage_input(const mx::array& xq, const mx::array& tx) {
   auto s = mx::default_stream(mx::Device::gpu);
   return mx::array({1}, mx::int32, std::make_shared<AneStage>(s, this, false),
@@ -269,12 +372,26 @@ void AneStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& enc = mx::metal::get_command_encoder(s);
-  auto* lib = d.get_library("mtplx_ane_stage2", [] { return std::string(kStageSource); });
+  auto* lib = d.get_library("mtplx_ane_stage3", [] { return std::string(kStageSource); });
+  if (prep_x_) {
+    AneFfn& f = *ffn_;
+    const uint32_t R = in[0].shape(0);
+    if (f.hidden_ != 5120 || f.x_.size() != 2) throw std::runtime_error("ane_prep_x: hidden 5120 only");
+    enc.set_compute_pipeline_state(d.get_kernel("ane_prep_x", lib));
+    const uint32_t p[4] = {R, f.x_[0].surface->stride, 0, 0};
+    enc.set_input_array(in[0], 0);
+    enc.set_buffer(f.x_[0].buffer, 1);
+    enc.set_buffer(f.x_[1].buffer, 2);
+    enc.set_buffer(f.tx_.buffer, 3);
+    enc.set_bytes(p, 4, 4);
+    enc.dispatch_threadgroups(MTL::Size(R, 1, 1), MTL::Size(256, 1, 1));
+    return;
+  }
   if (quantized_) {
     // in: gate (w, scales, biases) [C, H], up likewise, down (w, scales, biases) [H, C] (already the ANE's slices);
     // with int8 weights also the rotated rows' scales of gate [C], up [C], down [H].
     AneFfn& f = *ffn_;
-    auto* kp = d.get_kernel(f.w8_ ? "ane_prep_w8" : "ane_prep_w", lib);
+    auto* kp = d.get_kernel(f.w8_ ? "ane_prep_w8b" : "ane_prep_w2", lib);
     enc.set_compute_pipeline_state(kp);
     const uint32_t H = f.hidden_, C = f.channels_;
     auto prep = [&](int base, uint32_t rows, uint32_t in_dim, uint32_t col0, const AneFfn::Target& dst, uint32_t blocks) {
@@ -287,7 +404,7 @@ void AneStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>
       enc.set_bytes(p, 4, 4);
       enc.set_bytes(q, 4, 5);
       if (f.w8_) enc.set_input_array(in[9 + base / 3], 6);
-      enc.dispatch_threadgroups(MTL::Size(blocks, rows, 1), MTL::Size(256, 1, 1));
+      enc.dispatch_threadgroups(MTL::Size(blocks, rows, 1), MTL::Size(64, 1, 1));
     };
     for (size_t k = 0; k < f.wg_.size(); ++k) {
       prep(0, C, H, uint32_t(k * kSeg), f.wg_[k], kSeg / kBlock);
@@ -443,7 +560,7 @@ void AneLinStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::arr
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& enc = mx::metal::get_command_encoder(s);
-  auto* lib = d.get_library("mtplx_ane_stage2", [] { return std::string(kStageSource); });
+  auto* lib = d.get_library("mtplx_ane_stage3", [] { return std::string(kStageSource); });
   AneLinear& f = *lin_;
   const uint32_t R = in[0].shape(0), H = f.hidden_;
   enc.set_compute_pipeline_state(d.get_kernel("ane_stage_x", lib));

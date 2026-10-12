@@ -16,6 +16,7 @@ NB_MODULE(_ext, m) {
       .def("stage_weights_q", &mtplx_ane::AneFfn::stage_weights_q, "g"_a, "u"_a, "d"_a, "bits"_a, "group"_a,
            "row_scales"_a = std::vector<mx::array>{})
       .def("stage_input", &mtplx_ane::AneFfn::stage_input, "xq"_a, "tx"_a)
+      .def("stage_x", &mtplx_ane::AneFfn::stage_x, "x"_a)
       .def("run", &mtplx_ane::AneFfn::run, "rows"_a, nb::call_guard<nb::gil_scoped_release>())
       .def("output", &mtplx_ane::AneFfn::output)
       .def_prop_ro("max_rows", &mtplx_ane::AneFfn::max_rows)

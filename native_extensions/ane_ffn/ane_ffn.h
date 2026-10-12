@@ -27,6 +27,8 @@ class AneFfn {
   mx::array stage_weights_q(const std::vector<mx::array>& g, const std::vector<mx::array>& u,
                             const std::vector<mx::array>& d, int bits, int group,
                             const std::vector<mx::array>& row_scales = {});
+  // Rotates, quantizes and stages an fp16 input [R, 5120] in one kernel (replaces the MLX-side prep + stage_input).
+  mx::array stage_x(const mx::array& x);
   // Stages only the input (weights kept from an earlier stage of the same layer).
   mx::array stage_input(const mx::array& xq, const mx::array& tx);
   // Runs the function of the smallest row count >= rows; blocks until the ANE reports.
@@ -58,7 +60,7 @@ class AneStage : public mx::Primitive {
   void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
   const char* name() const override { return "AneStage"; }
   bool is_equivalent(const mx::Primitive&) const override { return false; }
-  bool quantized_ = false;
+  bool quantized_ = false, prep_x_ = false;
   int bits_ = 4, group_ = 32;
 
  private:

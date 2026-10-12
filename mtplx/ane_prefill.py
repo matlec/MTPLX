@@ -115,6 +115,14 @@ def _row_scales(self: Any, L: dict[str, Any]) -> list[mx.array]:
     return cached
 
 
+def _stage_x(ffn: Any, x2: mx.array) -> mx.array:
+    """The chunk's input rotated, quantized and staged: one kernel for H = 5120, MLX ops otherwise."""
+
+    if x2.shape[-1] == 5120 and hasattr(ffn, "stage_x"):
+        return ffn.stage_x(x2)
+    return ffn.stage_input(*_prep_x(x2))
+
+
 def _disable(exc: BaseException) -> None:
     """Retire the ANE for the life of the process after a failure (the GPU computes its share)."""
 
@@ -261,13 +269,13 @@ def install(model: Any = None) -> dict[str, Any]:
             mx.eval(x)
             t1 = _time.perf_counter()
         x2 = x.reshape(rows, H)
-        xq, tx = _prep_x(x2)
         ga, ua, da = L["ga"], L["ua"], L["da"]
         if ga[2] is None or ga[4] not in (4, 8) or not (ga[4] == ua[4] == da[4] and ga[3] == ua[3] == da[3]):
+            xq, tx = _prep_x(x2)
             stage = [ffn.stage(xq, tx, _had(_deq(ga)), _had(_deq(ua)), _had(_deq(da)))]
         else:
             scales = _row_scales(self, L) if _w8() else []
-            stage = [ffn.stage_input(xq, tx), ffn.stage_weights_q(list(ga[:3]), list(ua[:3]), list(da[:3]), ga[4], ga[3], scales)]
+            stage = [_stage_x(ffn, x2), ffn.stage_weights_q(list(ga[:3]), list(ua[:3]), list(da[:3]), ga[4], ga[3], scales)]
         mx.eval(*stage)
         if trace:
             t2 = _time.perf_counter()
@@ -345,9 +353,8 @@ def _ffn_begin(ffn: Any, layer: Any, h2: mx.array, channels: int):
     x2 = layer.post_attention_layernorm(h2).reshape(rows, H)
     inter = mlp.gate_proj.weight.shape[0]
     L = _layer(mlp, inter - channels)
-    xq, tx = _prep_x(x2)
     ga, ua, da = L["ga"], L["ua"], L["da"]
-    st = [ffn.stage_input(xq, tx), ffn.stage_weights_q(list(ga[:3]), list(ua[:3]), list(da[:3]), ga[4], ga[3])]
+    st = [_stage_x(ffn, x2), ffn.stage_weights_q(list(ga[:3]), list(ua[:3]), list(da[:3]), ga[4], ga[3])]
     mx.eval(*st)
     h = nn.silu(_qmm(x2, L["g"])) * _qmm(x2, L["u"])
     y_gpu = _qmm(h, L["d"])
