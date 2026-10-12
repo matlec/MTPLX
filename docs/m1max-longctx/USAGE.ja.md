@@ -28,6 +28,17 @@ cd MTPLX
 
 以下のコマンドは、この `MTPLX` ディレクトリで実行します。
 
+### ネイティブ拡張のビルド（チェックアウトごとに 1 回、1 分ほど）
+
+M1 向けの機能のうち 3 つはネイティブ拡張です。metal-flash-attention による prefill の attention、Neural Engine の prefill、draft chain に必要な MTP キャッシュのその場書き込みです。
+
+```bash
+scripts/build-m1-native-extensions.sh
+```
+
+アプリの実行環境の Python から `.build-venv` を作り、`mlx`（実行環境と同じ版）、`nanobind` 2.15.0、`cmake`、`setuptools` を入れて、2 つの拡張をその場でビルドします。最後に `mfa_attn: ok` / `ane_ffn: ok` と表示されれば完了です。Metal のツールチェーン（`xcrun metal`）が入った Xcode が必要です。チェックアウトを更新したら、もう一度実行してください。
+拡張がなくてもサーバーは動きます。その場合、これらの機能は GPU だけの処理に戻ります（prefill が遅くなり、draft は 1 段ずつになります）。
+
 ## アプリで動かす
 
 アプリには、環境変数 `MTPLX_APP_ALLOW_SOURCE_WRAPPER=1` と `MTPLX_APP_SOURCE_WRAPPER_PATH=<リポジトリ>/bin/mtplx` を渡すと、アプリ専用の実行環境より優先してそのラッパーでエンジンを起動する仕組みがあります（`apps/MTPLXApp/Sources/MTPLXAppCore/Services/MTPLXCommandBuilder.swift`）。

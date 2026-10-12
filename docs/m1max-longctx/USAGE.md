@@ -28,6 +28,17 @@ cd MTPLX
 
 Run the commands below from this `MTPLX` directory.
 
+### Build the native extensions (once per checkout, about a minute)
+
+Three M1 features are native extensions: prefill attention on metal-flash-attention, the Neural Engine prefill, and the in-place MTP cache append the sampled draft chain needs.
+
+```bash
+scripts/build-m1-native-extensions.sh
+```
+
+It creates `.build-venv` from the app runtime's Python, installs `mlx` (the runtime's version), `nanobind` 2.15.0, `cmake` and `setuptools`, builds both extensions in place and prints `mfa_attn: ok` / `ane_ffn: ok`. It needs Xcode with the Metal toolchain (`xcrun metal`). Run it again after every update of the checkout.
+Without the extensions the server still runs; those features fall back to the GPU path (slower prefill, serial draft).
+
 ## Run it in the app
 
 Given `MTPLX_APP_ALLOW_SOURCE_WRAPPER=1` and `MTPLX_APP_SOURCE_WRAPPER_PATH=<checkout>/bin/mtplx`, the app starts its engine through that wrapper ahead of its own runtime (`apps/MTPLXApp/Sources/MTPLXAppCore/Services/MTPLXCommandBuilder.swift`).

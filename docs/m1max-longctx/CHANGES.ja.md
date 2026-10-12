@@ -1,8 +1,55 @@
-# v2.12.2-m1 / v2.12.0-m1 〜 m1.3 変更内容まとめ
+# v2.12.2-m1.1 / v2.12.2-m1 / v2.12.0-m1 〜 m1.3 変更内容まとめ
 
 - **ベースリポジトリ：** MTPLX 2.12.2（本家 `youssofal/MTPLX` の v2.12.2）。`v2.12.0-m1.3` までは 2.12.0 がベースです
-- **対象：** タグ `v2.12.2-m1`（ブランチ `m1max-longctx`）。下の「変更点一覧」の M1 向けの変更はそのまま引き継いでいます
+- **対象：** タグ `v2.12.2-m1.1`（ブランチ `m1max-longctx`）。下の「変更点一覧」の M1 向けの変更はそのまま引き継いでいます
 - **本家との差分：** コード、テストコード、各種ドキュメント（`docs/m1max-longctx/`）、起動・検証スクリプト
+
+## v2.12.2-m1.1 での変更（2026-10-13）
+
+prefill と decode を速くしました。どれも M1 系の Mac での既定で、M1 以外の Mac では今までどおりです（`MTPLX_M1_LONG_CONTEXT=0` ですべて止まります）。
+
+### 前の版との比較（同じ時間帯に続けて計測）
+
+M1 Max 64GB、`Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16`、turbo、depth 3、q8 の KV。
+
+| | v2.12.2-m1 | v2.12.2-m1.1 | 比 |
+|---|---|---|---|
+| cold prefill 8.3K | 146 tok/s | **228** | 1.56 倍 |
+| cold prefill 28.7K | 136 | **218** | 1.60 倍 |
+| cold prefill 58K | 120 | **176** | 1.47 倍 |
+| decode 2K（temperature 1.0、4 seed） | 27.7 tok/s | **31.6** | +14% |
+| decode 32K（同） | 24.6 | **28.1** | +14% |
+
+- greedy の要約（3 本）は、両方の版で書き出しが同じでした。
+- decode の 1 ラウンドは、2K で 97.5 → 88.3 ms、32K で 105 → 97 ms です（draft と verify の合計）。tok/s には、draft の 8bit 化による受理率の違い（±3%）も入っています。
+- 以前の別の計測（huihui 4bit、128K の会話）では、cold prefill が 1,350 → 927 秒でした。
+
+### prefill
+
+- **Neural Engine（ANE）との分担：** 各層の MLP の中間チャンネルの一部（10,240 チャンネル）を ANE で同時に計算します。ANE 側は int8 の活性値（512 ブロックの Hadamard 回転つき）× fp16 の重みです。Splash（Apache-2.0）の ANE の呼び出し方を MLX の上に作り直しました（`native_extensions/ane_ffn/`、`NOTICE`）。
+  - prefill の塊を半分に分け、GPU と ANE が交互に休まず動くように重ねます。文脈が 32K までのときだけです。それより長いと GPU の見張り（watchdog）のエラーが出たので、半分ずつ順番に計算します。
+  - 非公開の `AppleNeuralEngine.framework` を使います。macOS の更新で使えなくなったときや、ANE の呼び出しが失敗したときは、自動で GPU だけの計算に戻ります。止めるときは `MTPLX_ANE_PREFILL=0`。
+  - 品質：greedy で 18 問中 11 問が完全一致でした。KV を q8 と fp16 で切り替えたときの変化と同じくらいです。70 分の連続運転でエラーは出ませんでした。
+- **過去の KV に対する attention を metal-flash-attention で：** native 拡張にしました（`native_extensions/mfa_attn/`）。1 層あたり 1.38〜1.51 倍で、新しいトークンが 256 以上のときだけ使います。止めるときは `MTPLX_MFA_PREFILL=0`。
+- **q8 の KV を層ごとに 1 回 fp16 に戻してから attention**（`MTPLX_KV_QUANT_PREFILL_DEQUANT=0` で止まる）と、**prefill の線形層を fp16 GEMM で**（ビット単位で同じ結果、`MTPLX_PREFILL_DEQUANT_GEMM=0`）。
+- ANE を使うときは、prefill の塊の大きさを 4096 にします（自動のとき）。
+
+### decode
+
+- **verify の attention を 8 simdgroup で**（16K 以上、`MTPLX_GQA_MMA_NSG=4` で元に戻る）と、**MTP の層（fp16）を読み込み時に 8bit に**（`MTPLX_MTP_QUANT_BITS=0` で fp16 のまま）。
+- **decode の間だけ、MLX のコマンドバッファの上限を 150 ops / 1,000 MB に**（prefill は MLX の既定のまま。`MTPLX_DECODE_CB_LIMITS=0`）。
+- **ホストと GPU の往復を減らしました。** どれも出力は変わりません（同じ seed でビット単位で同じ）。
+  - 受理の判定に使う確率を、1 位置ずつではなくまとめて 1 回で読みます（`MTPLX_M1_BATCH_TARGET_DEFAULT=0` で元に戻る）。
+  - 12K を超える文脈で、16 層の KV の位置を 1 層ずつ読んでいたのを 1 回にまとめました（`MTPLX_PAGED_OFFSETS_MAX_CONTEXT`）。
+  - **draft を GPU 上で 3 段続けて作る chain を既定にしました**（`MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN=0` で 1 段ずつ）。以前は長い文脈で遅くなっていました（段ごとに MTP の KV を丸ごとコピーしていたため）。KV をその場で書き込む命令を native 拡張に追加して直しました（`MTPLX_MTP_INPLACE_KV=0`）。32K で 1 ラウンド −2.3%、110K で −1.7%。
+- 3 つを合わせて、32K で 1 ラウンドが約 100 → 95 ms です。
+- verify を draft の直後に積む切り替え（`MTPLX_CHAIN_EARLY_VERIFY=1`）も入れましたが、速くならなかったので既定は off です。
+
+### その他
+
+- dense の 4bit・8bit のモデル（Qwen3.8-27B など）は、M1 では turbo の profile を既定にしました（`MTPLX_M1_TURBO_DEFAULT=0` で元に戻る）。MoE はこれまでどおり sustained です。
+- ネイティブ拡張は、利用者の環境でビルドが必要です（`scripts/build-m1-native-extensions.sh`、1 分ほど）。ビルドしなくても動きますが、ANE、metal-flash-attention、draft の chain は使われません。手順は USAGE を見てください。
+- テスト：本家との差分によるテストの失敗のほか、M1 の既定値を前提にしていないテストがいくつか落ちます（`MTPLX_M1_LONG_CONTEXT=0` で通るものがほとんど）。
 
 ## v2.12.2-m1 での変更（2026-10-04）
 
