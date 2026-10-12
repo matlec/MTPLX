@@ -890,6 +890,10 @@ def load(
 
         if _pdg_enabled():
             logger.info("[prefill-dequant-gemm] %s", _pdg_install())
+        from .ane_prefill import enabled as _ane_enabled, install as _ane_install
+
+        if _ane_enabled():
+            logger.info("[ane-prefill] %s", _ane_install(model))
         from .nax_verify import install_nax_qlinear_patch, nax_env_enabled
 
         if nax_env_enabled():

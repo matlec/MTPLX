@@ -1,0 +1,3 @@
+ane_client.mm and the FFN program layout in ane_ffn.cpp are adapted from Splash
+(https://github.com/incoai/splash; M1/M2 port https://github.com/paperniuk/splash),
+Copyright Inco, licensed under the Apache License, Version 2.0.
