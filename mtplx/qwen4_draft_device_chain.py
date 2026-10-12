@@ -115,6 +115,9 @@ class SampledChainPlan:
     top_k: int
     temperature: float
     top_p: float
+    #: True when the draft logits ARE the compact row (the FR-Spec legacy swap
+    #: of the dense 27B family): no head hook, ``head`` is None.
+    compact_logits: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -179,12 +182,71 @@ def claim(rt: Any, draft_sampler: SamplerConfig) -> tuple[SampledChainPlan | Non
     )
 
 
+def claim_compact_logits(
+    ids: Any, vocab_rows: int, draft_sampler: SamplerConfig
+) -> tuple[SampledChainPlan | None, str | None]:
+    """Bind the chain to draft logits that already are the compact row.
+
+    The FR-Spec legacy swap (``MTPLX_FRSPEC_LEGACY``, the M1 default of the
+    dense 27B family) puts the pruned head in the draft graph itself: each draft
+    step returns ``len(ids)`` logits whose row ``i`` is token ``ids[i]``. That
+    is the row the chain reads from a Flash-Next head's pre-scatter capture, so
+    the same support, prediction and host arithmetic apply; ``ids`` need not
+    be ascending (the prediction orders by real token id, as the host does).
+    """
+
+    import mlx.core as mx
+
+    ids_np = np.asarray(ids, dtype=np.int64).reshape(-1)
+    rows = int(ids_np.shape[0])
+    if rows < 2:
+        return None, "no_ranked_table"
+    if int(vocab_rows) <= rows or int(ids_np.max()) >= int(vocab_rows):
+        return None, "vocab_does_not_admit_table"
+    top_k = int(draft_sampler.top_k)
+    if float(draft_sampler.temperature) <= 0.0 or top_k <= 0 or top_k > rows:
+        return None, "not_a_sampled_top_k_draft"
+    if (
+        float(draft_sampler.presence_penalty) != 0.0
+        or float(draft_sampler.frequency_penalty) != 0.0
+    ):
+        return None, "draft_penalties"
+    return (
+        SampledChainPlan(
+            head=None,
+            ids_np=ids_np,
+            ids_mx=mx.array(ids_np.astype(np.int32)),
+            rows=rows,
+            vocab_rows=int(vocab_rows),
+            top_k=top_k,
+            temperature=float(draft_sampler.temperature),
+            top_p=float(draft_sampler.top_p),
+            compact_logits=True,
+        ),
+        None,
+    )
+
+
 def release(plan: SampledChainPlan | None) -> None:
-    if plan is not None:
+    if plan is not None and plan.head is not None:
         plan.head.arm_prescatter_capture(False)
 
 
 def _compact_row(plan: SampledChainPlan, draft_logits: Any) -> Any:
+    if plan.compact_logits:
+        import mlx.core as mx
+
+        row = draft_logits.reshape(-1, int(draft_logits.shape[-1]))[-1]
+        width = int(row.shape[0])
+        if width == plan.rows:
+            return row
+        if width == plan.vocab_rows:
+            # A graph without the swapped head (e.g. warmup before the swap):
+            # the same rows, gathered by id, are the compact row's logits.
+            return mx.take(row, plan.ids_mx)
+        raise RuntimeError(
+            f"draft logits are {width} wide, expected {plan.rows} or {plan.vocab_rows}"
+        )
     stashed = plan.head.take_prescatter_row(draft_logits)
     if stashed is None:
         raise RuntimeError(
@@ -241,7 +303,9 @@ def device_predict(
         probs_sorted = mx.where(
             cumulative_before < float(plan.top_p), probs_sorted, 0.0
         )
-    by_id = mx.argsort(local_sorted)
+    # Order by REAL token id, as host_distribution does (identical to ordering
+    # by row when the table is ascending, as a Flash-Next head's is).
+    by_id = mx.argsort(mx.take(plan.ids_mx, local_sorted))
     local_by_id = mx.take(local_sorted, by_id)
     probs_by_id = mx.take(probs_sorted, by_id)
     cdf = mx.cumsum(probs_by_id)

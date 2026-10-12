@@ -5639,6 +5639,12 @@ def _sink_admits(sink: Any, position: int) -> bool:
     return True if admits is None else bool(admits(int(position)))
 
 
+def _m1_chain_default() -> bool:
+    from .cache_state import m1_long_context_defaults
+
+    return m1_long_context_defaults()
+
+
 def _sink_cuts_forwards(sink: Any) -> bool:
     """Whether the prefill may end forwards or add in-forward captures for
     this sink. False for image prompts' sinks: they record only where the
@@ -12891,7 +12897,17 @@ def generate_mtpk(
     _sampled_chain_status = "off"
     _sampled_chain_rounds = 0
     _sampled_chain_cuts = 0
-    if _qwen4_sampled_chain.is_enabled():
+    # The dense 27B family's FR-Spec legacy lane runs the chain by default on
+    # the M1 family (its draft logits are the compact row; tokens identical to
+    # the serial reader per seed; draft -2.1 ms at 2K, -1.0 ms at 32K on M1
+    # Max, 2026-10-12). MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN=0 turns it off.
+    _sc_env = (os.environ.get("MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN") or "").strip().lower()
+    _sc_compact_default = (
+        _frspec_legacy_ids is not None
+        and not _sc_env
+        and _m1_chain_default()
+    )
+    if _qwen4_sampled_chain.is_enabled() or _sc_compact_default:
         _sampled_chain_blockers = [
             _sc_name
             for _sc_name, _sc_blocked in (
@@ -12921,7 +12937,8 @@ def generate_mtpk(
                     bool(online_correction_cache or prompt_correction_cache),
                 ),
                 ("penalties", bool(_penalties_active)),
-                ("frspec_legacy", _frspec_legacy_ids is not None),
+                # The FR-Spec legacy swap no longer blocks the chain: its draft
+                # logits are the compact row itself (claim_compact_logits).
                 ("combined_greedy_read", bool(combine_greedy_draft_read)),
                 ("mtp_cache_policy", mtp_cache_policy != "persistent"),
                 (
@@ -12935,9 +12952,16 @@ def generate_mtpk(
         if _sampled_chain_blockers:
             _sampled_chain_status = "declined:" + ",".join(_sampled_chain_blockers)
         else:
-            _sampled_chain_plan, _sc_reason = _qwen4_sampled_chain.claim(
-                rt, draft_sampler
-            )
+            if _frspec_legacy_ids is not None:
+                _sampled_chain_plan, _sc_reason = (
+                    _qwen4_sampled_chain.claim_compact_logits(
+                        _frspec_legacy_ids, _frspec_legacy_full, draft_sampler
+                    )
+                )
+            else:
+                _sampled_chain_plan, _sc_reason = _qwen4_sampled_chain.claim(
+                    rt, draft_sampler
+                )
             _sampled_chain_status = (
                 "installed" if _sampled_chain_plan is not None else f"declined:{_sc_reason}"
             )
