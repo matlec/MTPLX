@@ -430,8 +430,35 @@ def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ss
     except Exception:
         offset = limit + 1
     if offset + S > limit:
+        # Experimental (MTPLX_ANE_PREFILL_PIPELINE_LONG=1): past the limit, pipeline quarter-size pieces in
+        # two pairs, so each piece's attention is half as long a GPU command.
+        if os.environ.get("MTPLX_ANE_PREFILL_PIPELINE_LONG", "0") == "1" and half >= 2 * MIN_ROWS and _STATE.get("_long_depth", 0) == 0:
+            _STATE["_long_depth"] = 1
+            try:
+                first = pipelined_layers_forced(inner, h[:, :half], cache, fa_mask, ssm_mask)
+                second = pipelined_layers_forced(inner, h[:, half:], cache, fa_mask, ssm_mask)
+            finally:
+                _STATE["_long_depth"] = 0
+            _STATE["pipeline_long_pairs"] = _STATE.get("pipeline_long_pairs", 0) + 2
+            return mx.concatenate([first, second], axis=1)
         _STATE["pipeline_long_context_skips"] = _STATE.get("pipeline_long_context_skips", 0) + 1
         return None
+    return _pipeline_core(inner, h, cache, fa_mask, ssm_mask, half)
+
+
+def pipelined_layers_forced(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ssm_mask: Any) -> mx.array:
+    """The pipeline over a piece regardless of the context limit (the long-context quarter split)."""
+
+    S = h.shape[1]
+    half = (S // 2 // 32) * 32
+    out = _pipeline_core(inner, h, cache, fa_mask, ssm_mask, half)
+    if out is None:
+        raise RuntimeError("ANE pipeline unavailable for a forced piece")
+    return out
+
+
+def _pipeline_core(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ssm_mask: Any, half: int) -> mx.array | None:
+    layers = inner.layers
     channels = int(os.environ.get("MTPLX_ANE_PREFILL_PIPELINE_CHANNELS", "10240"))
     try:
         ffa, ffb = _ffn_pair(h.shape[-1], channels)
