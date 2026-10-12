@@ -33,6 +33,9 @@ import mlx.nn as nn
 logger = logging.getLogger(__name__)
 
 MIN_ROWS = 512
+# The program's functions: a chunk pads up to the next one (an evaluation costs its function's rows), so a
+# 256-row grid keeps the padding of odd follow-up suffixes small.
+_ROWS = list(range(512, 2048 + 1, 256))
 _STATE: dict[str, Any] = {"installed": False, "ffn": None, "calls": 0, "fallbacks": 0, "error": None}
 _LOCK = threading.Lock()
 
@@ -184,7 +187,7 @@ def install_gdn(model: Any) -> dict[str, Any]:
         n_ane = (n_qkv - cut) + n_z
         lin = _STATE.get("gdn_lin")
         if lin is None:
-            lin = ext.AneLinear(H, n_ane, [512, 1024, 1536, 2048])
+            lin = ext.AneLinear(H, n_ane, _ROWS)
             _STATE["gdn_lin"] = lin
             logger.info("[ane-prefill] GDN program ready (%.1f s)", lin.compile_seconds)
         if rows > lin.max_rows:
@@ -250,7 +253,7 @@ def install(model: Any = None) -> dict[str, Any]:
             with _LOCK:
                 if _STATE["ffn"] is None:
                     try:
-                        _STATE["ffn"] = ext.AneFfn(H, channels, [512, 1024, 1536, 2048], w8=_w8())
+                        _STATE["ffn"] = ext.AneFfn(H, channels, _ROWS, w8=_w8())
                     except Exception as exc:
                         _disable(exc)
                         return orig(self, x)
@@ -309,6 +312,20 @@ def install(model: Any = None) -> dict[str, Any]:
     qn.Qwen3NextMLP.__call__ = call
     _STATE["installed"] = True
     _STATE["channels"] = channels
+    if model is not None:
+        # Build (and on a Mac's first run compile, 10-30 s) the programs at load, not inside the first
+        # long prompt that needs them.
+        try:
+            text = getattr(model, "language_model", model)
+            hidden = int(getattr(getattr(text, "args", None), "hidden_size", 0) or 0)
+            if hidden and hidden % 2560 == 0:
+                _STATE["ffn"] = ext.AneFfn(hidden, channels, _ROWS, w8=_w8())
+                if pipeline_enabled():
+                    pc = int(os.environ.get("MTPLX_ANE_PREFILL_PIPELINE_CHANNELS", "10240"))
+                    _ffn_pair(hidden, pc)
+                _STATE["warmed"] = True
+        except Exception as exc:
+            _disable(exc)
     if model is not None and os.environ.get("MTPLX_ANE_PREFILL_GDN", "0") == "1":
         _STATE["gdn"] = install_gdn(model)
     return {k: v for k, v in _STATE.items() if k not in ("ffn", "gdn_lin")}
@@ -336,7 +353,7 @@ def _ffn_pair(H: int, channels: int):
     pair = _STATE.get("ffn_pair")
     if pair is None:
         ext = _ext()
-        pair = (ext.AneFfn(H, channels, [512, 1024, 1536, 2048]), ext.AneFfn(H, channels, [512, 1024, 1536, 2048]))
+        pair = (ext.AneFfn(H, channels, _ROWS), ext.AneFfn(H, channels, _ROWS))
         _STATE["ffn_pair"] = pair
         logger.info("[ane-prefill] pipeline programs ready")
     return pair
