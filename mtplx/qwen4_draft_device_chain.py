@@ -76,8 +76,27 @@ _ENV_VAR = "MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN"
 
 
 def is_enabled(env: Any | None = None) -> bool:
+    """On when the env says so; unset, on for the M1 family with the in-place append.
+
+    Without the in-place MTP KV append the chain copies the whole MTP cache per
+    depth and loses at long context (143K: draft 19.8 -> 32 ms); with it the
+    chain wins at every measured context on M1 Max (32K -2.3%, 110K -1.7% per
+    round, byte-identical output).
+    """
     source = os.environ if env is None else env
-    return str(source.get(_ENV_VAR, "")).strip().lower() in {"1", "true", "yes", "on"}
+    raw = str(source.get(_ENV_VAR, "")).strip().lower()
+    if raw:
+        return raw in {"1", "true", "yes", "on"}
+    if env is not None:
+        return False
+    try:
+        from .cache_state import m1_long_context_defaults
+
+        if not m1_long_context_defaults():
+            return False
+    except Exception:
+        return False
+    return _inplace_writer() is not None
 
 
 _PIPELINE_ENV_VAR = "MTPLX_QWEN4_DRAFT_CHAIN_PIPELINE"
@@ -225,6 +244,79 @@ def claim_compact_logits(
         ),
         None,
     )
+
+
+_INPLACE_ENV_VAR = "MTPLX_MTP_INPLACE_KV"
+_INPLACE = {"active": False, "write": None, "patched": False}
+
+
+def _inplace_writer():
+    if _INPLACE["write"] is None:
+        _INPLACE["write"] = False
+        if str(os.environ.get(_INPLACE_ENV_VAR, "1")).strip().lower() in {"0", "false", "no", "off"}:
+            return None
+        try:
+            from .kernels.mfa_prefill import _ext
+
+            ext = _ext()
+            fn = getattr(ext, "inplace_row_write", None) if ext is not None else None
+            _INPLACE["write"] = fn if fn is not None else False
+        except Exception:
+            _INPLACE["write"] = False
+    return _INPLACE["write"] or None
+
+
+def _patch_kv_cache() -> bool:
+    if _INPLACE["patched"]:
+        return True
+    try:
+        from mlx_lm.models.cache import KVCache
+    except Exception:
+        return False
+    stock = KVCache.update_and_fetch
+
+    def update_and_fetch(self, keys, values):
+        write = _INPLACE["write"] if _INPLACE["active"] else None
+        if (
+            not write
+            or self.keys is None
+            or self.offset + keys.shape[2] > self.keys.shape[2]
+            or keys.dtype != self.keys.dtype
+            or values.dtype != self.values.dtype
+        ):
+            return stock(self, keys, values)
+        prev = self.offset
+        self.offset += keys.shape[2]
+        self.keys = write(self.keys, keys, prev)
+        self.values = write(self.values, values, prev)
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+    KVCache.update_and_fetch = update_and_fetch
+    _INPLACE["patched"] = True
+    return True
+
+
+class inplace_mtp_kv:
+    """Chain depths append to the MTP KV cache in place (``MTPLX_MTP_INPLACE_KV``, default on).
+
+    Between chained depths nothing syncs, so the previous depth's command
+    buffer still references the cache buffer and MLX's ``slice_update`` cannot
+    donate it: every depth copied the whole fp16 MTP K/V (about 110 MB at 32K,
+    0.6 GB at 143K). Inside this block an append within capacity writes its
+    rows straight into the existing buffer instead. Every reader of the buffer
+    reads only rows below its own offset, and an append writes at or past the
+    current offset, so no reader sees a changed row; growth past capacity
+    takes the stock path.
+    """
+
+    def __enter__(self):
+        if _inplace_writer() is not None and _patch_kv_cache():
+            _INPLACE["active"] = True
+        return self
+
+    def __exit__(self, *exc):
+        _INPLACE["active"] = False
+        return False
 
 
 def release(plan: SampledChainPlan | None) -> None:

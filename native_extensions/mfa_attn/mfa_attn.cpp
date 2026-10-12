@@ -179,4 +179,73 @@ std::tuple<int, int> set_command_buffer_limits(int max_ops, int max_mb) {
   return prev;
 }
 
+mx::array inplace_row_write(
+    const mx::array& dst,
+    const mx::array& src,
+    int row,
+    mx::StreamOrDevice s) {
+  int nd = dst.ndim();
+  if (nd != 4 || src.ndim() != 4 || src.dtype() != dst.dtype() || dst.itemsize() != 2 ||
+      !dst.flags().row_contiguous) {
+    throw std::invalid_argument("inplace_row_write: dst/src rank or dtype mismatch");
+  }
+  for (int i = 0; i < nd; ++i) {
+    if (i != nd - 2 && src.shape(i) != dst.shape(i)) {
+      throw std::invalid_argument("inplace_row_write: shape mismatch");
+    }
+  }
+  if (row < 0 || row + src.shape(nd - 2) > dst.shape(nd - 2)) {
+    throw std::invalid_argument("inplace_row_write: rows out of range");
+  }
+  auto stream = mx::to_stream(s);
+  return mx::array(
+      dst.shape(), dst.dtype(), std::make_shared<InplaceRowWrite>(stream, row), {dst, src});
+}
+
+void InplaceRowWrite::eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) {
+  throw std::runtime_error("InplaceRowWrite: GPU only");
+}
+
+namespace {
+const char* kRowWriteSource = R"(
+#include <metal_stdlib>
+using namespace metal;
+// dst rows: p * cap + row + i, contiguous [P, cap, D]; src strided (b, h, i, d).
+kernel void mtplx_row_write(
+    device const ushort* src [[buffer(0)]],
+    device ushort* dst [[buffer(1)]],
+    constant long* st [[buffer(2)]],     // sB, sH, sN, sD
+    constant uint* p [[buffer(3)]],      // H, cap, D, row
+    uint3 g [[thread_position_in_grid]]) {
+  uint d = g.x, i = g.y, bh = g.z;
+  uint b = bh / p[0], h = bh % p[0];
+  long s = long(b) * st[0] + long(h) * st[1] + long(i) * st[2] + long(d) * st[3];
+  dst[(ulong(bh) * p[1] + p[3] + i) * p[2] + d] = src[s];
+}
+)";
+} // namespace
+
+void InplaceRowWrite::eval_gpu(
+    const std::vector<mx::array>& inputs,
+    std::vector<mx::array>& outputs) {
+  const auto& dst = inputs[0];
+  auto src = inputs[1];
+  auto& out = outputs[0];
+  out.copy_shared_buffer(dst);
+  auto& s = stream();
+  auto& d = mx::metal::device(s.device);
+  auto& enc = mx::metal::get_command_encoder(s);
+  auto* lib = d.get_library("mtplx_row_write1", [] { return std::string(kRowWriteSource); });
+  enc.set_compute_pipeline_state(d.get_kernel("mtplx_row_write", lib));
+  const uint32_t D = dst.shape(3), cap = dst.shape(2), H = dst.shape(1), B = dst.shape(0);
+  const uint32_t n = src.shape(2);
+  const int64_t st[4] = {src.strides()[0], src.strides()[1], src.strides()[2], src.strides()[3]};
+  const uint32_t p[4] = {H, cap, D, uint32_t(row_)};
+  enc.set_input_array(src, 0);
+  enc.set_output_array(out, 1);
+  enc.set_bytes(st, 4, 2);
+  enc.set_bytes(p, 4, 3);
+  enc.dispatch_threads(MTL::Size(D, n, B * H), MTL::Size(std::min<uint32_t>(D, 256), 1, 1));
+}
+
 } // namespace mtplx_mfa

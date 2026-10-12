@@ -14326,36 +14326,37 @@ def generate_mtpk(
             _sc_hiddens: list[mx.array] = []
             _sc_offsets: list[int | None] = []
             _sc_cache_offsets: list[int] = []
-            for _sc_depth in range(cycle_depth):
-                _sc_cache_offsets.append(_mtp_cache_offset(mtp_cache))
-                _sc_offset = mtp_position_offset_for_cache(mtp_cache)
-                _sc_offsets.append(_sc_offset)
-                _sc_logits, _sc_hidden_next = rt.draft_mtp(
-                    _sc_hidden,
-                    _sc_tok,
-                    mtp_cache=mtp_cache,
-                    return_hidden=True,
-                    mtp_hidden_variant=mtp_hidden_variant,
-                    mtp_depth=_sc_depth + 1,
-                    position_offset=_sc_offset,
-                )
-                _sc_support = _qwen4_sampled_chain.device_support(
-                    _sampled_chain_plan, _sc_logits
-                )
-                _sc_token = _qwen4_sampled_chain.device_predict(
-                    _sampled_chain_plan,
-                    *_sc_support,
-                    mx.array(_sc_uniforms[_sc_depth], dtype=mx.float32),
-                )
-                _sc_supports.append(_sc_support)
-                _sc_predicted.append(_sc_token)
-                _sc_tok = _sc_token.reshape(1, 1).astype(mx.int32)
-                _sc_hidden = _sc_hidden_next[:, -1:, :]
-                _sc_hiddens.append(_sc_hidden)
-                if _sc_pipeline:
-                    # Hand this depth to the GPU now; the next depth is built
-                    # while it runs.
-                    mx.async_eval(*_sc_support, _sc_token, _sc_hidden)
+            with _qwen4_sampled_chain.inplace_mtp_kv():
+                for _sc_depth in range(cycle_depth):
+                    _sc_cache_offsets.append(_mtp_cache_offset(mtp_cache))
+                    _sc_offset = mtp_position_offset_for_cache(mtp_cache)
+                    _sc_offsets.append(_sc_offset)
+                    _sc_logits, _sc_hidden_next = rt.draft_mtp(
+                        _sc_hidden,
+                        _sc_tok,
+                        mtp_cache=mtp_cache,
+                        return_hidden=True,
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        mtp_depth=_sc_depth + 1,
+                        position_offset=_sc_offset,
+                    )
+                    _sc_support = _qwen4_sampled_chain.device_support(
+                        _sampled_chain_plan, _sc_logits
+                    )
+                    _sc_token = _qwen4_sampled_chain.device_predict(
+                        _sampled_chain_plan,
+                        *_sc_support,
+                        mx.array(_sc_uniforms[_sc_depth], dtype=mx.float32),
+                    )
+                    _sc_supports.append(_sc_support)
+                    _sc_predicted.append(_sc_token)
+                    _sc_tok = _sc_token.reshape(1, 1).astype(mx.int32)
+                    _sc_hidden = _sc_hidden_next[:, -1:, :]
+                    _sc_hiddens.append(_sc_hidden)
+                    if _sc_pipeline:
+                        # Hand this depth to the GPU now; the next depth is built
+                        # while it runs.
+                        mx.async_eval(*_sc_support, _sc_token, _sc_hidden)
             _sc_window = [int(next_token)]
             if _sc_pipeline:
                 # The verify window opens with the primary, known already:
