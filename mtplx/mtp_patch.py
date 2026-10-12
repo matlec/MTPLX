@@ -314,6 +314,20 @@ def _quantize_mtp_module(mtp: Any, contract: MTPContract) -> None:
         return
 
     policy = _canonical_mtp_quant_policy(contract.mtp_quant_policy) or "all"
+    _scope = os.environ.get("MTPLX_MTP_QUANT_SCOPE", "").strip()
+    if policy == "all" and _scope:
+        # Experiment switch: quantize only modules whose path contains one of
+        # the comma-separated substrings (e.g. "mlp").
+        _parts = [x for x in _scope.split(",") if x]
+        nn.quantize(
+            mtp,
+            group_size=contract.mtp_quant_group_size,
+            bits=contract.mtp_quant_bits,
+            mode=contract.mtp_quant_mode,
+            class_predicate=lambda path, module: hasattr(module, "to_quantized")
+            and any(x in path for x in _parts),
+        )
+        return
     if policy == "all":
         nn.quantize(
             mtp,
@@ -831,6 +845,11 @@ def inject_mtp_support(
             self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     mtp = _MTPModule(args, n_layers)
+    _env_mtp_bits = os.environ.get("MTPLX_MTP_QUANT_BITS", "").strip()
+    if _env_mtp_bits and not contract.mtp_prequantized and contract.mtp_quant_bits is None:
+        # Experiment switch: quantize an fp16/bf16 MTP sidecar at load. The draft
+        # only proposes; speculative acceptance keeps the target distribution.
+        contract = replace(contract, mtp_quant_bits=int(_env_mtp_bits))
     if contract.mtp_prequantized:
         _quantize_mtp_module(mtp, contract)
     mtp.load_weights(list(mtp_weights.items()), strict=False)

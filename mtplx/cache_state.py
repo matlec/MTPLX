@@ -3488,7 +3488,7 @@ def _admit_paged_growth(transient_bytes: int, *, detail: str) -> None:
     )
 
 
-def reserve_paged_window(entries: Any, window_tokens: int) -> int:
+def reserve_paged_window(entries: Any, window_tokens: int, *, offset_bound: int | None = None) -> int:
     """Make one forward of ``window_tokens`` rows fit every promoted paged adapter.
 
     Promoted paged adapters (``TensorOffsetVllmMetalPagedKVCache`` and its
@@ -3524,10 +3524,22 @@ def reserve_paged_window(entries: Any, window_tokens: int) -> int:
     ]
     if not members:
         return 0
+    window = max(1, int(window_tokens))
+    if offset_bound is not None and all(
+        int(offset_bound) + window <= int(entry._physical_rows()) for entry in members
+    ):
+        # The caller's host upper bound of every offset already fits: the
+        # scalar read below would only sync on the previous round's pending
+        # commit (2.8 ms per decode round at 32K on M1 Max, the GPU idle
+        # between the commit and the next draft), so skip it.
+        if os.environ.get("MTPLX_PAGED_RESERVE_BOUND_CHECK") == "1":
+            real = _read_paged_offsets(members) or []
+            if any(o > int(offset_bound) for o in real):
+                raise AssertionError(f"paged offset {max(real)} above host bound {offset_bound}")
+        return 0
     offsets = _read_paged_offsets(members)
     if offsets is None:
         return 0
-    window = max(1, int(window_tokens))
     plans = []
     for entry, offset in zip(members, offsets):
         rows = int(entry._physical_rows())

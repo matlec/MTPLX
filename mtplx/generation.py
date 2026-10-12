@@ -10522,7 +10522,18 @@ def generate_mtp1(
     )
 
 
-def _paged_round_reservation(cache: Any, *, depth: int, copy_window: int = 0) -> dict[str, Any] | None:
+_PAGED_OFFSET_BOUND_SLACK = 256
+
+
+def _paged_offset_bound_enabled() -> bool:
+    """``MTPLX_PAGED_RESERVE_HOST_BOUND=1`` skips the round-start offset read (no gain measured at 32K)."""
+
+    return os.environ.get("MTPLX_PAGED_RESERVE_HOST_BOUND", "0") == "1"
+
+
+def _paged_round_reservation(
+    cache: Any, *, depth: int, copy_window: int = 0, offset_bound: int | None = None
+) -> dict[str, Any] | None:
     """Reserve one decode round's widest window on the promoted paged KV.
 
     ``None`` when it fits (or nothing is paged, or dynamic growth is off and
@@ -10534,7 +10545,7 @@ def _paged_round_reservation(cache: Any, *, depth: int, copy_window: int = 0) ->
 
     window = max(1 + max(1, int(depth)), int(copy_window))
     try:
-        reserve_paged_window(cache, window)
+        reserve_paged_window(cache, window, offset_bound=offset_bound)
     except PagedKVGrowthRefused as exc:
         return {"reason": "paged_kv_growth_refused", "window_tokens": window, "detail": str(exc)}
     except Exception:
@@ -13070,7 +13081,16 @@ def generate_mtpk(
         # the answer with every committed token whole (finish_reason
         # "length", memory_stop), as the fixed-M4 bank above does.
         paged_round = _paged_round_reservation(
-            cache, depth=int(speculative_depth), copy_window=(1 + max(4, int(ccopy_k))) if ccopy_active else 0
+            cache,
+            depth=int(speculative_depth),
+            copy_window=(1 + max(4, int(ccopy_k))) if ccopy_active else 0,
+            # Host upper bound of the paged offsets (prompt + every generated
+            # token + slack): when it fits, no offset read syncs the round.
+            offset_bound=(
+                len(prompt_ids) + len(tokens) + _PAGED_OFFSET_BOUND_SLACK
+                if _paged_offset_bound_enabled()
+                else None
+            ),
         )
         if paged_round is not None:
             memory_stop = {**paged_round, "completion_tokens": len(tokens)}

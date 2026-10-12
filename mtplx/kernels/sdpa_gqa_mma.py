@@ -392,6 +392,69 @@ def _prefill_source() -> str:
 
 
 @lru_cache(maxsize=None)
+def _wide_source(src: str) -> str:
+    """``_SOURCE`` with NSG simdgroups per threadgroup and TPR softmax threads per row.
+
+    Why (2026-10-12, M1 Max q8 verify at 34.8K-143.7K, attn-s3/attn_nsg.py):
+    the kernel is MMA-pipe bound at ~52 % of peak; 8 simdgroups sharing one
+    Q^T tile (64-key blocks, 32 output columns each, half the splits) run the
+    q_len-4 GQA-6 verify 6-11 % faster per layer (143.7K: 2.89 -> 2.70 ms;
+    34.8K: 0.75 -> 0.69 ms). 16 simdgroups are slower.
+    """
+
+    reps = [
+        ("constexpr int NSG = 4;", "constexpr int NSG = NSGV;"),
+        (
+            "const int srow = tid / 4;\n    const int squad = tid % 4;",
+            "const int srow = tid / TPR;\n    const int squad = tid % TPR;",
+        ),
+        (
+            "mx_ = max(mx_, simd_shuffle_xor(mx_, 1));\n            mx_ = max(mx_, simd_shuffle_xor(mx_, 2));",
+            "_Pragma(\"clang loop unroll(full)\") for (ushort o = 1; o < TPR; o <<= 1) mx_ = max(mx_, simd_shuffle_xor(mx_, o));",
+        ),
+        (
+            "sm += simd_shuffle_xor(sm, 1);\n            sm += simd_shuffle_xor(sm, 2);",
+            "_Pragma(\"clang loop unroll(full)\") for (ushort o = 1; o < TPR; o <<= 1) sm += simd_shuffle_xor(sm, o);",
+        ),
+    ]
+    for old, new in reps:
+        if src.count(old) != 1:
+            raise RuntimeError("sdpa_gqa_mma wide source patch point moved")
+        src = src.replace(old, new)
+    old = "for (int j = squad; j < BK; j += 4)"
+    if src.count(old) != 2:
+        raise RuntimeError("sdpa_gqa_mma wide source patch point moved")
+    return src.replace(old, "for (int j = squad; j < BK; j += TPR)")
+
+
+@lru_cache(maxsize=None)
+def _wide_kernel():
+    if not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name="mtplx_sdpa_gqa_mma_partials_wide",
+        input_names=[
+            "queries", "keys", "values", "k_scales", "v_scales", "offset",
+            "k_hs", "k_ts", "v_hs", "v_ts", "s_hs", "s_ts", "scale", "splits",
+        ],
+        output_names=["partials", "sums", "maxs"],
+        source=_wide_source(_SOURCE),
+    )
+
+
+def _wide_simdgroups(q_len: int, gqa: int, ceiling: int) -> int:
+    """Simdgroups per threadgroup of the verify partials (``MTPLX_GQA_MMA_NSG``, 4 or 8).
+
+    Wide only for multi-row windows past 16K keys: below that the halved
+    split count starves the GPU (4K ceiling: 0.32 -> 0.47 ms per layer).
+    """
+
+    nsg = _env_int("MTPLX_GQA_MMA_NSG", 4)
+    if nsg != 8 or q_len < 2 or gqa * q_len > 32 or int(ceiling) < 16384:
+        return 4
+    return 8
+
+
 def _kernels():
     if not mx.metal.is_available():
         return None, None
@@ -567,6 +630,17 @@ def sdpa_gqa_mma(
         offset_arr = mx.array([offset_int], dtype=mx.int32)
 
     splits = splits_for_ceiling(ceiling)
+    nsg = _wide_simdgroups(q_len, gqa, ceiling)
+    extra_template = []
+    if nsg != 4:
+        wide = _wide_kernel()
+        if wide is not None:
+            partials_kernel = wide
+            # Twice the keys per block: half the splits keeps the blocks per split.
+            splits = max(32, splits // 2)
+            extra_template = [("NSGV", nsg), ("TPR", 8)]
+        else:
+            nsg = 4
     dummy = _dummy_scales()
     partials, sums, maxs = partials_kernel(
         inputs=[
@@ -593,9 +667,10 @@ def sdpa_gqa_mma(
             ("KQ", kv_bits),
             ("KT", 1),
             ("QKS", 2 if kv_bits else 1),
+            *extra_template,
         ],
-        grid=(hk * 32, 4, splits),
-        threadgroup=(32, 4, 1),
+        grid=(hk * 32, nsg, splits),
+        threadgroup=(32, nsg, 1),
         output_shapes=[(hq * q_len * splits, d), (hq * q_len * splits,), (hq * q_len * splits,)],
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
