@@ -884,7 +884,14 @@ def inject_mtp_support(
             fa_mask = create_attention_mask(hidden_states, cache[inner.fa_idx])
             ssm_mask = create_ssm_mask(hidden_states, cache[inner.ssm_idx])
             eval_every = _prefill_layer_eval_every()
+            from .ane_prefill import pipelined_layers as _ane_pipelined_layers
+
+            piped = _ane_pipelined_layers(inner, hidden_states, cache, fa_mask, ssm_mask)
+            if piped is not None:
+                hidden_states = piped
             for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):
+                if piped is not None:
+                    break
                 mask = ssm_mask if layer.is_linear else fa_mask
                 hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
                 if eval_every and (layer_index + 1) % eval_every == 0:

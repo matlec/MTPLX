@@ -281,3 +281,104 @@ def install(model: Any = None) -> dict[str, Any]:
 
 def stats() -> dict[str, Any]:
     return {k: v for k, v in _STATE.items() if k != "ffn"}
+
+
+# ---- two halves of a chunk pipelined across the GPU and the ANE (MTPLX_ANE_PREFILL_PIPELINE=1) ----
+#
+# Why (2026-10-12, attn-s4 N-9): with the FFN split alone the ANE idles while the GPU runs each layer's
+# attention / GDN mixer. Splitting a prefill chunk into halves A and B and interleaving them per layer
+# (B's mixer on the GPU while A's FFN share is on the ANE, then the reverse) keeps both busy, and lets
+# the ANE take more channels. Outside the server, 8192 tokens: GPU only 155 tok/s, sequential split 190,
+# pipelined 208 (7680 ch) .. 240 (11264 ch), final logits identical to the sequential split.
+# Caches see A then B in every layer, as a single forward of A followed by B would.
+
+
+def pipeline_enabled() -> bool:
+    return enabled() and os.environ.get("MTPLX_ANE_PREFILL_PIPELINE", "0") == "1"
+
+
+def _ffn_pair(H: int, channels: int):
+    pair = _STATE.get("ffn_pair")
+    if pair is None:
+        ext = _ext()
+        pair = (ext.AneFfn(H, channels, [512, 1024, 1536, 2048]), ext.AneFfn(H, channels, [512, 1024, 1536, 2048]))
+        _STATE["ffn_pair"] = pair
+        logger.info("[ane-prefill] pipeline programs ready")
+    return pair
+
+
+def _mixer(layer: Any, h: mx.array, mask: Any, cache: Any) -> mx.array:
+    normed = layer.input_layernorm(h)
+    r = layer.linear_attn(normed, mask, cache) if layer.is_linear else layer.self_attn(normed, mask, cache)
+    return h + r
+
+
+def _ffn_begin(ffn: Any, layer: Any, h2: mx.array, channels: int):
+    import threading as _th
+
+    mlp = layer.mlp
+    B, S, H = h2.shape
+    rows = B * S
+    x2 = layer.post_attention_layernorm(h2).reshape(rows, H)
+    inter = mlp.gate_proj.weight.shape[0]
+    L = _layer(mlp, inter - channels)
+    xq, tx = _prep_x(x2)
+    ga, ua, da = L["ga"], L["ua"], L["da"]
+    st = [ffn.stage_input(xq, tx), ffn.stage_weights_q(list(ga[:3]), list(ua[:3]), list(da[:3]), ga[4], ga[3])]
+    mx.eval(*st)
+    h = nn.silu(_qmm(x2, L["g"])) * _qmm(x2, L["u"])
+    y_gpu = _qmm(h, L["d"])
+    mx.async_eval(y_gpu)
+    err: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            ffn.run(rows)
+        except BaseException as exc:  # surfaced on join
+            err.append(exc)
+
+    th = _th.Thread(target=run, name="mtplx-ane-ffn", daemon=True)
+    th.start()
+    return th, err, ffn, y_gpu, rows, h2
+
+
+def _ffn_end(handle: tuple) -> mx.array:
+    th, err, ffn, y_gpu, rows, h2 = handle
+    th.join()
+    if err:
+        raise err[0]
+    H = h2.shape[-1]
+    o = ffn.output()
+    y = y_gpu + (o[:H, :rows] * o[H : H + 1, :rows]).T.astype(y_gpu.dtype)
+    _STATE["pipeline_ffn_calls"] = _STATE.get("pipeline_ffn_calls", 0) + 1
+    return h2 + y.reshape(h2.shape)
+
+
+def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ssm_mask: Any) -> mx.array | None:
+    """The decoder stack over one prefill chunk as two pipelined halves; None when it does not apply."""
+
+    if not pipeline_enabled() or cache is None or h.shape[0] != 1:
+        return None
+    S = h.shape[1]
+    half = (S // 2 // 32) * 32
+    if half < MIN_ROWS or S - half < MIN_ROWS or S - half > 2048:
+        return None
+    if not (isinstance(fa_mask, str) or fa_mask is None) or ssm_mask is not None:
+        return None
+    layers = inner.layers
+    if not all(hasattr(l.mlp, "gate_proj") and hasattr(l.mlp.gate_proj, "scales") for l in layers):
+        return None
+    channels = int(os.environ.get("MTPLX_ANE_PREFILL_PIPELINE_CHANNELS", "10240"))
+    ffa, ffb = _ffn_pair(h.shape[-1], channels)
+    ha, hb = h[:, :half], h[:, half:]
+    pend_b = None
+    for layer, c in zip(layers, cache):
+        mask = ssm_mask if layer.is_linear else fa_mask
+        a = _ffn_begin(ffa, layer, _mixer(layer, ha, mask, c), channels)
+        if pend_b is not None:
+            hb = _ffn_end(pend_b)
+        pend_b = _ffn_begin(ffb, layer, _mixer(layer, hb, mask, c), channels)
+        ha = _ffn_end(a)
+    hb = _ffn_end(pend_b)
+    _STATE["pipeline_chunks"] = _STATE.get("pipeline_chunks", 0) + 1
+    return mx.concatenate([ha, hb], axis=1)
