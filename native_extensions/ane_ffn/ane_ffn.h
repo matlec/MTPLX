@@ -15,7 +15,7 @@ namespace mtplx_ane {
 
 class AneFfn {
  public:
-  AneFfn(int hidden, int channels, std::vector<int> rows);
+  AneFfn(int hidden, int channels, std::vector<int> rows, bool w8 = false);
   ~AneFfn();
   // Copies the chunk's int8 rotated input [R, H] and per-token scales [R] (x = xq * tx / 128), and the
   // ANE channels' rotated fp16 weights gate/up [C, H] and down [H, C], into the program's surfaces.
@@ -25,7 +25,8 @@ class AneFfn {
   // Stages the ANE's channels from the packed affine weights directly: g/u/d are (w, scales, biases) of
   // gate/up [C, H] and down [H, C]; dequantized, rotated in 512-blocks and written in one kernel each.
   mx::array stage_weights_q(const std::vector<mx::array>& g, const std::vector<mx::array>& u,
-                            const std::vector<mx::array>& d, int bits, int group);
+                            const std::vector<mx::array>& d, int bits, int group,
+                            const std::vector<mx::array>& row_scales = {});
   // Stages only the input (weights kept from an earlier stage of the same layer).
   mx::array stage_input(const mx::array& xq, const mx::array& tx);
   // Runs the function of the smallest row count >= rows; blocks until the ANE reports.
@@ -39,8 +40,9 @@ class AneFfn {
   // For the staging primitive.
   struct Target { Surface* surface; MTL::Buffer* buffer; };
   std::vector<Target> x_, wg_, wu_, wd_;
-  Target tx_{}, y_{};
+  Target tx_{}, y_{}, sg_{}, su_{}, sd_{};
   int hidden_, channels_;
+  bool w8_ = false;
   std::vector<int> rows_, dseg_;
 
  private:

@@ -66,6 +66,34 @@ kernel void ane_prep_w(const device uint* w [[buffer(0)]], const device half* sc
   const float n = 0.04419417382415922f;  // 1/sqrt(512)
   for (uint i = t; i < 512; i += 256) dst[(q.w + row) * q.x + q.y + blk * 512 + i] = half(v[i] * n);
 }
+kernel void ane_prep_w8(const device uint* w [[buffer(0)]], const device half* sc [[buffer(1)]],
+                        const device half* bi [[buffer(2)]], device char* dst [[buffer(3)]],
+                        constant uint4& p [[buffer(4)]], constant uint4& q [[buffer(5)]],
+                        const device half* rs [[buffer(6)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
+  // As ane_prep_w, then w / rs[row] rounded to int8 (rs = the rotated row's max / 127).
+  threadgroup float v[512];
+  const uint row = tg.y, blk = tg.x;
+  if (row >= q.z) return;
+  const uint per = 32 / p.z, words = p.x / per, groups = p.x / p.w;
+  for (uint i = t; i < 512; i += 256) {
+    const uint col = p.y + blk * 512 + i;
+    const uint word = w[row * words + col / per];
+    const uint qv = (word >> ((col % per) * p.z)) & ((1u << p.z) - 1u);
+    const uint gi = row * groups + col / p.w;
+    v[i] = float(qv) * float(sc[gi]) + float(bi[gi]);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint h = 1; h < 512; h <<= 1) {
+    const uint i = (t / h) * 2 * h + (t % h);
+    const float a = v[i], b = v[i + h];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    v[i] = a + b; v[i + h] = a - b;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  const float n = 0.04419417382415922f / max(float(rs[row]), 1e-12f);
+  for (uint i = t; i < 512; i += 256) dst[(q.w + row) * q.x + q.y + blk * 512 + i] = char(clamp(rint(v[i] * n), -127.0f, 127.0f));
+}
 )";
 }  // namespace
 
@@ -78,7 +106,8 @@ AneFfn::Target AneFfn::make(uint32_t rows, uint32_t width, bool int8) {
   return {s, b};
 }
 
-AneFfn::AneFfn(int hidden, int channels, std::vector<int> rows) : hidden_(hidden), channels_(channels), rows_(std::move(rows)) {
+AneFfn::AneFfn(int hidden, int channels, std::vector<int> rows, bool w8)
+    : hidden_(hidden), channels_(channels), rows_(std::move(rows)), w8_(w8) {
   if (const std::string why = unavailable(); !why.empty()) throw std::runtime_error("ANE unavailable: " + why);
   if (hidden % kSeg || channels % kBlock || rows_.empty()) throw std::runtime_error("ANE FFN: unsupported shape");
   std::sort(rows_.begin(), rows_.end());
@@ -86,9 +115,10 @@ AneFfn::AneFfn(int hidden, int channels, std::vector<int> rows) : hidden_(hidden
   if (Rm % 32) throw std::runtime_error("ANE FFN: rows must be multiples of 32");
   for (uint32_t k = 0; k < H / kSeg; ++k) x_.push_back(make(kSeg, Rm, true));
   tx_ = make(1, Rm, false);
-  for (uint32_t k = 0; k < H / kSeg; ++k) { wg_.push_back(make(C, kSeg, false)); wu_.push_back(make(C, kSeg, false)); }
+  for (uint32_t k = 0; k < H / kSeg; ++k) { wg_.push_back(make(C, kSeg, w8_)); wu_.push_back(make(C, kSeg, w8_)); }
   for (uint32_t b = 0; b < C; b += kSeg) dseg_.push_back(std::min(kSeg, C - b));
-  for (int w : dseg_) wd_.push_back(make(H, w, false));
+  for (int w : dseg_) wd_.push_back(make(H, w, w8_));
+  if (w8_) { sg_ = make(C, 1, false); su_ = make(C, 1, false); sd_ = make(H, 1, false); }
   y_ = make(H + 1, Rm, false);
 
   std::ostringstream mil;
@@ -107,6 +137,7 @@ AneFfn::AneFfn(int hidden, int channels, std::vector<int> rows) : hidden_(hidden
     param("tx", tx_, R);
     for (size_t k = 0; k < wg_.size(); ++k) { param("wg" + S(k), wg_[k], kSeg); param("wu" + S(k), wu_[k], kSeg); }
     for (size_t i = 0; i < wd_.size(); ++i) param("wd" + S(i), wd_[i], dseg_[i]);
+    if (w8_) { param("sg", sg_, 1); param("su", su_, 1); param("sd", sd_, 1); }
     auto mm = [&](const std::string& o, const std::string& w, const std::string& x, uint64_t h) {
       L(T("fp16", h, R) + " " + o + " = matmul(transpose_x = bool(false), transpose_y = bool(false), x = " + w + "_d, y = " + x + ")");
     };
@@ -118,6 +149,7 @@ AneFfn::AneFfn(int hidden, int channels, std::vector<int> rows) : hidden_(hidden
         if (k == 0) tot = o;
         else { const std::string n = std::string(p) + "a" + S(k); L(T("fp16", C, R) + " " + n + " = add(x = " + tot + ", y = " + o + ")"); tot = n; }
       }
+      if (w8_) { L(T("fp16", C, R) + " " + p + "w = mul(x = " + tot + ", y = s" + p + "_d)"); tot = std::string(p) + "w"; }
       L(T("fp16", C, R) + " " + p + "s = mul(x = " + tot + ", y = tx_d)");
     }
     // silu(g) = g/2 (1 + tanh(g/2)) (Splash: the ANE's tanh is closer than its sigmoid)
@@ -150,6 +182,7 @@ AneFfn::AneFfn(int hidden, int channels, std::vector<int> rows) : hidden_(hidden
       if (i == 0) tot = "dm0";
       else { const std::string n = "da" + S(i); L(T("fp16", H, R) + " " + n + " = add(x = " + tot + ", y = dm" + S(i) + ")"); tot = n; }
     }
+    if (w8_) { L(T("fp16", H, R) + " dw = mul(x = " + tot + ", y = sd_d)"); tot = "dw"; }
     L(T("fp16", H + 1, R) + " yt = concat(axis = int32(2), interleave = bool(false), values = (" + tot + ", hscale))");
     L(y_.surface->mil_type(R) + " y = tensor_to_tensor_buffer<ios17>(input = yt, interleave_factors = tensor<uint8, [4]>([1, 1, 1, 1]), strides = tensor<int64, [4]>(" +
       y_.surface->mil_strides() + "))");
@@ -174,6 +207,7 @@ AneFfn::~AneFfn() {
   for (auto* v : {&x_, &wg_, &wu_, &wd_}) for (auto& t : *v) t.buffer->release();
   tx_.buffer->release();
   y_.buffer->release();
+  if (w8_) { sg_.buffer->release(); su_.buffer->release(); sd_.buffer->release(); }
 }
 
 mx::array AneFfn::stage(const mx::array& xq, const mx::array& tx, const mx::array& wg, const mx::array& wu, const mx::array& wd) {
@@ -183,10 +217,17 @@ mx::array AneFfn::stage(const mx::array& xq, const mx::array& tx, const mx::arra
                     mx::contiguous(wu, false, s), mx::contiguous(wd, false, s)});
 }
 mx::array AneFfn::stage_weights_q(const std::vector<mx::array>& g, const std::vector<mx::array>& u,
-                                  const std::vector<mx::array>& d, int bits, int group) {
+                                  const std::vector<mx::array>& d, int bits, int group,
+                                  const std::vector<mx::array>& row_scales) {
   auto s = mx::default_stream(mx::Device::gpu);
   std::vector<mx::array> in;
   for (auto* v : {&g, &u, &d}) for (auto& a : *v) in.push_back(mx::contiguous(a, false, s));
+  if (w8_) {
+    if (row_scales.size() != 3) throw std::runtime_error("ANE FFN int8 weights need gate/up/down row scales");
+    // the kernel divides by the scale (in[9..11]); the program multiplies by scale*128 (in[12..14])
+    for (auto& a : row_scales) in.push_back(mx::contiguous(mx::astype(a, mx::float16, s), false, s));
+    for (auto& a : row_scales) in.push_back(mx::contiguous(mx::astype(mx::multiply(a, mx::array(128.0f), s), mx::float16, s), false, s));
+  }
   auto prim = std::make_shared<AneStage>(s, this, true);
   prim->quantized_ = true; prim->bits_ = bits; prim->group_ = group;
   return mx::array({1}, mx::int32, prim, std::move(in));
@@ -207,6 +248,7 @@ int AneFfn::run(int rows) {
   in["tx"] = tx_.surface;
   for (size_t k = 0; k < wg_.size(); ++k) { in["wg" + S(k)] = wg_[k].surface; in["wu" + S(k)] = wu_[k].surface; }
   for (size_t i = 0; i < wd_.size(); ++i) in["wd" + S(i)] = wd_[i].surface;
+  if (w8_) { in["sg"] = sg_.surface; in["su"] = su_.surface; in["sd"] = sd_.surface; }
   program_->run(program_->procedure("ffn" + S(R)), in, y_.surface);
   return R;
 }
@@ -229,10 +271,11 @@ void AneStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>
   auto& enc = mx::metal::get_command_encoder(s);
   auto* lib = d.get_library("mtplx_ane_stage2", [] { return std::string(kStageSource); });
   if (quantized_) {
-    // in: gate (w, scales, biases) [C, H], up likewise, down (w, scales, biases) [H, C] (already the ANE's slices)
-    auto* kp = d.get_kernel("ane_prep_w", lib);
-    enc.set_compute_pipeline_state(kp);
+    // in: gate (w, scales, biases) [C, H], up likewise, down (w, scales, biases) [H, C] (already the ANE's slices);
+    // with int8 weights also the rotated rows' scales of gate [C], up [C], down [H].
     AneFfn& f = *ffn_;
+    auto* kp = d.get_kernel(f.w8_ ? "ane_prep_w8" : "ane_prep_w", lib);
+    enc.set_compute_pipeline_state(kp);
     const uint32_t H = f.hidden_, C = f.channels_;
     auto prep = [&](int base, uint32_t rows, uint32_t in_dim, uint32_t col0, const AneFfn::Target& dst, uint32_t blocks) {
       const uint32_t p[4] = {in_dim, col0, uint32_t(bits_), uint32_t(group_)};
@@ -243,6 +286,7 @@ void AneStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>
       enc.set_buffer(dst.buffer, 3);
       enc.set_bytes(p, 4, 4);
       enc.set_bytes(q, 4, 5);
+      if (f.w8_) enc.set_input_array(in[9 + base / 3], 6);
       enc.dispatch_threadgroups(MTL::Size(blocks, rows, 1), MTL::Size(256, 1, 1));
     };
     for (size_t k = 0; k < f.wg_.size(); ++k) {
@@ -253,6 +297,20 @@ void AneStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>
     for (size_t i = 0; i < f.wd_.size(); ++i) {
       prep(6, H, C, beg, f.wd_[i], f.dseg_[i] / kBlock);
       beg += f.dseg_[i];
+    }
+    if (f.w8_) {
+      // scales x 128 (the program dequantizes int8 weights by 1/128): ane_stage_h copies, so pass pre-scaled arrays.
+      enc.set_compute_pipeline_state(d.get_kernel("ane_stage_h", lib));
+      const AneFfn::Target* dst[3] = {&f.sg_, &f.su_, &f.sd_};
+      for (int j = 0; j < 3; ++j) {
+        const uint32_t rows = in[12 + j].shape(0);
+        const uint32_t pp[4] = {1, 1, 0, dst[j]->surface->stride / 2};
+        enc.set_input_array(in[12 + j], 0);
+        enc.set_buffer(dst[j]->buffer, 1);
+        enc.set_bytes(pp, 4, 2);
+        enc.set_bytes(rows, 3);
+        enc.dispatch_threads(MTL::Size(1, rows, 1), MTL::Size(1, 64, 1));
+      }
     }
     return;
   }

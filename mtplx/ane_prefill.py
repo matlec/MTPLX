@@ -95,6 +95,26 @@ def _prep_x(x2: mx.array) -> tuple[mx.array, mx.array]:
     return xq, (s * 128.0).astype(mx.float16)
 
 
+def _w8() -> bool:
+    """``MTPLX_ANE_PREFILL_W8=1``: int8 weights on the ANE (per-row scales of the rotated rows, computed
+    once per layer), W8A8 instead of W16A8."""
+
+    return os.environ.get("MTPLX_ANE_PREFILL_W8", "0") == "1"
+
+
+def _row_scales(self: Any, L: dict[str, Any]) -> list[mx.array]:
+    cached = L.get("row_scales")
+    if cached is None:
+        def rs(p: tuple) -> mx.array:
+            w = _had(mx.dequantize(*p[:3], group_size=p[3], bits=p[4]).astype(mx.float32))
+            return mx.maximum(mx.max(mx.abs(w), axis=-1), 1e-8) / 127.0
+
+        cached = [rs(L["ga"]), rs(L["ua"]), rs(L["da"])]
+        mx.eval(*cached)
+        L["row_scales"] = cached
+    return cached
+
+
 def install_gdn(model: Any) -> dict[str, Any]:
     """GDN in-projections split: the GPU computes in_proj_qkv's leading rows while the ANE computes its
     trailing ``MTPLX_ANE_PREFILL_GDN_QKV_TAIL`` rows (default 2048) and all of in_proj_z, in one program
@@ -206,7 +226,7 @@ def install(model: Any = None) -> dict[str, Any]:
         if ffn is None:
             with _LOCK:
                 if _STATE["ffn"] is None:
-                    _STATE["ffn"] = ext.AneFfn(H, channels, [512, 1024, 1536, 2048])
+                    _STATE["ffn"] = ext.AneFfn(H, channels, [512, 1024, 1536, 2048], w8=_w8())
                     logger.info("[ane-prefill] program ready (%.1f s)", _STATE["ffn"].compile_seconds)
                 ffn = _STATE["ffn"]
         if rows > ffn.max_rows:
@@ -227,7 +247,8 @@ def install(model: Any = None) -> dict[str, Any]:
         if ga[2] is None or ga[4] not in (4, 8) or not (ga[4] == ua[4] == da[4] and ga[3] == ua[3] == da[3]):
             stage = [ffn.stage(xq, tx, _had(_deq(ga)), _had(_deq(ua)), _had(_deq(da)))]
         else:
-            stage = [ffn.stage_input(xq, tx), ffn.stage_weights_q(list(ga[:3]), list(ua[:3]), list(da[:3]), ga[4], ga[3])]
+            scales = _row_scales(self, L) if _w8() else []
+            stage = [ffn.stage_input(xq, tx), ffn.stage_weights_q(list(ga[:3]), list(ua[:3]), list(da[:3]), ga[4], ga[3], scales)]
         mx.eval(*stage)
         if trace:
             t2 = _time.perf_counter()
