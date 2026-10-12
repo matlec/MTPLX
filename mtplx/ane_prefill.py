@@ -399,6 +399,18 @@ def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ss
     layers = inner.layers
     if not all(hasattr(l.mlp, "gate_proj") and hasattr(l.mlp.gate_proj, "scales") for l in layers):
         return None
+    # Past MAX_CONTEXT keys one half's attention is a ~1 s GPU command at 128K, and with the ANE reading
+    # memory beside it macOS can abort it for stalling the display (kIOGPUCommandBufferCallbackError
+    # ImpactingInteractivity, seen once at 140K, 2026-10-13). There the gain is small anyway (attention
+    # dominates), so long prefixes take the sequential split, whose attention runs alone.
+    limit = int(os.environ.get("MTPLX_ANE_PREFILL_PIPELINE_MAX_CONTEXT", "65536"))
+    try:
+        offset = int(getattr(cache[inner.fa_idx], "offset", 0) or 0)
+    except Exception:
+        offset = limit + 1
+    if offset + S > limit:
+        _STATE["pipeline_long_context_skips"] = _STATE.get("pipeline_long_context_skips", 0) + 1
+        return None
     channels = int(os.environ.get("MTPLX_ANE_PREFILL_PIPELINE_CHANNELS", "10240"))
     try:
         ffa, ffb = _ffn_pair(h.shape[-1], channels)
