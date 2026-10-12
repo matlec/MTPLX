@@ -1043,6 +1043,8 @@ def apply_profile_env(
     profile_env_overridden[:] = overridden
     for key, value in overrides.items():
         target[key] = value
+    if environ is None:
+        _apply_m1_batched_target_default(target, previous)
     announce_runtime_gated_env(target, profile_name=profile.name)
     if environ is None:
         # The gates that generation/kernels froze at import must follow the
@@ -1052,6 +1054,40 @@ def apply_profile_env(
 
         refresh_env_flags()
     return previous
+
+
+def _apply_m1_batched_target_default(
+    target: MutableMapping[str, str],
+    previous: Mapping[str, str | None],
+) -> None:
+    """M1 family: batched target distributions instead of lazy per-row.
+
+    The lazy strategy reads one verify row per accept step, each a separate
+    host-device round trip (~0.7 ms on M1 Max). The batched arm reads every
+    row in one eval with the same row-local device numerics, so the accept
+    loop draws the same tokens: 16/16 seeds byte-identical at 2K and 32K,
+    -1.2 to -1.4 ms per round (+1.2 to +1.5% decode). Operator env for either
+    key, or ``MTPLX_M1_BATCH_TARGET_DEFAULT=0``, keeps the profile's choice.
+    """
+
+    keys = ("MTPLX_LAZY_TARGET_DISTRIBUTIONS", "MTPLX_BATCH_TARGET_ARRAYS")
+    if any(str(previous.get(key) or "").strip() for key in keys):
+        return
+    if os.environ.get("MTPLX_M1_BATCH_TARGET_DEFAULT", "").strip().lower() in {
+        "0", "false", "no", "off",
+    }:
+        return
+    if target.get(keys[0]) != "1":
+        return
+    try:
+        from .cache_state import m1_long_context_defaults
+
+        if not m1_long_context_defaults():
+            return
+    except Exception:
+        return
+    target[keys[0]] = "0"
+    target[keys[1]] = "1"
 
 
 def restore_profile_env(
