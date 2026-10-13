@@ -1381,6 +1381,11 @@ _M1_MOE_LANE_ENV = {
     # 2,048-token chunk; 8K cold prefill 939 -> 967 tok/s (alternating
     # processes, 2 each). Calls under 16 tokens (decode) keep the stock path.
     "MTPLX_GDN_BLOCKED_PREFILL": "1",
+    # Fewer GDN dispatches per verify: fused projections and the fused
+    # gated-norm + out_proj. Alternating processes (2 each): 2K 85.8 -> 88.4
+    # tok/s, 30K 77.0 -> 77.0, greedy text identical.
+    "MTPLX_FUSED_GDN_OUT": "1",
+    "MTPLX_FUSE_GDN_PROJECTIONS": "1",
 }
 
 
