@@ -20967,11 +20967,17 @@ def _prefill_forward_bill(
         )
         if (
             source.startswith("geometry_measured")
+            and not source.startswith("geometry_measured_m1_mma")
             and width is not None
             and int(width) < _DENSE_PREFILL_FLAT_WIDTH
         ):
             # Under 1,024 rows a dense family's chunks also hold about a live
             # row per token of context (_ADMISSION_NARROW_PREFILL_WIDTHS).
+            # Not on the M1 MMA prefill: its narrow chunks build no score
+            # tensor, and the fp16 rows of the prefix it reads are the q8
+            # dequant already in the bill. M1 Max, 2026-10-13: a 257,672-token
+            # prompt at 512 rows peaked at 53.2 GB wired (no swap) where this
+            # term had priced it 6.7 GiB past the 48 GiB limit and refused it.
             scratch += max(1, int(prompt_tokens)) * int(geometry.live_bytes_per_token)
             source += "+context"
         chunk = _admission_chunk_bytes(geometry, rows, scratch)
@@ -22263,6 +22269,28 @@ def _m1_compact_direct_restore(source: Any, geometry: Any) -> bool:
     return bits == {8 if quant == "q8" else 4}
 
 
+def _admission_repage_layers(runtime: Any) -> int:
+    """How many steps the contiguous-to-paged repage takes: the full-attention
+    layers when each is materialized on its own (``MTPLX_REPAGE_EVAL_PER_LAYER``,
+    M1 default), else 1 (every layer's pages beside every layer's contiguous
+    KV). M1 Max, 2026-10-13: a 257,672-token cold prompt (q8) grew wired
+    memory by 18.4 GiB through the repage, against 26.3 GiB priced whole."""
+
+    try:
+        from mtplx.cache_state import _env_flag_default_m1
+
+        if not _env_flag_default_m1("MTPLX_REPAGE_EVAL_PER_LAYER"):
+            return 1
+        args = _runtime_text_args(runtime) if runtime is not None else None
+        layers = int(getattr(args, "num_hidden_layers", 0) or 0)
+        interval = int(getattr(args, "full_attention_interval", 0) or 0)
+        if layers <= 0:
+            return 1
+        return max(1, layers // interval) if interval > 0 else layers
+    except Exception:
+        return 1
+
+
 def _admission_growth(
     geometry: _AdmissionGeometry,
     *,
@@ -22282,6 +22310,7 @@ def _admission_growth(
     publish_bytes: int | None = None,
     slack_rows: int = 0,
     compact_direct: bool = False,
+    repage_layers: int = 1,
 ) -> dict[str, Any]:
     """New memory one request needs at its peak, on top of what is measured.
 
@@ -22422,7 +22451,13 @@ def _admission_growth(
     scratch = max(0, int(scratch_bytes))
     prefill_end = live_prefill + context_transient + scratch + lease_transient
     paged_copy = (P + out_rows) * paged_w if repages else 0
-    repage = live_prefill + paged_copy if repages else 0
+    # A repage that materializes one layer's pages at a time and drops that
+    # layer's contiguous rows (``MTPLX_REPAGE_EVAL_PER_LAYER``, M1 default)
+    # holds the contiguous KV plus one layer's pages at its peak, not both
+    # whole (``_admission_repage_layers``).
+    repage = (
+        live_prefill + paged_copy // max(1, int(repage_layers)) if repages else 0
+    )
     quant = str(geometry.kv_quantization or "off").lower()
     quantized = paged_live and quant in {"q4", "q8"}
     quant_working = 0
@@ -23277,6 +23312,7 @@ def _run_prefill_admission(
             ),
             publish_bytes=anchor_bytes,
             slack_rows=slack_rows,
+            repage_layers=_admission_repage_layers(runtime),
             compact_direct=bool(copies) and _m1_compact_direct_restore(source, geometry),
         )
         model["scratch_source"] = scratch_source

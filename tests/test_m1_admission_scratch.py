@@ -132,3 +132,40 @@ def test_the_direct_path_needs_every_condition(monkeypatch, env, source, quant):
         monkeypatch.setenv(k, v)
     geometry = SimpleNamespace(kv_quantization=quant)
     assert srv._m1_compact_direct_restore(source, geometry) is False
+
+
+def test_m1_narrow_chunks_are_not_billed_a_context_row(monkeypatch):
+    """At 512 rows (prompts past 163,840 tokens) the M1 MMA bill adds no live row
+    per token of context: the prefix it reads in fp16 is the q8 dequant, already
+    billed. The 2026-10-13 256K refusal was 15 GiB of this term."""
+
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "1")
+    for name in ("MTPLX_GQA_MMA_PREFILL", "MTPLX_GQA_MMA_PREFILL_MIN_PREFIX", "MTPLX_M1_MMA_PREFILL_SCRATCH_FRACTION"):
+        monkeypatch.delenv(name, raising=False)
+    state = SimpleNamespace(runtime=_q27_runtime())
+    geometry = base.TestGrowthModel._geometry(base.TestGrowthModel(), live_bytes_per_token=Q27_KV)
+    bill = srv._prefill_forward_bill(state, new_tokens=257_672, width=512, prompt_tokens=257_672, geometry=geometry)
+    assert "+context" not in bill["source"]
+    assert bill["scratch"] < 257_672 * Q27_KV
+
+
+def test_per_layer_repage_holds_one_layer_of_pages():
+    geometry = base.TestGrowthModel._geometry(base.TestGrowthModel(), live_bytes_per_token=Q27_KV)
+    kwargs = dict(
+        prompt_tokens=200_000, reused_tokens=0, restore_copies_prefix=False,
+        layout="contiguous_then_repage", source_layout=None, output_tokens=256,
+        publish=False, scratch_bytes=GIB,
+    )
+    whole = srv._admission_growth(geometry, **kwargs)
+    per_layer = srv._admission_growth(geometry, **kwargs, repage_layers=16)
+    assert per_layer["repage_bytes"] == whole["live_prefill_bytes"] + whole["repage_copy_bytes"] // 16
+    assert per_layer["repage_bytes"] < whole["repage_bytes"]
+
+
+def test_repage_layers_follow_the_full_attention_layers(monkeypatch):
+    rt = SimpleNamespace(model=SimpleNamespace(args=SimpleNamespace(num_hidden_layers=64, full_attention_interval=4)))
+    monkeypatch.setattr(srv, "_runtime_text_args", lambda runtime: runtime.model.args)
+    monkeypatch.setenv("MTPLX_REPAGE_EVAL_PER_LAYER", "1")
+    assert srv._admission_repage_layers(rt) == 16
+    monkeypatch.setenv("MTPLX_REPAGE_EVAL_PER_LAYER", "0")
+    assert srv._admission_repage_layers(rt) == 1
