@@ -37,6 +37,13 @@ The original README is in [README.upstream.md](README.upstream.md).
 - **Long contexts in 64 GB.** 8-bit paged KV, prompts of 32K+ prefilled straight
   into the 8-bit pages, memory-guard bills measured on this build, and an engine
   budget of 13/16 of RAM: a 256K-token conversation runs at the defaults.
+- **Mixture-of-experts models.** On the 35B-A3B: upstream's fused MoE kernels ported to the
+  FP16 checkpoint (with a race fix), capture_commit verification, fewer host syncs per
+  round, and an expert-segmented sorted gather for prefill. Decode is 1.6–2.7x
+  v2.12.2-m1.2 and ahead of Splash from 8K on (see the
+  [benchmark](https://github.com/shunya1810/apple-silicon-llm-bench#qwen36-35b-a3b-moe)).
+  The model-agnostic parts apply to every MoE model on M1 (`MTPLX_M1_MOE_LANE=0` turns
+  them off); dense models are unchanged.
 - **Agent-session fixes** (any Mac): session identity across token seams, tool
   argument whitespace, KV growth refusals ending an answer instead of failing it.
   See [CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.md).
@@ -75,7 +82,7 @@ Needs an M1-family Mac (measured on an M1 Max 64 GB, macOS 26), the
 model are used), and Xcode with the Metal toolchain for the native extensions.
 
 ```bash
-git clone --branch v2.12.2-m1.3 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.4 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # about a minute; prints mfa_attn: ok / ane_ffn: ok
 ```
@@ -100,7 +107,7 @@ prefill and the chained draft.
 |---|---|
 | `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16` | measured, recommended (turbo profile by default on M1) |
 | `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality-FP16` | measured (8-bit; 9 GB more memory, ~10–15% slower decode) |
-| Qwen3.6-35B-A3B (MoE) | runs, not tuned yet |
+| `Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16` (MoE) | measured and tuned on M1 (v2.12.2-m1.4): decode 90 / 88 / 77 / 69 / 57 / 43 tok/s at 2K / 8K / 32K / 64K / 128K / 256K |
 
 ## Switches
 
@@ -115,6 +122,7 @@ of them off.
 | `MTPLX_M1_PAGED_PREFILL=0` | on (32K+) | prefill straight into 8-bit pages |
 | `MTPLX_M1_ENGINE_RAM_FRACTION=0.75` | 13/16 | the larger engine budget |
 | `MTPLX_M1_TURBO_DEFAULT=0` | turbo for dense 4/8-bit | the turbo profile default |
+| `MTPLX_M1_MOE_LANE=0` | on for MoE models | the MoE launch defaults (kernels, sync cuts, prefill chunks) |
 
 The full list, with measurements: [CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.md).
 

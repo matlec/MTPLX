@@ -1,8 +1,57 @@
-# v2.12.2-m1.3 / m1.2 / m1.1 / v2.12.2-m1 / v2.12.0-m1 〜 m1.3 変更内容まとめ
+# v2.12.2-m1.4 / m1.3 / m1.2 / m1.1 / v2.12.2-m1 / v2.12.0-m1 〜 m1.3 変更内容まとめ
 
 - **ベースリポジトリ：** MTPLX 2.12.2（本家 `youssofal/MTPLX` の v2.12.2）。`v2.12.0-m1.3` までは 2.12.0 がベースです
-- **対象：** タグ `v2.12.2-m1.3`（ブランチ `m1max-longctx`）。下の「変更点一覧」の M1 向けの変更はそのまま引き継いでいます
+- **対象：** タグ `v2.12.2-m1.4`（ブランチ `m1max-longctx`）。下の「変更点一覧」の M1 向けの変更はそのまま引き継いでいます
 - **本家との差分：** コード、テストコード、各種ドキュメント（`docs/m1max-longctx/`）、起動・検証スクリプト
+
+## v2.12.2-m1.4 での変更（2026-10-14）
+
+**MoE（mixture-of-experts）のモデルを速くしました。** M1 系の Mac だけの変更です。dense のモデル（Qwen3.8-27B など）の動作は変わりません（同じ条件で交互に計測し、decode の速さと greedy の出力が一致しました）。
+
+### Qwen3.6-35B-A3B での結果
+
+[apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench) の 3 ターンの会話です。M1 Max 64GB、8bit の KV、temperature 0、Splash 1.3.0-m1.1 と交互に計測しました（2K〜64K は 2 回の中央値、128K と 256K は 1 回）。
+
+| decode（tok/s、3 ターンの平均） | 2K | 8K | 32K | 64K | 128K | 256K |
+|---|---|---|---|---|---|---|
+| v2.12.2-m1.2 | 55.1 | 47.6 | 36.0 | 30.4 | 20.7 | — |
+| **v2.12.2-m1.4** | **90.1** | **87.6** | **77.1** | **69.4** | **56.7** | **42.8** |
+| Splash 1.3.0-m1.1 | 93.6 | 77.9 | 58.7 | 50.6 | 35.4 | 21.5 |
+
+| 会話全体の時間 | 2K | 8K | 32K | 64K | 128K | 256K |
+|---|---|---|---|---|---|---|
+| v2.12.2-m1.2 | 16.7 秒 | 25.1 秒 | 62.1 秒 | 2.1 分 | 5.2 分 | — |
+| **v2.12.2-m1.4** | **10.9 秒** | **17.3 秒** | **47.3 秒** | **1.8 分** | **4.9 分** | **17.9 分** |
+| Splash 1.3.0-m1.1 | 9.7 秒 | 18.6 秒 | 63.6 秒 | 2.6 分 | 8.2 分 | 27.0 分 |
+
+- cold の prefill: 8K で 1,088 tok/s（m1.2 は 960、Splash は 906）、32K で 914（817、650）、128K で 480（478、282）
+- メモリのピーク: 27〜34 GB（Splash は 26〜29 GB）
+- 2K では、Splash の decode がまだ約 4% 速いです。
+
+### 変更点
+
+**A3B だけに入るもの**（kernel が A3B の形に合わせて書かれているもの）
+
+- **上流の A3B 向けの高速な kernel（row-owned router、combine、gate/up の packing、whole-MoE）を fp16 に移植しました**（`mtplx/kernels/moe_scalar.py`）。上流の kernel は BF16 の checkpoint 専用でした。M1 で使う FP16 版のモデルに合わせて、`bfloat` を `half` にして生成します。
+- **whole-MoE を capture_commit・8bit のページ・会話の保存（session bank）の上で使うようにしました**（`MTPLX_M1_WHOLE_MOE_ANY_ROUTE`）。上流では、厳密な比較のための条件（target_prefix、連続したキャッシュ、会話の保存なし）がそろわないと動きません。kernel は MoE ブロックだけを置き換え、キャッシュには触れません。
+- **whole-MoE の競合のバグを直しました。** stage 1（routing）の softmax が、行の最大値と合計を `simd_values[0]` に書いて配っていましたが、他の simdgroup がまだ読んでいる間に上書きすることがありました。GPU が混んでいると、同じ入力で選ばれる expert が変わることがありました（40 層を 8 回試して 7 回）。各 simdgroup が自分で部分和を集める形に直しました。上流の BF16 版にも同じコードがあります。
+- A3B の verify は、M1 では既定で capture_commit です（v2.12.2-m1.3 から）。
+
+**どの MoE にも入るもの**（config.json の expert の数で MoE と判断します）
+
+- **draft の同期の後回し**（`MTPLX_M1_MOE_DEFERRED_DRAFT`）: depth 1 の greedy の draft を GPU に渡したまま、トークンを verify の入力に使います。値はあとで読みます。
+- **bonus と訂正のトークンをまとめて計算**（`MTPLX_M1_MOE_BATCHED_BONUS`）: 全部受理したときの bonus の行も、却下したときの訂正のトークンも、accept の argmax と 1 回の読み出しで済ませます。
+- **greedy の chain の 12K の上限を外しました**（dense で決めた値でした）。
+- **サンプリングのときの early verify**（`MTPLX_CHAIN_EARLY_VERIFY`）: temperature 1.0 で 2K は 75.8 → 82.2 tok/s、30K は 65.8 → 72.3 tok/s。同じ seed なら出力は一致します。
+- **MoE の prefill の gather を expert ごとに区切りました**（`mtplx/kernels/moe_seg_gather_m1.py`、`MTPLX_M1_MOE_SEG_GATHER`）。MLX 0.32.2 の gather_qmm は、tile が expert の境目をまたぐと行列積をやり直します。expert ごとに tile を切り、MLX 自身の `qmm_t_impl` で計算します。結果はビット単位で一致し、最初の呼び出しで形ごとに照合して、合わなければ元の処理に戻します。MoE ブロックは 25.3 → 21.3 ms（2048 トークン）になりました。
+- **prefill の chunk を 4,096 トークンに**しました。8K の cold prefill は +6%、30K は +4.5% です。メモリが足りないときは、メモリガードが今までどおり chunk を狭めます。
+- **qwen3_next の GDN を持つ MoE だけ**: blocked の GDN prefill、GDN の射影と出力の融合（`MTPLX_GDN_BLOCKED_PREFILL`、`MTPLX_FUSE_GDN_PROJECTIONS`、`MTPLX_FUSED_GDN_OUT`）
+- A3B 以外の MoE では計測していません。どれも出力が一致する（または一致を確かめてから使う）変更ですが、速くなるかは確かめていません。
+
+**切り替え**
+
+- `MTPLX_M1_MOE_LANE=0` で、上の起動時の設定をすべて止められます。個々の環境変数を自分で設定すれば、その値が優先されます。
+- 設定はサーバーのプロセス（アプリと `mtplx serve`）にだけ渡し、dense のモデルには渡しません。CLI の `run` / `ask` の 1 回だけの生成には入りません。
 
 ## v2.12.2-m1.3 での変更（2026-10-13）
 

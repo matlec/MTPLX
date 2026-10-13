@@ -21,6 +21,7 @@ MTPLX のプロジェクトとは関係のない非公式のフォークです�
 - **M1 向けの attention の kernel**：キャッシュ済みの部分に対する prefill の attention を、M1 向けに調整した [metal-flash-attention](https://github.com/philipturner/metal-flash-attention)（head size 256）で計算します。verify の attention と射影も M1 の GPU に合わせています。
 - **decode でホストとの往復を減らす**：verify の各行と KV の位置を 1 回でまとめて読み、draft の 3 段を GPU 上で続けて作ります。MTP のキャッシュはその場で書き込みます。32K の文脈では、decode の 1 ラウンドが約 5% 短くなります。
 - **64 GB で長い文脈を扱う**：KV を 8bit のページで持ち、32K トークン以上のプロンプトは最初から 8bit のページに読み込みます。メモリガードの見積もりをこのフォークでの実測に合わせ、エンジンが RAM の 13/16 まで使えるようにしました。256K トークンの会話が既定の設定で動きます。
+- **MoE（mixture-of-experts）のモデル**：35B-A3B では、上流の MoE の融合 kernel を FP16 の checkpoint に移植し（競合のバグも修正）、verify を capture_commit にし、1 ラウンドあたりのホストとの同期を減らし、prefill の gather を expert ごとに区切りました。decode は v2.12.2-m1.2 の 1.6〜2.7 倍で、8K 以上では Splash より速くなりました（[ベンチ](https://github.com/shunya1810/apple-silicon-llm-bench/blob/main/README.ja.md)）。モデルに依存しない部分は M1 のすべての MoE のモデルに入ります（`MTPLX_M1_MOE_LANE=0` で止まります）。dense のモデルは変わりません。
 - **エージェントでの会話の修正**（どの Mac でも有効）：トークンの区切り方の違いで同じ会話が別の会話として扱われる問題、ツールの引数の空白が消える問題、KV を広げられないときに回答ごと失敗する問題などを直しました。詳しくは [CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.md) を見てください。
 
 ## 計測結果
@@ -55,7 +56,7 @@ MTPLX のプロジェクトとは関係のない非公式のフォークです�
 - ネイティブ拡張をビルドするための、Metal のツールチェーンが入った Xcode
 
 ```bash
-git clone --branch v2.12.2-m1.3 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.4 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # 1 分ほど。mfa_attn: ok / ane_ffn: ok と表示されれば完了
 ```
@@ -77,7 +78,7 @@ PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/pyth
 |---|---|
 | `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16` | 計測済み、おすすめ（M1 では既定で turbo の profile） |
 | `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality-FP16` | 計測済み（8bit。メモリが 9 GB 多く、decode は 10〜15% 遅い） |
-| Qwen3.6-35B-A3B（MoE） | 動くが、まだ調整していない |
+| `Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16`（MoE） | M1 向けに調整・計測済み（v2.12.2-m1.4）。decode は 2K / 8K / 32K / 64K / 128K / 256K で 90 / 88 / 77 / 69 / 57 / 43 tok/s |
 
 ## 切り替え
 
@@ -91,6 +92,7 @@ M1 向けの既定値は、1 つずつ止められます。`MTPLX_M1_LONG_CONTEX
 | `MTPLX_M1_PAGED_PREFILL=0` | on（32K 以上） | 8bit のページへの直接の prefill |
 | `MTPLX_M1_ENGINE_RAM_FRACTION=0.75` | 13/16 | 広げたエンジンのメモリ上限 |
 | `MTPLX_M1_TURBO_DEFAULT=0` | dense の 4/8bit は turbo | turbo の profile の既定 |
+| `MTPLX_M1_MOE_LANE=0` | MoE のモデルで on | MoE の起動時の設定（kernel、同期の削減、prefill の chunk） |
 
 すべての変更点と計測値は [CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.md) にあります。
 
