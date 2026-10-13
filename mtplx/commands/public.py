@@ -1386,6 +1386,12 @@ _M1_MOE_LANE_ENV = {
     # tok/s, 30K 77.0 -> 77.0, greedy text identical.
     "MTPLX_FUSED_GDN_OUT": "1",
     "MTPLX_FUSE_GDN_PROJECTIONS": "1",
+    # Prefill chunks of 4,096 rows: the MoE's expert-segmented gather fills
+    # its tiles better with more rows per expert. Cold prefill (alternating
+    # processes, 2 each): 8K 1068 -> 1132 tok/s, 30K 901 -> 942 tok/s. The
+    # memory admission still narrows a chunk that does not fit.
+    "MTPLX_PREFILL_CHUNK_SIZE_DENSE": "4096",
+    "MTPLX_PREFILL_CHUNK_SIZE_REPAGE": "4096",
 }
 
 
