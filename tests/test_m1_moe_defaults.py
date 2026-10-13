@@ -11,7 +11,7 @@ from mtplx.commands import public as p
 @pytest.fixture(autouse=True)
 def _private_environ(monkeypatch):
     env = dict(os.environ)
-    for key in p._M1_MOE_LANE_ENV:
+    for key in (*p._M1_MOE_ENV, *p._M1_MOE_GDN_ENV, *p._M1_A3B_ENV):
         env.pop(key, None)
     env.pop("MTPLX_M1_MOE_LANE", None)
     monkeypatch.setattr(os, "environ", env)
@@ -57,18 +57,43 @@ def test_explicit_flag_and_dense_models_are_untouched(monkeypatch):
     assert a.verify_strategy is None and a.depth == 3
 
 
-def test_m1_moe_lane_env_only_for_m1_capture_commit(_private_environ):
+def _model_dir(tmp_path, name, config):
+    import json
+
+    d = tmp_path / name
+    d.mkdir()
+    (d / "config.json").write_text(json.dumps(config))
+    return d
+
+
+_GDN = {"recommended_backend": "qwen3_next"}
+
+
+def test_a3b_gets_every_lane(_private_environ, tmp_path):
     env = _private_environ
     env["MTPLX_M1_LONG_CONTEXT"] = "1"
     env["MTPLX_QWEN_MOE_PACK_GATE_UP"] = "0"
     a = _args()
     p._apply_qwen36_35b_optimized_speed_defaults(a, _moe_id())
+    p._apply_m1_moe_defaults(a, _GDN, _moe_id(), _model_dir(tmp_path, "a3b", {"num_experts": 256}))
     child = a._child_env_defaults
-    assert child["MTPLX_A3B_WHOLE_MOE_FUSION"] == "1"
-    assert child["MTPLX_M1_MOE_DEFERRED_DRAFT"] == "1"
+    for key in (*p._M1_MOE_ENV, *p._M1_MOE_GDN_ENV, "MTPLX_A3B_WHOLE_MOE_FUSION"):
+        assert key in child, key
     assert "MTPLX_QWEN_MOE_PACK_GATE_UP" not in child  # an explicit env wins
     assert "MTPLX_LINEAR_GDN_FROM_CONV_TGY" not in child
     assert "MTPLX_A3B_WHOLE_MOE_FUSION" not in env  # never this process's env
+
+
+def test_other_moe_gets_the_generic_lane_only(_private_environ, tmp_path):
+    env = _private_environ
+    env["MTPLX_M1_LONG_CONTEXT"] = "1"
+    a = _args()
+    moe = _model_dir(tmp_path, "moe", {"text_config": {"num_experts": 128}})
+    p._apply_m1_moe_defaults(a, {"recommended_backend": "mixtral"}, "some-moe", moe)
+    assert set(a._child_env_defaults) == set(p._M1_MOE_ENV)
+    b = _args()
+    p._apply_m1_moe_defaults(b, _GDN, "some-qwen3-next-moe", moe)
+    assert set(b._child_env_defaults) == set(p._M1_MOE_ENV) | set(p._M1_MOE_GDN_ENV)
 
 
 @pytest.mark.parametrize(
@@ -76,18 +101,34 @@ def test_m1_moe_lane_env_only_for_m1_capture_commit(_private_environ):
     [
         {"MTPLX_M1_LONG_CONTEXT": "0"},
         {"MTPLX_M1_LONG_CONTEXT": "1", "MTPLX_M1_MOE_LANE": "0"},
-        {"MTPLX_M1_LONG_CONTEXT": "1", "MTPLX_M1_MOE_VERIFY_STRATEGY": "target_prefix"},
     ],
 )
-def test_m1_moe_lane_env_stays_off(_private_environ, setup):
+def test_m1_moe_lane_env_stays_off(_private_environ, tmp_path, setup):
     env = _private_environ
     env.update(setup)
     a = _args()
     p._apply_qwen36_35b_optimized_speed_defaults(a, _moe_id())
+    p._apply_m1_moe_defaults(a, _GDN, _moe_id(), _model_dir(tmp_path, "a3b", {"num_experts": 256}))
     assert not a._child_env_defaults
-    dense = _args()
-    p._apply_qwen36_35b_optimized_speed_defaults(dense, "mtplx-qwen38-27b-optimized-speed-fp16")
-    assert not getattr(dense, "_child_env_defaults", None)
+
+
+def test_dense_models_get_nothing(_private_environ, tmp_path):
+    env = _private_environ
+    env["MTPLX_M1_LONG_CONTEXT"] = "1"
+    a = _args()
+    dense = _model_dir(tmp_path, "dense", {"num_experts": 0, "text_config": {"hidden_size": 5120}})
+    p._apply_m1_moe_defaults(a, _GDN, "mtplx-qwen38-27b-optimized-speed-fp16", dense)
+    assert a._child_env_defaults == {}
+
+
+def test_a3b_target_prefix_keeps_only_the_generic_lane(_private_environ, tmp_path):
+    env = _private_environ
+    env.update({"MTPLX_M1_LONG_CONTEXT": "1", "MTPLX_M1_MOE_VERIFY_STRATEGY": "target_prefix"})
+    a = _args()
+    p._apply_qwen36_35b_optimized_speed_defaults(a, _moe_id())
+    p._apply_m1_moe_defaults(a, _GDN, _moe_id(), _model_dir(tmp_path, "a3b", {"num_experts": 256}))
+    assert "MTPLX_A3B_WHOLE_MOE_FUSION" not in a._child_env_defaults
+    assert "MTPLX_M1_MOE_DEFERRED_DRAFT" in a._child_env_defaults
 
 
 def test_ane_prefill_skips_moe_models():

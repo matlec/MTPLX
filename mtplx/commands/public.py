@@ -1349,17 +1349,48 @@ def _m1_moe_verify_strategy() -> str | None:
         return None
 
 
-# M1 family, Qwen3.6-35B-A3B only (2026-10-14, M1 Max, q8 KV, depth 1,
-# capture_commit, greedy 300-token decode; moe-s1/abl.txt): the upstream fast
-# lane ported to fp16 plus two host-sync cuts. Decode 71 -> 86 tok/s at 2K and
-# 62 -> 77 tok/s at 30K, greedy text identical to the lane without the
-# sync cuts. Row-owned router + combine tail + packed gate/up: +8-9%;
-# whole-MoE fusion: +4.5% (it installs only beside the compiled target-prefix
-# factory, which needs the GDN postconv); deferred draft + batched bonus
-# (generation.py): +7%; the greedy trio fence (12K, measured on a dense model)
-# would turn the deferred draft off past 12K. MTPLX_LINEAR_GDN_FROM_CONV_TGY=4
-# measured no gain (-4% at 30K) and stays off. setdefault: an explicit env wins.
-_M1_MOE_LANE_ENV = {
+# M1 family, mixture-of-experts daemons (measured on Qwen3.6-35B-A3B,
+# 2026-10-14, M1 Max, q8 KV, depth 1, capture_commit; moe-s1/REPORT.md).
+# Launch env handed to the daemon only (never this process), keys the caller
+# already set win, ``MTPLX_M1_MOE_LANE=0`` turns all of it off, and a dense
+# model never gets any of it. A3B decode 71 -> 88 tok/s at 2K, 62 -> 77 at
+# 30K; cold prefill 8K 960 -> 1130 tok/s.
+#
+# Any MoE (none of these knows the model's shapes):
+_M1_MOE_ENV = {
+    # Deferred depth-1 greedy draft, batched bonus/correction argmax
+    # (generation.py): +9% at 2K, greedy text identical. The greedy trio's
+    # 12K fence was measured on a dense model and turned the chain off at 30K.
+    "MTPLX_M1_MOE_DEFERRED_DRAFT": "1",
+    "MTPLX_M1_MOE_BATCHED_BONUS": "1",
+    "MTPLX_GREEDY_TRIO_MAX_CONTEXT": "0",
+    # Sampled requests: the verify queues behind the device-predicted draft
+    # chain. A3B, temperature 1.0, same seeds, same text: 75.8 -> 82.2 tok/s
+    # at 2K, 65.8 -> 72.3 at 30K (on the dense 27B it measured no gain).
+    "MTPLX_CHAIN_EARLY_VERIFY": "1",
+    # 4,096-row prefill chunks: the expert-segmented sorted gather
+    # (kernels/moe_seg_gather_m1, on for every MoE on M1) fills its tiles
+    # better with more rows per expert. A3B cold prefill: 8K 1068 -> 1132
+    # tok/s, 30K 901 -> 942. The memory admission still narrows a chunk.
+    "MTPLX_PREFILL_CHUNK_SIZE_DENSE": "4096",
+    "MTPLX_PREFILL_CHUNK_SIZE_REPAGE": "4096",
+}
+# MoE with qwen3-next Gated DeltaNet layers (backend ``qwen3_next``):
+_M1_MOE_GDN_ENV = {
+    # Blocked-sequential GDN prefill: 5.75 -> 3.77 ms per layer at 2,048
+    # rows; 8K cold prefill 939 -> 967 tok/s.
+    "MTPLX_GDN_BLOCKED_PREFILL": "1",
+    # Fused GDN projections and gated-norm + out_proj: 2K 85.8 -> 88.4 tok/s,
+    # 30K unchanged, greedy text identical.
+    "MTPLX_FUSED_GDN_OUT": "1",
+    "MTPLX_FUSE_GDN_PROJECTIONS": "1",
+}
+# Qwen3.6-35B-A3B only (kernels written for its 256 experts / top-8 / 2048
+# hidden), on the capture_commit route: the upstream fast lane ported to fp16.
+# Row-owned router + combine tail + packed gate/up: +8-9%; whole-MoE fusion
+# (installs only beside the compiled target-prefix factory, which needs the
+# GDN postconv): +4.5%. MTPLX_LINEAR_GDN_FROM_CONV_TGY=4 measured no gain.
+_M1_A3B_ENV = {
     "MTPLX_QWEN_ROW_OWNED_ROUTER": "1",
     "MTPLX_QWEN_COMBINE_TAIL": "1",
     "MTPLX_QWEN_MOE_PACK_GATE_UP": "1",
@@ -1368,41 +1399,41 @@ _M1_MOE_LANE_ENV = {
     "MTPLX_A3B_GDN_POSTCONV_IMPL": "headquarter",
     "MTPLX_A3B_WHOLE_MOE_FUSION": "1",
     "MTPLX_M1_WHOLE_MOE_ANY_ROUTE": "1",
-    "MTPLX_GREEDY_TRIO_MAX_CONTEXT": "0",
-    "MTPLX_M1_MOE_DEFERRED_DRAFT": "1",
-    "MTPLX_M1_MOE_BATCHED_BONUS": "1",
-    # Sampled requests: the verify queues behind the device-predicted draft
-    # chain (generation._chain_early_verify_enabled). In-process ABAB at
-    # temperature 1.0, same seeds, same text: 75.8 -> 82.2 tok/s at 2K and
-    # 65.8 -> 72.3 at 30K (on the dense 27B it measured no gain).
-    "MTPLX_CHAIN_EARLY_VERIFY": "1",
-    # Prefill: the blocked-sequential GDN kernel (kernels/gdn_blocked_prefill)
-    # for the 30 linear-attention layers: 5.75 -> 3.77 ms per layer at a
-    # 2,048-token chunk; 8K cold prefill 939 -> 967 tok/s (alternating
-    # processes, 2 each). Calls under 16 tokens (decode) keep the stock path.
-    "MTPLX_GDN_BLOCKED_PREFILL": "1",
-    # Fewer GDN dispatches per verify: fused projections and the fused
-    # gated-norm + out_proj. Alternating processes (2 each): 2K 85.8 -> 88.4
-    # tok/s, 30K 77.0 -> 77.0, greedy text identical.
-    "MTPLX_FUSED_GDN_OUT": "1",
-    "MTPLX_FUSE_GDN_PROJECTIONS": "1",
-    # Prefill chunks of 4,096 rows: the MoE's expert-segmented gather fills
-    # its tiles better with more rows per expert. Cold prefill (alternating
-    # processes, 2 each): 8K 1068 -> 1132 tok/s, 30K 901 -> 942 tok/s. The
-    # memory admission still narrows a chunk that does not fit.
-    "MTPLX_PREFILL_CHUNK_SIZE_DENSE": "4096",
-    "MTPLX_PREFILL_CHUNK_SIZE_REPAGE": "4096",
 }
+_MOE_EXPERT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 
 
-def _m1_moe_lane_env() -> dict[str, str]:
-    """The M1 MoE lane env the A3B daemon is launched with: empty off the M1
-    family or with ``MTPLX_M1_MOE_LANE=0``, and without any key the caller's
-    environment already sets."""
+def _config_is_moe(model_path: Any) -> bool:
+    """Whether the checkpoint's config.json (or its text_config) routes experts."""
+
+    import json
+
+    try:
+        config = json.loads((Path(str(model_path)) / "config.json").read_text())
+    except Exception:
+        return False
+    for section in (config, config.get("text_config") or {}):
+        if not isinstance(section, dict):
+            continue
+        for key in _MOE_EXPERT_KEYS:
+            try:
+                if int(section.get(key) or 0) > 1:
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
+
+
+def _m1_moe_lane_env(
+    *, moe: bool, gdn: bool, a3b_capture_commit: bool
+) -> dict[str, str]:
+    """The M1 MoE launch env for one daemon: empty for a dense model, off the
+    M1 family or with ``MTPLX_M1_MOE_LANE=0``, and without any key the
+    caller's environment already sets."""
 
     import os
 
-    if (os.environ.get("MTPLX_M1_MOE_LANE") or "").strip() == "0":
+    if not moe or (os.environ.get("MTPLX_M1_MOE_LANE") or "").strip() == "0":
         return {}
     try:
         from mtplx.cache_state import m1_long_context_defaults
@@ -1411,11 +1442,29 @@ def _m1_moe_lane_env() -> dict[str, str]:
             return {}
     except Exception:
         return {}
-    return {
-        key: value
-        for key, value in _M1_MOE_LANE_ENV.items()
-        if key not in os.environ
+    env = dict(_M1_MOE_ENV)
+    if gdn:
+        env.update(_M1_MOE_GDN_ENV)
+    if a3b_capture_commit:
+        env.update(_M1_A3B_ENV)
+    return {key: value for key, value in env.items() if key not in os.environ}
+
+
+def _apply_m1_moe_defaults(
+    args: Any, inspection: dict[str, Any], model_id: str, model_path: Any
+) -> None:
+    """Hand the daemon the M1 MoE launch env (``args._child_env_defaults``)."""
+
+    a3b = model_id in {
+        QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
+        QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
     }
+    args._child_env_defaults = _m1_moe_lane_env(
+        moe=a3b or _config_is_moe(model_path),
+        gdn=_inspection_backend_id(inspection) == "qwen3_next",
+        a3b_capture_commit=a3b
+        and getattr(args, "verify_strategy", None) == "capture_commit",
+    )
 
 
 def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None:
@@ -1433,12 +1482,6 @@ def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None
         args.depth = 1
     if "verify-strategy" not in cli_flags:
         args.verify_strategy = _m1_moe_verify_strategy() or "target_prefix"
-    # Handed to the daemon's environment at launch (never this process's).
-    args._child_env_defaults = (
-        _m1_moe_lane_env()
-        if getattr(args, "verify_strategy", None) == "capture_commit"
-        else {}
-    )
     if "draft-temperature" not in cli_flags:
         args.draft_temperature = 0.6
         injected.add("draft-temperature")
@@ -10102,6 +10145,7 @@ def cmd_serve_public(args: Any) -> int:
     _apply_model_contract_depth_default(args, inspection, profile)
     _apply_backend_serve_defaults(args, inspection)
     _apply_qwen36_35b_optimized_speed_defaults(args, model_id)
+    _apply_m1_moe_defaults(args, inspection, model_id, runtime_model)
     backend_descriptor = descriptor_from_inspection(inspection)
     draft_lm_head = _model_draft_lm_head_spec(inspection, profile) or {
         "bits": 4,

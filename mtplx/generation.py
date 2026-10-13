@@ -2561,8 +2561,8 @@ def _m1_moe_deferred_draft_enabled(rt: Any) -> bool:
     The verify window reads the drafted token on device and the host value is
     read once the verify forward is queued. On the A3B (M1 Max, 2K) the
     draft sync and its gap were ~2 ms of a 20 ms round with the GPU idle.
-    Set by the A3B launch defaults on the M1 family (commands/public.py
-    _M1_MOE_LANE_ENV); dense models never set it.
+    Set by the M1 MoE launch defaults (commands/public.py _M1_MOE_ENV);
+    dense models never set it.
     """
     del rt
     return os.environ.get("MTPLX_M1_MOE_DEFERRED_DRAFT", "").strip() == "1"
