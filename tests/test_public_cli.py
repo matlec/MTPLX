@@ -7585,6 +7585,9 @@ def test_public_model_ids_resolve_to_hf_model_defaults(public_model_id, expected
 
 
 def test_serve_uses_measured_qwen36_35b_speed_defaults(monkeypatch):
+    # Upstream's measured defaults; the M1 family serves capture_commit
+    # instead (tests/test_m1_moe_defaults.py).
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "0")
     calls = {}
 
     monkeypatch.setattr(

@@ -2555,6 +2555,32 @@ def _m1_paged_prefill_enabled(context_tokens: int) -> bool:
     return int(context_tokens) >= _env_int("MTPLX_M1_PAGED_PREFILL_MIN_CONTEXT", 32768)
 
 
+def _m1_moe_deferred_draft_enabled(rt: Any) -> bool:
+    """``MTPLX_M1_MOE_DEFERRED_DRAFT=1``: no host sync on the depth-1 greedy draft.
+
+    The verify window reads the drafted token on device and the host value is
+    read once the verify forward is queued. On the A3B (M1 Max, 2K) the
+    draft sync and its gap were ~2 ms of a 20 ms round with the GPU idle.
+    Set by the A3B launch defaults on the M1 family (commands/public.py
+    _M1_MOE_LANE_ENV); dense models never set it.
+    """
+    del rt
+    return os.environ.get("MTPLX_M1_MOE_DEFERRED_DRAFT", "").strip() == "1"
+
+
+def _m1_whole_moe_any_route() -> bool:
+    """``MTPLX_M1_WHOLE_MOE_ANY_ROUTE=1``: serve the installed whole-MoE block
+    on any verify route (capture_commit, q8 pages, session bank).
+
+    The kernels replace the MoE block of each decode row and never touch the
+    cache; the upstream request contract (exact target-prefix, contiguous
+    cache, cold prompt) exists so a greedy stream byte-matches generate_ar,
+    not for the block itself. The compiled target-prefix request preflight
+    still runs whenever that route serves the request.
+    """
+    return os.environ.get("MTPLX_M1_WHOLE_MOE_ANY_ROUTE", "").strip() == "1"
+
+
 def _sustained_prefill_layout(context_tokens: int | None = None) -> str:
     """The prefill cache layout for the prompt being prefilled.
 
@@ -10968,20 +10994,23 @@ def generate_mtpk(
             verify_core=verify_core,
             mtp_history_policy=mtp_history_policy,
         )
-    if bool(getattr(rt, "a3b_whole_moe_installed", False)):
+    if bool(getattr(rt, "a3b_whole_moe_installed", False)) and (
+        not _m1_whole_moe_any_route() or exact_a3b_target_prefix
+    ):
         os.environ["MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS"] = str(len(prompt_ids))
         whole_moe_prefill_layout = _sustained_prefill_layout()
-        validate_a3b_whole_moe_request(
-            verify_strategy=verify_strategy,
-            requested_speculative_depth=requested_speculative_depth,
-            speculative_depth=speculative_depth,
-            verify_core=verify_core,
-            draft_core=draft_core,
-            compiled_target_prefix=exact_a3b_target_prefix,
-            session_bank_present=session_bank is not None,
-            vision_splice_present=vision_splice is not None,
-            prefill_layout=whole_moe_prefill_layout,
-        )
+        if not _m1_whole_moe_any_route():
+            validate_a3b_whole_moe_request(
+                verify_strategy=verify_strategy,
+                requested_speculative_depth=requested_speculative_depth,
+                speculative_depth=speculative_depth,
+                verify_core=verify_core,
+                draft_core=draft_core,
+                compiled_target_prefix=exact_a3b_target_prefix,
+                session_bank_present=session_bank is not None,
+                vision_splice_present=vision_splice is not None,
+                prefill_layout=whole_moe_prefill_layout,
+            )
         ensure_a3b_whole_moe_request_preflight(
             rt,
             prompt_ids,
@@ -12896,6 +12925,16 @@ def generate_mtpk(
         and _mtp_history_uses_committed_cache(mtp_history_policy)
         and _env_enabled_default_on("MTPLX_GREEDY_DRAFT_CHAIN")
     )
+    # M1 MoE: hand the depth-1 greedy draft to the verify forward as a device
+    # token instead of syncing on it (see _m1_moe_deferred_draft_enabled).
+    _deferred_draft_eligible = (
+        _greedy_chain_eligible and _m1_moe_deferred_draft_enabled(rt)
+    )
+    _batched_bonus_eligible = (
+        _greedy_chain_eligible
+        and state_rebase_every <= 0
+        and os.environ.get("MTPLX_M1_MOE_BATCHED_BONUS", "").strip() == "1"
+    )
     # Acceptance-EMA adaptive draft temperature (MTPLX_ADAPTIVE_DTEMP,
     # default off) — HYPER-PLAN §15 ship shape for the register-dependent
     # dtemp-0.85 lever. PRE-BOUND like the greedy chain above: activation is
@@ -14617,6 +14656,7 @@ def generate_mtpk(
                 event["drafts"][-1]["timing_s"]["draft"] = _sc_elapsed
             _sampled_chain_rounds += 1
             _greedy_chain_used = _sampled_chain_next_depth >= cycle_depth
+        _deferred_draft_array = None
         if (
             _greedy_chain_eligible
             and not used_device_core
@@ -14678,9 +14718,23 @@ def generate_mtpk(
                 _chain_tok = _chain_arg.reshape(1, 1).astype(mx.int32)
                 _chain_hidden = _chain_hidden_next[:, -1:, :]
                 draft_hidden_for_update.append(_chain_hidden)
-            _eval(*_chain_pending, *_chain_conf_pending, _chain_hidden)
-            _chain_tokens = [int(a.item()) for a in _chain_pending]
-            _chain_confs = [float(c.item()) for c in _chain_conf_pending]
+            if (
+                _deferred_draft_eligible
+                and cycle_depth == 1
+                and len(_chain_pending) == 1
+                and not _chain_conf_pending
+            ):
+                # Submit the draft now and let the verify window read the
+                # token on device; the host value is read after the verify
+                # forward is queued (the draft finished long before).
+                mx.async_eval(*_chain_pending, _chain_hidden)
+                _deferred_draft_array = _chain_pending[0]
+                _chain_tokens = [-1]
+                _chain_confs = []
+            else:
+                _eval(*_chain_pending, *_chain_conf_pending, _chain_hidden)
+                _chain_tokens = [int(a.item()) for a in _chain_pending]
+                _chain_confs = [float(c.item()) for c in _chain_conf_pending]
             # Parallel-array invariant: draft_hidden_update_keys must track
             # draft_hidden_for_update position-for-position (the online-hidden
             # consumer indexes by position). Keys are host-cheap here — the
@@ -14721,6 +14775,8 @@ def generate_mtpk(
                 if _chain_offsets[_chain_index] is not None:
                     _chain_event["position_offset"] = int(_chain_offsets[_chain_index])
                 event["drafts"].append(_chain_event)
+            if _deferred_draft_array is not None:
+                event["drafts"][-1]["draft_core"] = "greedy-chain-deferred"
             draft_hidden = _chain_hidden
             next_token = _chain_tokens[-1]
             _greedy_chain_used = True
@@ -15168,6 +15224,22 @@ def generate_mtpk(
                 (mx.array([[primary]]), device_draft_token.reshape(1, 1)),
                 axis=1,
             )
+        elif _deferred_draft_array is not None:
+            # Stop-token checks need the host draft; a stop draft only makes
+            # the bonus row unused, never wrong.
+            lazy_bonus_verify = False
+            bonus_distribution_row_needed = (
+                not omit_speculative_bonus and len(tokens) + 1 < max_tokens
+            )
+            target_distribution_rows_needed = 1 + int(bonus_distribution_row_needed)
+            verified_token_count = 2
+            verify_input_array = mx.concatenate(
+                (
+                    mx.array([[primary]], dtype=mx.int32),
+                    _deferred_draft_array.reshape(1, 1).astype(mx.int32),
+                ),
+                axis=1,
+            )
         else:
             lazy_bonus_verify = (
                 lazy_bonus_verify_requested
@@ -15392,6 +15464,12 @@ def generate_mtpk(
         elapsed_verify_forward = time.perf_counter() - started_forward
         verify_forward_time += elapsed_verify_forward
         _add_timing(event, "verify_forward", elapsed_verify_forward)
+        if _deferred_draft_array is not None:
+            _deferred_token = int(_deferred_draft_array.item())
+            draft_tokens[-1] = _deferred_token
+            event["drafts"][-1]["token"] = _deferred_token
+            next_token = _deferred_token
+            _deferred_draft_array = None
         # The rows the window is verified and sampled against. Under a grammar
         # constraint each is masked at its own grammar position (as the AR lane
         # masks each step), so acceptance, residual corrections and the
@@ -15702,6 +15780,7 @@ def generate_mtpk(
         # knob may default on. Bonus row NOT ported (stale-row hazard via
         # maybe_rebase_decode_state on the all-accept path).
         _batched_target_tokens: list[int] | None = None
+        _batched_bonus_token: int | None = None
         if (
             _trio_context_ok
             and sampler.temperature <= 0
@@ -15711,9 +15790,23 @@ def generate_mtpk(
             and int(verify_logits.shape[1]) >= len(draft_tokens)
             and _env_enabled_default_on("MTPLX_BATCHED_GREEDY_ACCEPT")
         ):
-            _batched_target_tokens = mx.argmax(
-                accept_logits[0, : len(draft_tokens), :], axis=-1
-            ).tolist()
+            if (
+                _batched_bonus_eligible
+                and not lazy_bonus_verify
+                and int(verify_logits.shape[1]) > len(draft_tokens)
+            ):
+                # Bonus row rides the same argmax: no rebase can replace the
+                # all-accept row (state_rebase_every <= 0) and no constraint
+                # masks it differently (greedy-chain eligibility).
+                _batched_all = mx.argmax(
+                    accept_logits[0, : len(draft_tokens) + 1, :], axis=-1
+                ).tolist()
+                _batched_target_tokens = _batched_all[: len(draft_tokens)]
+                _batched_bonus_token = int(_batched_all[len(draft_tokens)])
+            else:
+                _batched_target_tokens = mx.argmax(
+                    accept_logits[0, : len(draft_tokens), :], axis=-1
+                ).tolist()
         for depth_index, draft_token in enumerate(_host_accept_drafts):
             target_logits_for_draft = accept_logits[:, depth_index, :]
             if _steer_active:
@@ -16229,6 +16322,8 @@ def generate_mtpk(
                     bonus = int(target_prefix_tokens[len(draft_tokens)])
                 elif target_distribution_batch is not None and not lazy_bonus_verify:
                     bonus = target_distribution_batch.sample(len(draft_tokens), rng)
+                elif _batched_bonus_token is not None and not lazy_bonus_verify:
+                    bonus = _batched_bonus_token
                 elif (
                     target_distributions is not None
                     and not lazy_bonus_verify

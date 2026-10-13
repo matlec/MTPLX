@@ -1349,6 +1349,54 @@ def _m1_moe_verify_strategy() -> str | None:
         return None
 
 
+# M1 family, Qwen3.6-35B-A3B only (2026-10-14, M1 Max, q8 KV, depth 1,
+# capture_commit, greedy 300-token decode; moe-s1/abl.txt): the upstream fast
+# lane ported to fp16 plus two host-sync cuts. Decode 71 -> 86 tok/s at 2K and
+# 62 -> 77 tok/s at 30K, greedy text identical to the lane without the
+# sync cuts. Row-owned router + combine tail + packed gate/up: +8-9%;
+# whole-MoE fusion: +4.5% (it installs only beside the compiled target-prefix
+# factory, which needs the GDN postconv); deferred draft + batched bonus
+# (generation.py): +7%; the greedy trio fence (12K, measured on a dense model)
+# would turn the deferred draft off past 12K. MTPLX_LINEAR_GDN_FROM_CONV_TGY=4
+# measured no gain (-4% at 30K) and stays off. setdefault: an explicit env wins.
+_M1_MOE_LANE_ENV = {
+    "MTPLX_QWEN_ROW_OWNED_ROUTER": "1",
+    "MTPLX_QWEN_COMBINE_TAIL": "1",
+    "MTPLX_QWEN_MOE_PACK_GATE_UP": "1",
+    "MTPLX_COMPILED_TARGET_PREFIX": "1",
+    "MTPLX_FUSE_GDN_POST_CONV": "1",
+    "MTPLX_A3B_GDN_POSTCONV_IMPL": "headquarter",
+    "MTPLX_A3B_WHOLE_MOE_FUSION": "1",
+    "MTPLX_M1_WHOLE_MOE_ANY_ROUTE": "1",
+    "MTPLX_GREEDY_TRIO_MAX_CONTEXT": "0",
+    "MTPLX_M1_MOE_DEFERRED_DRAFT": "1",
+    "MTPLX_M1_MOE_BATCHED_BONUS": "1",
+}
+
+
+def _m1_moe_lane_env() -> dict[str, str]:
+    """The M1 MoE lane env the A3B daemon is launched with: empty off the M1
+    family or with ``MTPLX_M1_MOE_LANE=0``, and without any key the caller's
+    environment already sets."""
+
+    import os
+
+    if (os.environ.get("MTPLX_M1_MOE_LANE") or "").strip() == "0":
+        return {}
+    try:
+        from mtplx.cache_state import m1_long_context_defaults
+
+        if not m1_long_context_defaults():
+            return {}
+    except Exception:
+        return {}
+    return {
+        key: value
+        for key, value in _M1_MOE_LANE_ENV.items()
+        if key not in os.environ
+    }
+
+
 def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None:
     # The -FP16 sibling shares the byte-identical INT packs and the measured
     # launch defaults; the app's substring detection already applied them to
@@ -1364,6 +1412,12 @@ def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None
         args.depth = 1
     if "verify-strategy" not in cli_flags:
         args.verify_strategy = _m1_moe_verify_strategy() or "target_prefix"
+    # Handed to the daemon's environment at launch (never this process's).
+    args._child_env_defaults = (
+        _m1_moe_lane_env()
+        if getattr(args, "verify_strategy", None) == "capture_commit"
+        else {}
+    )
     if "draft-temperature" not in cli_flags:
         args.draft_temperature = 0.6
         injected.add("draft-temperature")
@@ -10349,6 +10403,7 @@ def cmd_serve_public(args: Any) -> int:
     if getattr(args, "strict_warmup", False):
         cmd.append("--strict-warmup")
     child_env_base = os.environ.copy()
+    child_env_base.update(getattr(args, "_child_env_defaults", None) or {})
     child_env_base.update(
         paged_kv_quantization_env(
             getattr(args, "paged_kv_quantization", "off") or "off"
