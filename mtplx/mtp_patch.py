@@ -896,6 +896,10 @@ def inject_mtp_support(
             from .ane_prefill import pipelined_layers as _ane_pipelined_layers
 
             piped = _ane_pipelined_layers(inner, hidden_states, cache, fa_mask, ssm_mask)
+            if piped is None:
+                from .ane_prefill_moe import pipelined_layers as _ane_moe_pipelined_layers
+
+                piped = _ane_moe_pipelined_layers(inner, hidden_states, cache, fa_mask, ssm_mask)
             if piped is not None:
                 hidden_states = piped
             for layer_index, (layer, layer_cache) in enumerate(zip(inner.layers, cache)):

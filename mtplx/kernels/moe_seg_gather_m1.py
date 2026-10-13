@@ -105,6 +105,59 @@ def _inline(root: Path, rel: str, seen: set[str], out: list[str]) -> None:
             out.append(line)
 
 
+# Loads a [BM, BK] activation tile whose rows are token rows ``row_map[i]`` of
+# ``x`` (row stride K) instead of consecutive rows; rows past ``valid`` load as
+# zero. Same thread layout as steel's BlockLoader at BM * BK / threads values
+# per thread, so the MMA sees the tile it would see after the copy.
+_GATHER_LOADER = r"""
+template <typename T, short BROWS, short BCOLS, short dst_ld, short tgp_size>
+struct MtplxGatherRowLoader {
+  STEEL_CONST short n_reads = (BCOLS * BROWS) / tgp_size;
+  STEEL_CONST short TCOLS = BCOLS / n_reads;
+  STEEL_CONST short TROWS = tgp_size / TCOLS;
+  STEEL_CONST short n_rows = BROWS / TROWS;
+  const short bi;
+  const short bj;
+  threadgroup T* dst;
+  const device T* rows[n_rows];
+  bool live[n_rows];
+  int k_off;
+  METAL_FUNC MtplxGatherRowLoader(
+      const device T* x, const device uint32_t* row_map, int valid, int K,
+      threadgroup T* dst_, ushort simd_group_id, ushort simd_lane_id) thread
+      : bi((simd_group_id * 32 + simd_lane_id) / TCOLS),
+        bj(n_reads * ((simd_group_id * 32 + simd_lane_id) % TCOLS)),
+        dst(dst_ + bi * dst_ld + bj), k_off(0) {
+    for (short i = 0; i < n_rows; i++) {
+      const int r = bi + i * TROWS;
+      live[i] = r < valid;
+      rows[i] = x + size_t(live[i] ? row_map[r] : 0) * K + bj;
+    }
+  }
+  struct alignas(n_reads * sizeof(T)) ReadVector { uint8_t v[sizeof(T) * n_reads]; };
+  METAL_FUNC void load_unsafe() const thread {
+    for (short i = 0; i < n_rows; i++) {
+      if (live[i]) {
+        *((threadgroup ReadVector*)(&dst[i * TROWS * dst_ld])) =
+            *((const device ReadVector*)(&rows[i][k_off]));
+      } else {
+        for (short j = 0; j < n_reads; j++) dst[i * TROWS * dst_ld + j] = T(0);
+      }
+    }
+  }
+  METAL_FUNC void load_safe(short2 src_tile_dim) const thread {
+    for (short i = 0; i < n_rows; i++) {
+      const bool ok = live[i] && (bi + i * TROWS) < src_tile_dim.y;
+      for (short j = 0; j < n_reads; j++) {
+        dst[i * TROWS * dst_ld + j] = (ok && bj + j < src_tile_dim.x) ? rows[i][k_off + j] : T(0);
+      }
+    }
+  }
+  METAL_FUNC void next() thread { k_off += BCOLS; }
+};
+"""
+
+
 @lru_cache(maxsize=1)
 def _mlx_headers() -> str | None:
     """MLX's steel GEMM and quantized templates plus a copy of ``qmm_t_impl``
@@ -125,11 +178,35 @@ def _mlx_headers() -> str | None:
         start = text.index("METAL_FUNC void qmm_t_impl(")
         template_start = text.rindex("template <", 0, start)
         end = text.index("\n}\n", start) + 3
-        local = (
-            text[template_start:end]
-            .replace("void qmm_t_impl(", "void mtplx_qmm_t_rows(")
-            .replace("const constant int&", "const int")
+        body = text[template_start:end].replace("const constant int&", "const int")
+        local = body.replace("void qmm_t_impl(", "void mtplx_qmm_t_rows(")
+        # The same body reading its activation rows through a row map (token
+        # rows in place, no per-route copy): only the x loader changes.
+        gathered = (
+            body.replace("void qmm_t_impl(", "void mtplx_qmm_t_rows_gather(")
+            .replace(
+                "    const device T* x,\n",
+                "    const device T* x,\n    const device uint32_t* row_map,\n",
+                1,
+            )
+            .replace(
+                "mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>",
+                "MtplxGatherRowLoader<T, BM, BK, BK_padded, WM * WN * SIMD_SIZE>",
+                1,
+            )
+            .replace(
+                "  x += y_row * static_cast<int64_t>(K);\n",
+                "",
+                1,
+            )
+            .replace(
+                "loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);",
+                "loader_x_t loader_x(x, row_map + y_row, min(BM, M - y_row), K, Xs, simd_gid, simd_lid);",
+                1,
+            )
         )
+        if gathered.count("MtplxGatherRowLoader") != 1 or "row_map + y_row" not in gathered:
+            raise RuntimeError("qmm_t_impl layout changed; the gather variant cannot be built")
     except Exception as exc:
         _STATS["header_failures"] += 1
         print(
@@ -139,7 +216,7 @@ def _mlx_headers() -> str | None:
             flush=True,
         )
         return None
-    return text + "\n" + local
+    return text + "\n" + _GATHER_LOADER + "\n" + local + "\n" + gathered
 
 
 _SOURCE = r"""
@@ -178,6 +255,31 @@ _SOURCE = r"""
         thread_index_in_threadgroup, simdgroup_index_in_threadgroup,
         thread_index_in_simdgroup);
 """
+
+
+_GATHER_SOURCE = _SOURCE.replace(
+    "    mtplx_qmm_t_rows<T, GS, BITS, true, BM, BK, BN>(\n"
+    "        expert_w, expert_scales, expert_biases,\n"
+    "        x + size_t(row0) * KD, y + size_t(row0) * ND, Xs, Ws,",
+    "    mtplx_qmm_t_rows_gather<T, GS, BITS, true, BM, BK, BN>(\n"
+    "        expert_w, expert_scales, expert_biases,\n"
+    "        x, row_map + row0, y + size_t(row0) * ND, Xs, Ws,",
+)
+
+
+@lru_cache(maxsize=1)
+def _gather_kernel():
+    headers = _mlx_headers()
+    if headers is None or _GATHER_SOURCE == _SOURCE:
+        return None
+    return mx.fast.metal_kernel(
+        name="mtplx_m1_moe_seg_gather_rows_qmm",
+        input_names=["x", "w", "scales", "biases", "tile_start", "row_start", "row_map"],
+        output_names=["y"],
+        source=_GATHER_SOURCE,
+        header=headers,
+        ensure_row_contiguous=True,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -229,6 +331,32 @@ def applies(
     return enabled() and _kernel() is not None
 
 
+def row_map_enabled() -> bool:
+    """``MTPLX_M1_MOE_ROW_MAP`` (default on with the segmented gather): the
+    packed gate/up reads token rows through the sort's row map."""
+
+    # Measured slower than the copy (35B-A3B, 4,096-token chunk: MoE block
+    # 36.7 -> 38.2 ms, bit-identical): scattered token rows load worse than the
+    # contiguous copy. Opt-in only.
+    raw = (os.environ.get("MTPLX_M1_MOE_ROW_MAP") or "").strip().lower()
+    if raw not in {"1", "true", "yes", "on"}:
+        return False
+    return enabled()
+
+
+def row_map_applies(dtype, k: int, routed_rows: int, w, scales, biases, *,
+                    group_size: int, bits: int, mode: str = "affine") -> bool:
+    if routed_rows < MIN_ROWS or mode != "affine" or biases is None:
+        return False
+    if group_size not in (32, 64, 128) or bits not in (4, 8):
+        return False
+    if dtype not in (mx.float16, mx.bfloat16) or scales.dtype != dtype or w.ndim != 3:
+        return False
+    if k % BK or int(w.shape[1]) % BN or k % int(group_size):
+        return False
+    return row_map_enabled() and _gather_kernel() is not None
+
+
 def _segmented(x, w, scales, biases, rhs_indices, *, group_size: int, bits: int):
     experts = int(w.shape[0])
     n = int(w.shape[1])
@@ -250,6 +378,57 @@ def _segmented(x, w, scales, biases, rhs_indices, *, group_size: int, bits: int)
         output_dtypes=[x.dtype],
     )
     return y.reshape(rows, 1, n)
+
+
+def _tables(rhs_indices, experts: int):
+    counts = mx.zeros((experts,), dtype=mx.int32).at[rhs_indices.astype(mx.int32)].add(1)
+    zero = mx.zeros((1,), dtype=mx.int32)
+    row_start = mx.concatenate([zero, mx.cumsum(counts)])
+    tile_start = mx.concatenate([zero, mx.cumsum((counts + BM - 1) // BM)])
+    return tile_start, row_start
+
+
+def gather_rows_qmm(tokens, row_map, w, scales, biases, rhs_indices, *, group_size: int, bits: int):
+    """``gather_qmm(tokens[row_map], ...)`` with sorted ``rhs_indices``, reading token rows in place.
+
+    ``tokens`` [n, K]; returns [rows, N] in sorted-route order, or None when the
+    kernel is unavailable. Bit-identical to the copy plus the segmented kernel
+    (the tile sees the same rows); the first call per shape is checked.
+    """
+
+    kernel = _gather_kernel()
+    if kernel is None:
+        return None
+    experts, n = int(w.shape[0]), int(w.shape[1])
+    rows, k = int(row_map.shape[0]), int(tokens.shape[-1])
+    tile_start, row_start = _tables(rhs_indices, experts)
+    (y,) = kernel(
+        inputs=[tokens.reshape(-1, k), w, scales, biases, tile_start, row_start, row_map.astype(mx.uint32)],
+        template=[
+            ("T", tokens.dtype), ("GS", int(group_size)), ("BITS", int(bits)),
+            ("KD", k), ("ND", n), ("ED", experts), ("BM", BM), ("BN", BN), ("BK", BK),
+        ],
+        grid=((n // BN) * THREADS, rows // BM + experts, 1),
+        threadgroup=(THREADS, 1, 1),
+        output_shapes=[(rows, n)],
+        output_dtypes=[tokens.dtype],
+    )
+    key = ("rows",) + (tuple(int(d) for d in w.shape), str(tokens.dtype), int(group_size), int(bits))
+    verdict = _CANARY.get(key)
+    if verdict is None:
+        _STATS["canaries"] += 1
+        ref = _segmented(tokens.reshape(-1, k)[row_map][:, None, :], w, scales, biases, rhs_indices,
+                         group_size=group_size, bits=bits).reshape(rows, n)
+        verdict = bool(mx.array_equal(y, ref).item())
+        _CANARY[key] = verdict
+        if not verdict:
+            _STATS["canary_failures"] += 1
+            print(f"[moe-seg-gather] row-map kernel differs for {key}; the copy path serves it",
+                  file=sys.stderr, flush=True)
+    if not verdict:
+        return None
+    _STATS["calls"] += 1
+    return y
 
 
 def gather_qmm(x, w, scales, biases, rhs_indices, *, group_size: int, bits: int):

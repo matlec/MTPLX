@@ -470,9 +470,12 @@ void AneStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>
 
 
 // ---------------------------------------------------------------------------------------------------
-AneLinear::AneLinear(int hidden, int out, std::vector<int> rows) : hidden_(hidden), out_(out), rows_(std::move(rows)) {
+AneLinear::AneLinear(int hidden, int out, std::vector<int> rows, int slots)
+    : hidden_(hidden), out_(out), slots_(slots), rows_(std::move(rows)) {
   if (const std::string why = unavailable(); !why.empty()) throw std::runtime_error("ANE unavailable: " + why);
-  if (hidden % kSeg || out % 64 || rows_.empty()) throw std::runtime_error("ANE linear: unsupported shape");
+  seg_ = hidden % int(kSeg) == 0 ? int(kSeg) : (hidden % int(kBlock) == 0 && hidden <= 4096 ? hidden : 0);
+  if (!seg_ || out % 64 || rows_.empty() || slots < 1) throw std::runtime_error("ANE linear: unsupported shape");
+  const uint32_t kSeg = uint32_t(seg_);  // this projection's segment width (2560 for the dense 27B as before)
   std::sort(rows_.begin(), rows_.end());
   const uint32_t H = hidden, N = out, Rm = rows_.back();
   auto make = [&](uint32_t r, uint32_t w, bool i8) {
@@ -484,7 +487,8 @@ AneLinear::AneLinear(int hidden, int out, std::vector<int> rows) : hidden_(hidde
   };
   for (uint32_t k = 0; k < H / kSeg; ++k) x_.push_back(make(kSeg, Rm, true));
   tx_ = make(1, Rm, false);
-  for (uint32_t k = 0; k < H / kSeg; ++k) w_.push_back(make(N, kSeg, false));
+  for (int slot = 0; slot < slots; ++slot)
+    for (uint32_t k = 0; k < H / kSeg; ++k) w_.push_back(make(N, kSeg, false));
   y_ = make(N, Rm, false);
   std::ostringstream mil;
   mil << "program(1.3)\n{\n";
@@ -499,7 +503,7 @@ AneLinear::AneLinear(int hidden, int out, std::vector<int> rows) : hidden_(hidde
     };
     for (size_t k = 0; k < x_.size(); ++k) param("x" + S(k), x_[k], R);
     param("tx", tx_, R);
-    for (size_t k = 0; k < w_.size(); ++k) param("w" + S(k), w_[k], kSeg);
+    for (size_t k = 0; k < x_.size(); ++k) param("w" + S(k), w_[k], kSeg);
     std::string tot;
     for (size_t k = 0; k < x_.size(); ++k) {
       const std::string o = "m" + S(k);
@@ -526,20 +530,23 @@ AneLinear::~AneLinear() {
 }
 
 mx::array AneLinear::stage(const mx::array& xq, const mx::array& tx, const std::vector<mx::array>& weights,
-                           const std::vector<int>& row_offsets, int bits, int group) {
+                           const std::vector<int>& row_offsets, int bits, int group, int slot) {
+  if (slot < 0 || slot >= slots_) throw std::runtime_error("ANE linear: weight slot out of range");
   auto s = mx::default_stream(mx::Device::gpu);
   std::vector<mx::array> in = {mx::contiguous(xq, false, s), mx::contiguous(tx, false, s)};
   for (auto& a : weights) in.push_back(mx::contiguous(a, false, s));
-  auto prim = std::make_shared<AneLinStage>(s, this, row_offsets, bits, group);
+  auto prim = std::make_shared<AneLinStage>(s, this, weights.empty() ? std::vector<int>{} : row_offsets, bits, group, slot);
   return mx::array({1}, mx::int32, prim, std::move(in));
 }
 
-int AneLinear::run(int rows) {
+int AneLinear::run(int rows, int slot) {
   int R = -1;
   for (int r : rows_) if (r >= rows) { R = r; break; }
   if (R < 0) throw std::runtime_error("ANE linear: chunk wider than the program");
+  if (slot < 0 || slot >= slots_) throw std::runtime_error("ANE linear: weight slot out of range");
   std::map<std::string, Surface*> in;
-  for (size_t k = 0; k < x_.size(); ++k) { in["x" + S(k)] = x_[k].surface; in["w" + S(k)] = w_[k].surface; }
+  const size_t base = size_t(slot) * x_.size();
+  for (size_t k = 0; k < x_.size(); ++k) { in["x" + S(k)] = x_[k].surface; in["w" + S(k)] = w_[base + k].surface; }
   in["tx"] = tx_.surface;
   program_->run(program_->procedure("lin" + S(R)), in, y_.surface);
   return R;
@@ -563,6 +570,8 @@ void AneLinStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::arr
   auto* lib = d.get_library("mtplx_ane_stage3", [] { return std::string(kStageSource); });
   AneLinear& f = *lin_;
   const uint32_t R = in[0].shape(0), H = f.hidden_;
+  const uint32_t kSeg = uint32_t(f.seg_);
+  const size_t base = size_t(slot_) * f.x_.size();
   enc.set_compute_pipeline_state(d.get_kernel("ane_stage_x", lib));
   for (size_t k = 0; k < f.x_.size(); ++k) {
     const uint32_t p[4] = {R, H, uint32_t(k * kSeg), f.x_[k].surface->stride};
@@ -586,13 +595,14 @@ void AneLinStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::arr
   for (size_t j = 0; j < offsets_.size(); ++j) {
     const auto& w = in[2 + 3 * j];
     const uint32_t rows = w.shape(0);
-    for (size_t k = 0; k < f.w_.size(); ++k) {
+    for (size_t k = 0; k < f.x_.size(); ++k) {
+      const AneFfn::Target& wt = f.w_[base + k];
       const uint32_t p[4] = {H, uint32_t(k * kSeg), uint32_t(bits_), uint32_t(group_)};
-      const uint32_t q[4] = {f.w_[k].surface->stride / 2, 0, rows, uint32_t(offsets_[j])};
+      const uint32_t q[4] = {wt.surface->stride / 2, 0, rows, uint32_t(offsets_[j])};
       enc.set_input_array(w, 0);
       enc.set_input_array(in[3 + 3 * j], 1);
       enc.set_input_array(in[4 + 3 * j], 2);
-      enc.set_buffer(f.w_[k].buffer, 3);
+      enc.set_buffer(wt.buffer, 3);
       enc.set_bytes(p, 4, 4);
       enc.set_bytes(q, 4, 5);
       enc.dispatch_threadgroups(MTL::Size(kSeg / kBlock, rows, 1), MTL::Size(256, 1, 1));

@@ -72,18 +72,22 @@ class AneStage : public mx::Primitive {
 // (as for AneFfn) and W fp16 rotated; the output is already scaled by the token scales.
 class AneLinear {
  public:
-  AneLinear(int hidden, int out, std::vector<int> rows);
+  // hidden a multiple of 2560 (the dense 27B's segments) or, up to 4096, of 512 (one segment); `slots`
+  // independent weight sets share the one compiled program (one per layer keeps every layer's weights resident).
+  AneLinear(int hidden, int out, std::vector<int> rows, int slots = 1);
   ~AneLinear();
-  // weights: (w, scales, biases) triples of packed affine rows; triple j lands at output row row_offsets[j].
+  // weights: (w, scales, biases) triples of packed affine rows; triple j lands at output row row_offsets[j] of
+  // weight slot `slot`. An empty list stages the input only (the slot's weights stay as last staged).
   mx::array stage(const mx::array& xq, const mx::array& tx, const std::vector<mx::array>& weights,
-                  const std::vector<int>& row_offsets, int bits, int group);
-  int run(int rows);
+                  const std::vector<int>& row_offsets, int bits, int group, int slot = 0);
+  int run(int rows, int slot = 0);
+  int slots() const { return slots_; }
   mx::array output();  // [N, max_rows] fp16
   int max_rows() const { return rows_.back(); }
   double compile_seconds() const { return program_ ? program_->compile_seconds() : 0; }
   std::vector<AneFfn::Target> x_, w_;
   AneFfn::Target tx_{}, y_{};
-  int hidden_, out_;
+  int hidden_, out_, seg_ = 0, slots_ = 1;
   std::vector<int> rows_;
 
  private:
@@ -93,8 +97,8 @@ class AneLinear {
 
 class AneLinStage : public mx::Primitive {
  public:
-  AneLinStage(mx::Stream s, AneLinear* lin, std::vector<int> offsets, int bits, int group)
-      : mx::Primitive(s), lin_(lin), offsets_(std::move(offsets)), bits_(bits), group_(group) {}
+  AneLinStage(mx::Stream s, AneLinear* lin, std::vector<int> offsets, int bits, int group, int slot = 0)
+      : mx::Primitive(s), lin_(lin), offsets_(std::move(offsets)), bits_(bits), group_(group), slot_(slot) {}
   void eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) override;
   void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
   const char* name() const override { return "AneLinStage"; }
@@ -103,7 +107,7 @@ class AneLinStage : public mx::Primitive {
  private:
   AneLinear* lin_;
   std::vector<int> offsets_;
-  int bits_, group_;
+  int bits_, group_, slot_;
 };
 
 }  // namespace mtplx_ane

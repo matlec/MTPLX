@@ -1384,6 +1384,13 @@ _M1_MOE_GDN_ENV = {
     # 30K unchanged, greedy text identical.
     "MTPLX_FUSED_GDN_OUT": "1",
     "MTPLX_FUSE_GDN_PROJECTIONS": "1",
+    # Prefill with the GDN and attention q/k/v projections on the Neural
+    # Engine while the GPU runs the other half chunk's experts
+    # (ane_prefill_moe). 35B-A3B conversations: 32K 47.3 -> 44.3 s, 64K 108 ->
+    # 100 s, 128K 291 -> 281 s (cold prefill +8-12%); teacher-forced top-1
+    # agreement 98.25% / mean KL 0.0034 against the GPU-only prefill. The
+    # first long prompt pays the program compile (~4 s).
+    "MTPLX_ANE_PREFILL_MOE": "1",
 }
 # Qwen3.6-35B-A3B only (kernels written for its 256 experts / top-8 / 2048
 # hidden), on the capture_commit route: the upstream fast lane ported to fp16.

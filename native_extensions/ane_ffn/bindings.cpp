@@ -22,9 +22,11 @@ NB_MODULE(_ext, m) {
       .def_prop_ro("max_rows", &mtplx_ane::AneFfn::max_rows)
       .def_prop_ro("compile_seconds", &mtplx_ane::AneFfn::compile_seconds);
   nb::class_<mtplx_ane::AneLinear>(m, "AneLinear")
-      .def(nb::init<int, int, std::vector<int>>(), "hidden"_a, "out"_a, "rows"_a)
-      .def("stage", &mtplx_ane::AneLinear::stage, "xq"_a, "tx"_a, "weights"_a, "row_offsets"_a, "bits"_a, "group"_a)
-      .def("run", &mtplx_ane::AneLinear::run, "rows"_a, nb::call_guard<nb::gil_scoped_release>())
+      .def(nb::init<int, int, std::vector<int>, int>(), "hidden"_a, "out"_a, "rows"_a, "slots"_a = 1)
+      .def("stage", &mtplx_ane::AneLinear::stage, "xq"_a, "tx"_a, "weights"_a, "row_offsets"_a, "bits"_a, "group"_a,
+           "slot"_a = 0)
+      .def("run", &mtplx_ane::AneLinear::run, "rows"_a, "slot"_a = 0, nb::call_guard<nb::gil_scoped_release>())
+      .def_prop_ro("slots", &mtplx_ane::AneLinear::slots)
       .def("output", &mtplx_ane::AneLinear::output)
       .def_prop_ro("max_rows", &mtplx_ane::AneLinear::max_rows)
       .def_prop_ro("compile_seconds", &mtplx_ane::AneLinear::compile_seconds);

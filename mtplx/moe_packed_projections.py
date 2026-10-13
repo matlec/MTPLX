@@ -201,6 +201,9 @@ class PackedSwitchGLU(nn.Module):
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         from mlx_lm.models.switch_layers import _gather_sort, _scatter_unsort
 
+        rows_routed = self._m1_row_map_gate_up(x, indices)
+        if rows_routed is not None:
+            return rows_routed
         x = mx.expand_dims(x, (-2, -3))
 
         # ``MTPLX_A3B_MOE_FORCE_UNSORTED`` pins the batched-decode lane to the
@@ -227,6 +230,46 @@ class PackedSwitchGLU(nn.Module):
             x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
+
+
+    def _m1_row_map_gate_up(self, x: mx.array, indices: mx.array) -> mx.array | None:
+        """M1 prefill: the packed gate/up reads token rows in place through the
+        sort's row map (no per-route copy of ``x``); the rest is the sorted
+        path below, bit-identical (kernels/moe_seg_gather_m1)."""
+
+        from mlx_lm.models.switch_layers import _scatter_unsort
+
+        from .kernels import moe_seg_gather_m1 as seg
+
+        proj = self.gate_up_proj
+        if (
+            moe_force_unsorted_enabled()
+            or not hasattr(proj, "scales")
+            or not seg.row_map_applies(
+                x.dtype, int(x.shape[-1]), int(indices.size), proj["weight"], proj["scales"],
+                proj.get("biases"), group_size=proj.group_size, bits=proj.bits, mode=proj.mode,
+            )
+        ):
+            return None
+        k = x.shape[-1]
+        top_k = int(indices.shape[-1])
+        tokens = x.reshape(-1, k)
+        flat = indices.flatten()
+        order = mx.argsort(flat)
+        inv_order = mx.argsort(order)
+        row_map = (order // top_k).astype(mx.uint32)
+        sorted_idx = flat[order]
+        packed = seg.gather_rows_qmm(
+            tokens, row_map, proj["weight"], proj["scales"], proj.get("biases"), sorted_idx,
+            group_size=proj.group_size, bits=proj.bits,
+        )
+        if packed is None:
+            return None
+        packed = packed[:, None, :]
+        x_gate, x_up = mx.split(packed, [self._split_at], axis=-1)
+        y = self.down_proj(self.activation(x_up, x_gate), sorted_idx, sorted_indices=True)
+        y = _scatter_unsort(y, inv_order, indices.shape)
+        return y.squeeze(-2)
 
 
 class PackedGateUpMLP(nn.Module):
