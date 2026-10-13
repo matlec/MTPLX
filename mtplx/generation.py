@@ -2512,6 +2512,28 @@ def _iter_prefill_chunk_spans(
     )
 
 
+def _m1_paged_prefill_enabled(context_tokens: int) -> bool:
+    """M1 family with quantized KV: a long prompt prefills straight into the pages.
+
+    The contiguous layout writes the prompt's KV at full width and repages it
+    afterwards: on an M1 Max 64 GB (Qwen3.8-27B, q8, 2026-10-13) the paged
+    layout ran the same cold prefill speed (26K 207 vs 207 tok/s, 50K 187 vs
+    185) and grew wired memory less (+7.1 vs +8.6 GB, +9.9 vs +11.7 GB); at
+    256K the full-width KV is ~17 GB against ~10 GB of q8 pages. Prefill
+    attention then reads the prompt's earlier chunks from the q8 pages, as
+    every follow-up turn already does: greedy answers matched at 26K and 50K,
+    and at 8K they parted after 73 characters, so prompts under
+    ``MTPLX_M1_PAGED_PREFILL_MIN_CONTEXT`` (32,768) keep the contiguous layout,
+    where the saving is under a gigabyte. ``MTPLX_M1_PAGED_PREFILL=0`` keeps
+    it for every prompt.
+    """
+    from .cache_state import _env_flag_default_m1
+
+    if not _env_flag_default_m1("MTPLX_M1_PAGED_PREFILL"):
+        return False
+    return int(context_tokens) >= _env_int("MTPLX_M1_PAGED_PREFILL_MIN_CONTEXT", 32768)
+
+
 def _sustained_prefill_layout(context_tokens: int | None = None) -> str:
     """The prefill cache layout for the prompt being prefilled.
 
@@ -2533,10 +2555,12 @@ def _sustained_prefill_layout(context_tokens: int | None = None) -> str:
     # quantized cache.
     from .kv_quant import paged_kv_quant_mode_from_env
 
-    if paged_kv_quant_mode_from_env() != "off":
-        return "contiguous_then_repage"
     if context_tokens is None:
         context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+    if paged_kv_quant_mode_from_env() != "off":
+        if _m1_paged_prefill_enabled(context_tokens):
+            return "paged"
+        return "contiguous_then_repage"
     dense_max = _dense_decode_max_context()
     if context_tokens > 0 and context_tokens <= dense_max:
         return "contiguous_dense_decode"

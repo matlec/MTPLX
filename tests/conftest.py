@@ -34,6 +34,9 @@ def pytest_configure(config):
 def _hermetic_mtplx_state(monkeypatch, tmp_path_factory):
     isolated = tmp_path_factory.mktemp("hermetic-mtplx")
     monkeypatch.setenv("MTPLX_START_ATTACH_PROBE", "off")
+    # The memory-plan tests pin upstream's 75% engine envelope; the M1
+    # family's wider one is pinned in tests/test_m1_engine_envelope.py.
+    monkeypatch.setenv("MTPLX_M1_ENGINE_RAM_FRACTION", "0.75")
     monkeypatch.setenv(
         "MTPLX_APP_SETTINGS_PATH", str(isolated / "app-settings.json")
     )

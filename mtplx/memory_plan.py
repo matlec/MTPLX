@@ -300,12 +300,46 @@ def _ram_share_bytes(total_ram_bytes: int) -> int:
     )
 
 
+# M1 family under 128 GB: the engine may use 13/16 of RAM (52 GiB on 64 GB,
+# MLX's recommended working set there is 51.8 GiB), never past macOS's own
+# reserve. On an M1 Max 64 GB (2026-10-13) the 256K conversation's second
+# turn peaked at 53.2 GB wired with no swap, against a 48.95 GiB projection
+# the 75% rule refused; the guard's whole-Mac floors still apply.
+# ``MTPLX_M1_ENGINE_RAM_FRACTION`` overrides (0.75 = the upstream rule).
+M1_ENGINE_RAM_FRACTION = 0.8125
+
+
+def _m1_engine_ram_fraction() -> float | None:
+    import os
+
+    raw = (os.environ.get("MTPLX_M1_ENGINE_RAM_FRACTION") or "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            return None
+        return value if 0.0 < value <= 1.0 else None
+    try:
+        from .cache_state import m1_long_context_defaults
+
+        return M1_ENGINE_RAM_FRACTION if m1_long_context_defaults() else None
+    except Exception:
+        return None
+
+
 def usable_engine_bytes(total_ram_bytes: int) -> int:
     """The engine's default allocator envelope for a machine of this size."""
     total = int(total_ram_bytes)
     usable = _ram_share_bytes(total)
     if total >= DESKTOP_HEADROOM_MIN_RAM_BYTES:
         usable = min(usable, total - DESKTOP_HEADROOM_BYTES)
+    else:
+        fraction = _m1_engine_ram_fraction()
+        if fraction is not None:
+            usable = max(
+                usable,
+                min(int(total * fraction), total - system_reserve_bytes(total)),
+            )
     return usable
 
 
