@@ -55,7 +55,7 @@ MTPLX のプロジェクトとは関係のない非公式のフォークです�
 - ネイティブ拡張をビルドするための、Metal のツールチェーンが入った Xcode
 
 ```bash
-git clone --branch v2.12.2-m1.2 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.3 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # 1 分ほど。mfa_attn: ok / ane_ffn: ok と表示されれば完了
 ```
@@ -98,7 +98,7 @@ M1 向けの既定値は、1 つずつ止められます。`MTPLX_M1_LONG_CONTEX
 
 - 計測は M1 Max 64 GB の 1 台だけです。M1 Pro、M1 Ultra、ほかのメモリ量でも同じコードが動きますが、確かめていません。
 - Neural Engine の経路は Apple の非公開のフレームワークを使うので、macOS の更新で使えなくなることがあります。そのときは GPU だけの prefill に戻ります。
-- 256K ではメモリのピークが約 50 GB になります。その一部は、2 ターン目以降を速く始めるためにセッションバンクが持つ、会話のもう 1 組のコピーです。
+- 256K では、メモリのピークは 1 ターン目のプロンプトの読み込み中に約 48 GB、2 ターン目以降は 41〜42 GB です。
 - 本家のテストのうち、本家の既定値を前提にしたものは、M1 の既定値のままでは失敗します。ほとんどは `MTPLX_M1_LONG_CONTEXT=0` で通ります。
 
 ## ライセンス

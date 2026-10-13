@@ -75,7 +75,7 @@ Needs an M1-family Mac (measured on an M1 Max 64 GB, macOS 26), the
 model are used), and Xcode with the Metal toolchain for the native extensions.
 
 ```bash
-git clone --branch v2.12.2-m1.2 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.3 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # about a minute; prints mfa_attn: ok / ane_ffn: ok
 ```
@@ -124,8 +124,8 @@ The full list, with measurements: [CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.
   same code but are untested.
 - The Neural Engine path uses a private Apple framework and may stop working
   after a macOS update (prefill then falls back to the GPU).
-- Memory: at 256K the build peaks around 50 GB. Part of it is a second copy of
-  the conversation the session bank keeps for fast follow-up turns.
+- Memory: at 256K the build peaks around 48 GB while reading the first prompt and
+  41–42 GB on follow-up turns.
 - Some upstream tests assume upstream's defaults and fail with the M1 defaults on;
   most pass with `MTPLX_M1_LONG_CONTEXT=0`.
 
