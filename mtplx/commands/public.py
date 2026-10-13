@@ -1323,6 +1323,32 @@ def _m1_dense_turbo_eligible(model_ref: str | Path) -> bool:
     return int(quant.get("bits", 0) or 0) in (4, 8) and str(quant.get("mode", "affine") or "affine") == "affine"
 
 
+def _m1_moe_verify_strategy() -> str | None:
+    """M1 family: the verify strategy for the 35B-A3B MoE served one request at a time.
+
+    Upstream pins ``target_prefix`` for this model (measured on M5, and the
+    batched A3B lane requires it). On an M1 Max (2026-10-13, serial
+    scheduler, q8 KV, depth 1) every rejected draft under ``target_prefix``
+    rolled the cache back and re-forwarded the committed tokens (~18 ms, 38%
+    of rounds); ``capture_commit`` commits the verified prefix from the
+    captured rows instead: decode 50 -> 70 tok/s at 2K and 38 -> 65 tok/s at
+    32K, tokens per round unchanged. ``MTPLX_M1_MOE_VERIFY_STRATEGY`` overrides
+    (``target_prefix`` restores upstream's default); None off the M1 family.
+    """
+
+    import os
+
+    raw = (os.environ.get("MTPLX_M1_MOE_VERIFY_STRATEGY") or "").strip().lower()
+    if raw:
+        return raw
+    try:
+        from mtplx.cache_state import m1_long_context_defaults
+
+        return "capture_commit" if m1_long_context_defaults() else None
+    except Exception:
+        return None
+
+
 def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None:
     # The -FP16 sibling shares the byte-identical INT packs and the measured
     # launch defaults; the app's substring detection already applied them to
@@ -1337,7 +1363,7 @@ def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None
     if "depth" not in cli_flags:
         args.depth = 1
     if "verify-strategy" not in cli_flags:
-        args.verify_strategy = "target_prefix"
+        args.verify_strategy = _m1_moe_verify_strategy() or "target_prefix"
     if "draft-temperature" not in cli_flags:
         args.draft_temperature = 0.6
         injected.add("draft-temperature")
