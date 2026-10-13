@@ -1371,6 +1371,11 @@ _M1_MOE_LANE_ENV = {
     "MTPLX_GREEDY_TRIO_MAX_CONTEXT": "0",
     "MTPLX_M1_MOE_DEFERRED_DRAFT": "1",
     "MTPLX_M1_MOE_BATCHED_BONUS": "1",
+    # Sampled requests: the verify queues behind the device-predicted draft
+    # chain (generation._chain_early_verify_enabled). In-process ABAB at
+    # temperature 1.0, same seeds, same text: 75.8 -> 82.2 tok/s at 2K and
+    # 65.8 -> 72.3 at 30K (on the dense 27B it measured no gain).
+    "MTPLX_CHAIN_EARLY_VERIFY": "1",
 }
 
 
