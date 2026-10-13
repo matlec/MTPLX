@@ -238,8 +238,27 @@ def install_gdn(model: Any) -> dict[str, Any]:
     return {"gdn": tagged, "qkv_tail": tail}
 
 
+def _is_moe(model: Any) -> bool:
+    """A mixture-of-experts model: its shared expert is a Qwen3NextMLP too, but
+    the ANE program is built for the dense 27B's FFN shapes (it failed with
+    "unsupported shape" on the 35B-A3B and disabled itself on the first call)."""
+
+    if model is None:
+        return False
+    try:
+        for _name, module in model.named_modules():
+            if "SparseMoe" in type(module).__name__:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def install(model: Any = None) -> dict[str, Any]:
     if _STATE["installed"]:
+        return dict(_STATE)
+    if _is_moe(model):
+        _STATE["error"] = "mixture-of-experts model"
         return dict(_STATE)
     ext = _ext()
     why = ext.unavailable()

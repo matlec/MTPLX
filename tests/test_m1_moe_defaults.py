@@ -42,3 +42,16 @@ def test_explicit_flag_and_dense_models_are_untouched(monkeypatch):
     a = _args()
     p._apply_qwen36_35b_optimized_speed_defaults(a, "mtplx-qwen38-27b-optimized-speed-fp16")
     assert a.verify_strategy is None and a.depth == 3
+
+
+def test_ane_prefill_skips_moe_models():
+    from types import SimpleNamespace as NS
+
+    from mtplx import ane_prefill as ap
+
+    class Qwen3NextSparseMoeBlock:  # noqa: N801 - mirrors the class name it detects
+        pass
+
+    moe = NS(named_modules=lambda: [("layers.0.mlp", Qwen3NextSparseMoeBlock())])
+    dense = NS(named_modules=lambda: [("layers.0.mlp", object())])
+    assert ap._is_moe(moe) and not ap._is_moe(dense) and not ap._is_moe(None)
