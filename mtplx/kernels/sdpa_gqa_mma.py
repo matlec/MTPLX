@@ -457,6 +457,7 @@ def _wide_simdgroups(q_len: int, gqa: int, ceiling: int) -> int:
     return 8
 
 
+@lru_cache(maxsize=None)
 def _kernels():
     if not mx.metal.is_available():
         return None, None
