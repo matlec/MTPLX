@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 _HEADQUARTER_IMPORT_WARNED = False
 
 
+
+def _gdn_scalar():
+    from .kernels import moe_scalar
+
+    return moe_scalar.scalar()
+
 def _env_enabled(name: str, *, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -162,7 +168,7 @@ def _validate_a3b_quant_projection(
         or int(getattr(projection, "group_size", -1)) != 64
         or getattr(projection, "mode", None) != "affine"
         or tuple(getattr(scales, "shape", ())) != scales_shape
-        or getattr(scales, "dtype", None) != mx.bfloat16
+        or getattr(scales, "dtype", None) != _gdn_scalar()
     ):
         _fail_a3b_gdn_postconv_configuration(
             "A3B GDN postconv projection_quantization mismatch for "
@@ -200,10 +206,14 @@ def prepare_a3b_gdn_postconv(
         _fail_a3b_gdn_postconv_configuration(
             "A3B GDN postconv topology requires the exact A3B model"
         )
-    if text_config.get("dtype") != "bfloat16":
+    if text_config.get("dtype") not in ("bfloat16", "float16"):
         _fail_a3b_gdn_postconv_configuration(
             "A3B GDN postconv config_dtype requires bfloat16"
         )
+    from .kernels import moe_scalar
+
+    # The M1 build serves the FP16 sibling: the same kernels with float16 rows.
+    moe_scalar.set_scalar(mx.float16 if text_config.get("dtype") == "float16" else mx.bfloat16)
 
     text_model = getattr(model, "language_model", None)
     inner = getattr(text_model, "model", None)
@@ -288,7 +298,7 @@ def prepare_a3b_gdn_postconv(
                     "A3B GDN postconv parameter_shape mismatch for "
                     f"{parameter_name} at GDN layer {index}"
                 )
-            if getattr(node, "dtype", None) != mx.bfloat16:
+            if getattr(node, "dtype", None) != _gdn_scalar():
                 _fail_a3b_gdn_postconv_configuration(
                     "A3B GDN postconv parameter_dtype requires BF16 for "
                     f"{parameter_name} at GDN layer {index}"
@@ -2029,7 +2039,7 @@ def _a3b_compiled_target_gdn_postconv_m1_tgy4(
     return _linear_gated_delta_from_conv_inline_g_kernel(
         inputs=[conv_out, a, b, A_log, dt_bias, state, 1],
         template=[
-            ("InT", mx.bfloat16),
+            ("InT", _gdn_scalar()),
             ("StT", mx.float32),
             ("Dk", 128),
             ("Dv", 128),
@@ -2041,7 +2051,7 @@ def _a3b_compiled_target_gdn_postconv_m1_tgy4(
         grid=(32, 128, 32),
         threadgroup=(32, 4, 1),
         output_shapes=[(1, 1, 32, 128), (1, 1, 32, 128, 128)],
-        output_dtypes=[mx.bfloat16, mx.float32],
+        output_dtypes=[_gdn_scalar(), mx.float32],
     )
 
 
@@ -2058,7 +2068,7 @@ def _a3b_compiled_target_gdn_postconv_m2_tgy4(
     return _linear_gated_delta_from_conv_inline_g_kernel(
         inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
         template=[
-            ("InT", mx.bfloat16),
+            ("InT", _gdn_scalar()),
             ("StT", mx.float32),
             ("Dk", 128),
             ("Dv", 128),
@@ -2070,7 +2080,7 @@ def _a3b_compiled_target_gdn_postconv_m2_tgy4(
         grid=(32, 128, 32),
         threadgroup=(32, 4, 1),
         output_shapes=[(1, 2, 32, 128), (1, 2, 32, 128, 128)],
-        output_dtypes=[mx.bfloat16, mx.float32],
+        output_dtypes=[_gdn_scalar(), mx.float32],
     )
 
 
@@ -2087,7 +2097,7 @@ def _a3b_compiled_target_gdn_postconv_b8_t2_tgy4(
     return _linear_gated_delta_from_conv_inline_g_kernel(
         inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
         template=[
-            ("InT", mx.bfloat16),
+            ("InT", _gdn_scalar()),
             ("StT", mx.float32),
             ("Dk", 128),
             ("Dv", 128),
@@ -2099,7 +2109,7 @@ def _a3b_compiled_target_gdn_postconv_b8_t2_tgy4(
         grid=(32, 128, 256),
         threadgroup=(32, 4, 1),
         output_shapes=[(8, 2, 32, 128), (8, 2, 32, 128, 128)],
-        output_dtypes=[mx.bfloat16, mx.float32],
+        output_dtypes=[_gdn_scalar(), mx.float32],
     )
 
 
@@ -2121,7 +2131,7 @@ def _a3b_compiled_target_gdn_postconv_b3_t2_tgy4(
     return _linear_gated_delta_from_conv_inline_g_kernel(
         inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
         template=[
-            ("InT", mx.bfloat16),
+            ("InT", _gdn_scalar()),
             ("StT", mx.float32),
             ("Dk", 128),
             ("Dv", 128),
@@ -2133,7 +2143,7 @@ def _a3b_compiled_target_gdn_postconv_b3_t2_tgy4(
         grid=(32, 128, 96),
         threadgroup=(32, 4, 1),
         output_shapes=[(3, 2, 32, 128), (3, 2, 32, 128, 128)],
-        output_dtypes=[mx.bfloat16, mx.float32],
+        output_dtypes=[_gdn_scalar(), mx.float32],
     )
 
 
@@ -2230,7 +2240,7 @@ def _a3b_compiled_target_gdn_postconv_m1_headquarter(
     return _linear_gated_delta_from_conv_headquarter_kernel(
         inputs=[conv_out, a, b, A_log, dt_bias, state, 1],
         template=[
-            ("InT", mx.bfloat16),
+            ("InT", _gdn_scalar()),
             ("StT", mx.float32),
             ("Dk", 128),
             ("Dv", 128),
@@ -2244,7 +2254,7 @@ def _a3b_compiled_target_gdn_postconv_m1_headquarter(
         grid=(256, 4, 32),
         threadgroup=(256, 1, 1),
         output_shapes=[(1, 1, 32, 128), (1, 1, 32, 128, 128)],
-        output_dtypes=[mx.bfloat16, mx.float32],
+        output_dtypes=[_gdn_scalar(), mx.float32],
     )
 
 
@@ -2261,7 +2271,7 @@ def _a3b_compiled_target_gdn_postconv_m2_headquarter(
     return _linear_gated_delta_from_conv_headquarter_kernel(
         inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
         template=[
-            ("InT", mx.bfloat16),
+            ("InT", _gdn_scalar()),
             ("StT", mx.float32),
             ("Dk", 128),
             ("Dv", 128),
@@ -2275,7 +2285,7 @@ def _a3b_compiled_target_gdn_postconv_m2_headquarter(
         grid=(256, 4, 32),
         threadgroup=(256, 1, 1),
         output_shapes=[(1, 2, 32, 128), (1, 2, 32, 128, 128)],
-        output_dtypes=[mx.bfloat16, mx.float32],
+        output_dtypes=[_gdn_scalar(), mx.float32],
     )
 
 
@@ -2292,7 +2302,7 @@ def _a3b_compiled_target_gdn_postconv_b8_t2_headquarter(
     return _linear_gated_delta_from_conv_headquarter_kernel(
         inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
         template=[
-            ("InT", mx.bfloat16),
+            ("InT", _gdn_scalar()),
             ("StT", mx.float32),
             ("Dk", 128),
             ("Dv", 128),
@@ -2306,7 +2316,7 @@ def _a3b_compiled_target_gdn_postconv_b8_t2_headquarter(
         grid=(256, 4, 256),
         threadgroup=(256, 1, 1),
         output_shapes=[(8, 2, 32, 128), (8, 2, 32, 128, 128)],
-        output_dtypes=[mx.bfloat16, mx.float32],
+        output_dtypes=[_gdn_scalar(), mx.float32],
     )
 
 
@@ -2327,7 +2337,7 @@ def _a3b_compiled_target_gdn_postconv_b3_t2_headquarter(
     return _linear_gated_delta_from_conv_headquarter_kernel(
         inputs=[conv_out, a, b, A_log, dt_bias, state, 2],
         template=[
-            ("InT", mx.bfloat16),
+            ("InT", _gdn_scalar()),
             ("StT", mx.float32),
             ("Dk", 128),
             ("Dv", 128),
@@ -2341,7 +2351,7 @@ def _a3b_compiled_target_gdn_postconv_b3_t2_headquarter(
         grid=(256, 4, 96),
         threadgroup=(256, 1, 1),
         output_shapes=[(3, 2, 32, 128), (3, 2, 32, 128, 128)],
-        output_dtypes=[mx.bfloat16, mx.float32],
+        output_dtypes=[_gdn_scalar(), mx.float32],
     )
 
 
@@ -2443,7 +2453,7 @@ def _a3b_compiled_target_gdn_postconv_m3_tgy4(
     return _linear_gated_delta_from_conv_inline_g_kernel(
         inputs=[conv_out, a, b, A_log, dt_bias, state, 3],
         template=[
-            ("InT", mx.bfloat16),
+            ("InT", _gdn_scalar()),
             ("StT", mx.float32),
             ("Dk", 128),
             ("Dv", 128),
@@ -2455,7 +2465,7 @@ def _a3b_compiled_target_gdn_postconv_m3_tgy4(
         grid=(32, 128, 32),
         threadgroup=(32, 4, 1),
         output_shapes=[(1, 3, 32, 128), (1, 3, 32, 128, 128)],
-        output_dtypes=[mx.bfloat16, mx.float32],
+        output_dtypes=[_gdn_scalar(), mx.float32],
     )
 
 
@@ -2472,7 +2482,7 @@ def _a3b_compiled_target_gdn_postconv_m3_headquarter(
     return _linear_gated_delta_from_conv_headquarter_kernel(
         inputs=[conv_out, a, b, A_log, dt_bias, state, 3],
         template=[
-            ("InT", mx.bfloat16),
+            ("InT", _gdn_scalar()),
             ("StT", mx.float32),
             ("Dk", 128),
             ("Dv", 128),
@@ -2486,7 +2496,7 @@ def _a3b_compiled_target_gdn_postconv_m3_headquarter(
         grid=(256, 4, 32),
         threadgroup=(256, 1, 1),
         output_shapes=[(1, 3, 32, 128), (1, 3, 32, 128, 128)],
-        output_dtypes=[mx.bfloat16, mx.float32],
+        output_dtypes=[_gdn_scalar(), mx.float32],
     )
 
 

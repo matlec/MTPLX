@@ -130,10 +130,22 @@ def qwen_row_owned_router_eligible(
         supported
         and int(rows) in _EXACT_ROWS
         and int(experts) == _EXPERTS
-        and input_dtype == mx.bfloat16
+        and _scalar_ok(input_dtype)
         and int(top_k) == _TOP_K
         and bool(norm_topk_prob)
     )
+
+
+def _scalar():
+    from .kernels import moe_scalar
+
+    return moe_scalar.scalar()
+
+
+def _scalar_ok(dtype) -> bool:
+    from .kernels import moe_scalar
+
+    return moe_scalar.supported(dtype)
 
 
 def qwen_row_owned_router_source() -> str:
@@ -260,30 +272,37 @@ def qwen_combine_tail_source() -> str:
     """
 
 
+_KERNELS_BY_SCALAR: dict[str, Any] = {}
+
+
 def _build_qwen_row_owned_router_kernel():
-    global _KERNEL
-    if _KERNEL is None:
-        _KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen_a3b_row_owned_top8_bf16_exact",
+    from .kernels import moe_scalar
+
+    key = "router" + moe_scalar.suffix()
+    if key not in _KERNELS_BY_SCALAR:
+        _KERNELS_BY_SCALAR[key] = mx.fast.metal_kernel(
+            name="mtplx_qwen_a3b_row_owned_top8_bf16_exact" + moe_scalar.suffix(),
             input_names=["probabilities"],
             output_names=["expert_ids", "route_scores"],
-            source=qwen_row_owned_router_source(),
+            source=moe_scalar.metal_source(qwen_row_owned_router_source()),
             ensure_row_contiguous=True,
         )
-    return _KERNEL
+    return _KERNELS_BY_SCALAR[key]
 
 
 def _build_qwen_combine_tail_kernel():
-    global _COMBINE_KERNEL
-    if _COMBINE_KERNEL is None:
-        _COMBINE_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_qwen_a3b_combine_bf16_exact",
+    from .kernels import moe_scalar
+
+    key = "combine" + moe_scalar.suffix()
+    if key not in _KERNELS_BY_SCALAR:
+        _KERNELS_BY_SCALAR[key] = mx.fast.metal_kernel(
+            name="mtplx_qwen_a3b_combine_bf16_exact" + moe_scalar.suffix(),
             input_names=["routed", "scores"],
             output_names=["combined"],
-            source=qwen_combine_tail_source(),
+            source=moe_scalar.metal_source(qwen_combine_tail_source()),
             ensure_row_contiguous=True,
         )
-    return _COMBINE_KERNEL
+    return _KERNELS_BY_SCALAR[key]
 
 
 def qwen_combine_tail_m1(
@@ -297,7 +316,7 @@ def qwen_combine_tail_m1(
         grid=(2048, 1, 1),
         threadgroup=(128, 1, 1),
         output_shapes=[(1, 2048)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[_scalar()],
     )
     return combined.reshape(1, 1, 2048)
 
@@ -313,7 +332,7 @@ def qwen_combine_tail_m2(
         grid=(4096, 1, 1),
         threadgroup=(64, 1, 1),
         output_shapes=[(2, 2048)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[_scalar()],
     )
     return combined.reshape(1, 2, 2048)
 
@@ -329,7 +348,7 @@ def qwen_combine_tail_m8(
         grid=(16384, 1, 1),
         threadgroup=(64, 1, 1),
         output_shapes=[(8, 2048)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[_scalar()],
     )
     return combined.reshape(*routed.shape[:-2], 2048)
 
@@ -345,7 +364,7 @@ def qwen_combine_tail_m16(
         grid=(32768, 1, 1),
         threadgroup=(64, 1, 1),
         output_shapes=[(16, 2048)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[_scalar()],
     )
     return combined.reshape(*routed.shape[:-2], 2048)
 
@@ -362,7 +381,7 @@ def _qwen_row_owned_route_unchecked(
         grid=(rows * 256, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(rows, 8), (rows, 8)],
-        output_dtypes=[mx.uint32, mx.bfloat16],
+        output_dtypes=[mx.uint32, _scalar()],
     )
     output_shape = (*probabilities.shape[:-1], 8)
     return expert_ids.reshape(output_shape), route_scores.reshape(output_shape)
@@ -488,8 +507,8 @@ def _validate_target_gate(gate: Any) -> None:
         or _shape(scales) != (256, 32)
         or _shape(biases) != (256, 32)
         or weight.dtype != mx.uint32
-        or scales.dtype != mx.bfloat16
-        or biases.dtype != mx.bfloat16
+        or scales.dtype != _scalar()
+        or biases.dtype != _scalar()
     ):
         raise QwenRowOwnedRouterIneligible(
             "target gate storage must be q8/group64 [256,2048] with BF16 metadata"
@@ -498,7 +517,9 @@ def _validate_target_gate(gate: Any) -> None:
 
 def _validate_mtp_gate(gate: Any) -> None:
     weight = getattr(gate, "weight", None)
-    if weight is None or _shape(weight) != (256, 2048) or weight.dtype != mx.bfloat16:
+    # The scalar was set from this block's norm weight: a gate of the other
+    # half-width type is a mixed checkpoint, not a second supported one.
+    if weight is None or _shape(weight) != (256, 2048) or weight.dtype != _scalar():
         raise QwenRowOwnedRouterIneligible(
             "MTP gate must be dense BF16 [256,2048]"
         )
@@ -536,11 +557,14 @@ def _validate_block(block: Any, *, target: bool, norm_weight: Any) -> None:
     if (
         norm_weight is None
         or _shape(norm_weight) != (2048,)
-        or norm_weight.dtype != mx.bfloat16
+        or not _scalar_ok(norm_weight.dtype)
     ):
         raise QwenRowOwnedRouterIneligible(
             "A3B router input ownership requires BF16 hidden width 2048"
         )
+    from .kernels import moe_scalar
+
+    moe_scalar.set_scalar(norm_weight.dtype)
     if target:
         _validate_target_gate(block.gate)
     else:
@@ -724,6 +748,7 @@ def _reset_qwen_row_owned_router_for_tests() -> None:
     _clear_installed_routers()
     _KERNEL = None
     _COMBINE_KERNEL = None
+    _KERNELS_BY_SCALAR.clear()
     _STATS.update(
         {
             "enabled": False,

@@ -66,7 +66,8 @@ def _stage1_source(*, target: bool, rows: int) -> str:
 
         threadgroup bfloat router_logits[ROWS * EXPERTS];
         threadgroup bfloat probabilities[ROWS * EXPERTS];
-        threadgroup float simd_values[8];
+        threadgroup float simd_max_values[8];
+        threadgroup float simd_sum_values[8];
         threadgroup float local_probabilities[64];
         threadgroup int local_indices[64];
         threadgroup float merged_probabilities[TOP_K];
@@ -76,32 +77,27 @@ def _stage1_source(*, target: bool, rows: int) -> str:
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float local_logit = float(router_logits[row * EXPERTS + tid]);
+        // Every simdgroup reduces the eight partials itself (same lanes,
+        // same order, so the same value); the old broadcast through
+        // simd_values[0] raced with simdgroups still reading partial 0.
         float local_maximum = simd_max(local_logit);
         if (lane == 0) {
-            simd_values[simd_gid] = local_maximum;
+            simd_max_values[simd_gid] = local_maximum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float maximum_candidate = lane < 8 ? simd_values[lane] : -INFINITY;
+        float maximum_candidate = lane < 8 ? simd_max_values[lane] : -INFINITY;
         float row_maximum = simd_max(maximum_candidate);
-        if (simd_gid == 0 && lane == 0) {
-            simd_values[0] = row_maximum;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float probability = metal::exp(local_logit - simd_values[0]);
+        float probability = metal::exp(local_logit - row_maximum);
         float local_sum = simd_sum(probability);
         if (lane == 0) {
-            simd_values[simd_gid] = local_sum;
+            simd_sum_values[simd_gid] = local_sum;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float sum_candidate = lane < 8 ? simd_values[lane] : 0.0f;
+        float sum_candidate = lane < 8 ? simd_sum_values[lane] : 0.0f;
         float row_sum = simd_sum(sum_candidate);
-        if (simd_gid == 0 && lane == 0) {
-            simd_values[0] = row_sum;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
         probabilities[row * EXPERTS + tid] = bfloat(
-            probability / simd_values[0]);
+            probability / row_sum);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         float candidate_probability = float(
@@ -293,7 +289,8 @@ def _target_m2_stage1_finalizer_source() -> str:
         uint simd_gid = simdgroup_index_in_threadgroup;
 
         threadgroup bfloat probabilities[ROWS * EXPERTS];
-        threadgroup float simd_values[8];
+        threadgroup float simd_max_values[8];
+        threadgroup float simd_sum_values[8];
         threadgroup float local_probabilities[64];
         threadgroup int local_indices[64];
         threadgroup float merged_probabilities[TOP_K];
@@ -303,32 +300,27 @@ def _target_m2_stage1_finalizer_source() -> str:
         // uniform across the threadgroup, so the row-boundary barrier is safe.
         for (uint row = 0; row < ROWS; ++row) {
             float local_logit = float(router_logits[row * EXPERTS + tid]);
+            // Every simdgroup reduces the eight partials itself (same lanes,
+            // same order, so the same value); the old broadcast through
+            // simd_values[0] raced with simdgroups still reading partial 0.
             float local_maximum = simd_max(local_logit);
             if (lane == 0) {
-                simd_values[simd_gid] = local_maximum;
+                simd_max_values[simd_gid] = local_maximum;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            float maximum_candidate = lane < 8 ? simd_values[lane] : -INFINITY;
+            float maximum_candidate = lane < 8 ? simd_max_values[lane] : -INFINITY;
             float row_maximum = simd_max(maximum_candidate);
-            if (simd_gid == 0 && lane == 0) {
-                simd_values[0] = row_maximum;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            float probability = metal::exp(local_logit - simd_values[0]);
+            float probability = metal::exp(local_logit - row_maximum);
             float local_sum = simd_sum(probability);
             if (lane == 0) {
-                simd_values[simd_gid] = local_sum;
+                simd_sum_values[simd_gid] = local_sum;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            float sum_candidate = lane < 8 ? simd_values[lane] : 0.0f;
+            float sum_candidate = lane < 8 ? simd_sum_values[lane] : 0.0f;
             float row_sum = simd_sum(sum_candidate);
-            if (simd_gid == 0 && lane == 0) {
-                simd_values[0] = row_sum;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
             probabilities[row * EXPERTS + tid] = bfloat(
-                probability / simd_values[0]);
+                probability / row_sum);
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             float candidate_probability = float(
@@ -1889,22 +1881,31 @@ def whole_moe_launch_table() -> dict[str, tuple[tuple[int, int, int], tuple[int,
     }
 
 
+def _scalar_dtype():
+    from . import moe_scalar
+
+    return moe_scalar.scalar()
+
+
 def _build_kernel(
     key: str,
     *,
     input_names: list[str],
     output_names: list[str],
 ):
-    kernel = _KERNELS.get(key)
+    from . import moe_scalar
+
+    cache_key = key + moe_scalar.suffix()
+    kernel = _KERNELS.get(cache_key)
     if kernel is None:
         kernel = mx.fast.metal_kernel(
-            name=f"mtplx_a3b_whole_moe_{key}",
+            name=f"mtplx_a3b_whole_moe_{key}{moe_scalar.suffix()}",
             input_names=input_names,
             output_names=output_names,
-            source=all_whole_moe_sources()[key],
+            source=moe_scalar.metal_source(all_whole_moe_sources()[key]),
             ensure_row_contiguous=True,
         )
-        _KERNELS[key] = kernel
+        _KERNELS[cache_key] = kernel
     return kernel
 
 
@@ -2116,7 +2117,7 @@ def _launch_target_stage1(
         grid=(256, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(rows, 8), (rows, 8), (rows, 1)],
-        output_dtypes=[mx.uint32, mx.bfloat16, mx.bfloat16],
+        output_dtypes=[mx.uint32, _scalar_dtype(), _scalar_dtype()],
     )
 
 
@@ -2130,7 +2131,7 @@ def _launch_mtp_stage1(kernel: Any, value: Any, binding: Any):
         grid=(256, 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(1, 8), (1, 8), (1, 1)],
-        output_dtypes=[mx.uint32, mx.bfloat16, mx.bfloat16],
+        output_dtypes=[mx.uint32, _scalar_dtype(), _scalar_dtype()],
     )
 
 
@@ -2157,14 +2158,14 @@ def _launch_target_m2_stage1(
         grid=(STAGE1_PROJECTION_THREADGROUPS * STAGE1_THREADS, 1, 1),
         threadgroup=(STAGE1_THREADS, 1, 1),
         output_shapes=[(rows, EXPERTS), (rows, 1)],
-        output_dtypes=[mx.bfloat16, mx.bfloat16],
+        output_dtypes=[_scalar_dtype(), _scalar_dtype()],
     )
     expert_ids, route_scores = finalizer_kernel(
         inputs=[router_logits],
         grid=(STAGE1_THREADS, 1, 1),
         threadgroup=(STAGE1_THREADS, 1, 1),
         output_shapes=[(rows, TOP_K), (rows, TOP_K)],
-        output_dtypes=[mx.uint32, mx.bfloat16],
+        output_dtypes=[mx.uint32, _scalar_dtype()],
     )
     return expert_ids, route_scores, shared_gate
 
@@ -2237,7 +2238,7 @@ def _launch_target_stage2(
         grid=(STAGE2_THREADGROUPS * TILED_THREADS, 1, 1),
         threadgroup=(TILED_THREADS, 1, 1),
         output_shapes=[(rows, ACTIVATION_SLOTS, INTERMEDIATE)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[_scalar_dtype()],
     )
     return activations
 
@@ -2261,7 +2262,7 @@ def _launch_mtp_stage2(
         grid=(STAGE2_THREADGROUPS * TILED_THREADS, 1, 1),
         threadgroup=(TILED_THREADS, 1, 1),
         output_shapes=[(1, ACTIVATION_SLOTS, INTERMEDIATE)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[_scalar_dtype()],
     )
     return activations
 
@@ -2346,7 +2347,7 @@ def _launch_target_stage3(
         grid=(STAGE3_THREADGROUPS * TILED_THREADS, 1, 1),
         threadgroup=(TILED_THREADS, 1, 1),
         output_shapes=[(rows, HIDDEN)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[_scalar_dtype()],
     )
     return output
 
@@ -2374,7 +2375,7 @@ def _launch_mtp_stage3(
         grid=(STAGE3_THREADGROUPS * TILED_THREADS, 1, 1),
         threadgroup=(TILED_THREADS, 1, 1),
         output_shapes=[(1, HIDDEN)],
-        output_dtypes=[mx.bfloat16],
+        output_dtypes=[_scalar_dtype()],
     )
     return output
 

@@ -248,6 +248,12 @@ def validate_a3b_whole_moe_request(
         )
 
 
+def _moe_scalar():
+    from .kernels import moe_scalar
+
+    return moe_scalar.scalar()
+
+
 def _shape(value: Any) -> tuple[int, ...]:
     return tuple(int(dimension) for dimension in value.shape)
 
@@ -286,8 +292,8 @@ def _require_quantized(
         or _shape(scales) != metadata_shape
         or _shape(biases) != metadata_shape
         or weight.dtype != mx.uint32
-        or scales.dtype != mx.bfloat16
-        or biases.dtype != mx.bfloat16
+        or scales.dtype not in (mx.bfloat16, mx.float16)
+        or biases.dtype != scales.dtype
     ):
         raise A3BWholeMoeConfigError(
             f"{label} storage does not match the exact packed tensor contract"
@@ -306,7 +312,7 @@ def _require_dense(
     if (
         weight is None
         or _shape(weight) != weight_shape
-        or weight.dtype != mx.bfloat16
+        or weight.dtype not in (mx.bfloat16, mx.float16)
         or int(getattr(module, "bits", 0) or 0) != 0
         or getattr(module, "scales", None) is not None
         or getattr(module, "biases", None) is not None
@@ -375,11 +381,14 @@ def _require_common_block(block: Any, *, label: str, norm_weight: Any) -> None:
     if (
         norm_weight is None
         or _shape(norm_weight) != (2048,)
-        or norm_weight.dtype != mx.bfloat16
+        or norm_weight.dtype not in (mx.bfloat16, mx.float16)
     ):
         raise A3BWholeMoeConfigError(
             f"{label} requires BF16 hidden width 2048 ownership"
         )
+    from .kernels import moe_scalar
+
+    moe_scalar.set_scalar(norm_weight.dtype)
 
 
 def _target_binding(block: Any, *, norm_weight: Any) -> A3BWholeMoeBinding:
@@ -750,7 +759,7 @@ def _check_whole_moe_m1_m2_row_parity(binding: A3BWholeMoeBinding) -> float:
     value = (
         mx.sin(fixture * 0.013) * 0.25
         + mx.cos(fixture * 0.007) * 0.0625
-    ).astype(mx.bfloat16)
+    ).astype(_moe_scalar())
     m2_out = _target_m2_route(binding)(value)
     m1_route = _target_m1_route(binding)
     row0 = m1_route(value[:, 0:1, :])
@@ -774,7 +783,7 @@ def _check_whole_moe_m1_m3_row_parity(binding: A3BWholeMoeBinding) -> float:
     value = (
         mx.sin(fixture * 0.013) * 0.25
         + mx.cos(fixture * 0.007) * 0.0625
-    ).astype(mx.bfloat16)
+    ).astype(_moe_scalar())
     m3_out = _target_m3_route(binding)(value)
     m1_route = _target_m1_route(binding)
     row0 = m1_route(value[:, 0:1, :])
@@ -799,7 +808,7 @@ def _check_whole_moe_m2_m3_prefix_parity(binding: A3BWholeMoeBinding) -> float:
     value = (
         mx.sin(fixture * 0.013) * 0.25
         + mx.cos(fixture * 0.007) * 0.0625
-    ).astype(mx.bfloat16)
+    ).astype(_moe_scalar())
     m3_out = _target_m3_route(binding)(value)
     m2_out = _target_m2_route(binding)(value[:, 0:2, :])
     mx.eval(m3_out, m2_out)
@@ -853,7 +862,7 @@ def _check_whole_moe_lane(
     value = (
         mx.sin(fixture * 0.013) * 0.25
         + mx.cos(fixture * 0.007) * 0.0625
-    ).astype(mx.bfloat16)
+    ).astype(_moe_scalar())
 
     if binding.variant == "target_q8g64_q4g64":
         stage3 = (
@@ -941,11 +950,69 @@ def _check_whole_moe_lane(
         compiled_reference,
     )
     if not bool(mx.array_equal(expert_ids, reference_ids).item()):
-        return {component: float("inf") for component in _SELFCHECK_LIMITS}
+        if not _same_top8_up_to_ties(expert_ids, reference_ids, probabilities, rows):
+            return {component: float("inf") for component in _SELFCHECK_LIMITS}
+        # argpartition breaks exact probability ties arbitrarily (in FP16 rows
+        # ties are common enough to hit one of 40 layers); the kernel keeps the
+        # lower ids. Both are the stock top-8, so the remaining stages are
+        # compared against the kernel's own selection.
+        return _check_whole_moe_lane_with_ids(
+            binding, value, rows, expert_ids, route_scores, shared_gate,
+            activations, compiled_candidate, compiled_reference, probabilities, stage3,
+        )
     return {
         "expert_ids": 0.0,
         "route_scores": _max_abs_diff(route_scores, reference_scores),
         "shared_gate": _max_abs_diff(shared_gate, reference_shared_gate),
+        "activations": _max_abs_diff(activations, reference_activations),
+        "stage3_output": _max_abs_diff(stage3_candidate, compiled_reference),
+        "output": _max_abs_diff(compiled_candidate, compiled_reference),
+    }
+
+
+def _same_top8_up_to_ties(candidate_ids, reference_ids, probabilities, rows: int) -> bool:
+    """The two top-8 sets differ only by experts of exactly equal probability."""
+
+    probs = probabilities.reshape(rows, -1).astype(mx.float32)
+    for row in range(rows):
+        cand = set(int(i) for i in candidate_ids[row].tolist())
+        ref = set(int(i) for i in reference_ids[row].tolist())
+        if cand == ref:
+            continue
+        values = {float(probs[row, i].item()) for i in cand ^ ref}
+        if len(values) != 1:
+            return False
+        cutoff = min(float(probs[row, i].item()) for i in ref)
+        if values != {cutoff}:
+            return False
+    return True
+
+
+def _check_whole_moe_lane_with_ids(
+    binding, value, rows, expert_ids, route_scores, shared_gate,
+    activations, compiled_candidate, compiled_reference, probabilities, stage3,
+) -> dict[str, float]:
+    from mlx_lm.models.qwen3_next import swiglu
+
+    ids = expert_ids.reshape(rows, 8)
+    probs = probabilities.reshape(rows, -1)
+    scores = mx.take_along_axis(probs, ids.astype(mx.int32), axis=-1)
+    scores = scores / scores.sum(axis=-1, keepdims=True)
+    shared = binding.block.shared_expert_gate(value).reshape(rows, 1)
+    packed = binding.block.switch_mlp.gate_up_proj.gather(
+        mx.expand_dims(value, (-2, -3)), ids.reshape(1, rows, 8), False
+    )
+    gate, up = mx.split(packed, [512], axis=-1)
+    sg, su = mx.split(binding.block.shared_expert.gate_up_proj(value), [512], axis=-1)
+    reference_activations = mx.concatenate(
+        [swiglu(gate, up).reshape(rows, 8, 512), swiglu(sg, su).reshape(rows, 1, 512)], axis=1
+    )
+    stage3_candidate = stage3(reference_activations, ids, scores, shared, binding).reshape(*value.shape)
+    mx.eval(scores, shared, reference_activations, stage3_candidate)
+    return {
+        "expert_ids": 0.0,
+        "route_scores": _max_abs_diff(route_scores, scores),
+        "shared_gate": _max_abs_diff(shared_gate, shared),
         "activations": _max_abs_diff(activations, reference_activations),
         "stage3_output": _max_abs_diff(stage3_candidate, compiled_reference),
         "output": _max_abs_diff(compiled_candidate, compiled_reference),
@@ -973,7 +1040,12 @@ def run_a3b_whole_moe_selfcheck(
         for binding, rows in lane_checks:
             try:
                 differences = _check_whole_moe_lane(binding, rows=rows)
-            except Exception:
+            except Exception as exc:
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "[a3b-whole-moe] self-check %s raised %r", lane, exc
+                )
                 differences = {
                     component: float("inf") for component in _SELFCHECK_LIMITS
                 }
@@ -1098,6 +1170,14 @@ def install_a3b_whole_moe(
             "a3b_whole_moe_target_m2_m3_prefix_parity",
         )
     failed = tuple(lane for lane in required_lanes if lanes.get(lane) != "ok")
+    if failed and os.environ.get("MTPLX_A3B_WHOLE_MOE_SELFCHECK_ADVISORY") == "1":
+        # Measurement only: install despite failed lanes, and say so.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "[a3b-whole-moe] ADVISORY install despite failed self-check: %s", ", ".join(failed)
+        )
+        failed = ()
     if failed:
         _STATS.update(
             {
@@ -1105,7 +1185,11 @@ def install_a3b_whole_moe(
                 "installed": False,
                 "installation_status": "configuration_error",
                 "installation_error": (
-                    "whole-MoE self-check failed for " + ", ".join(failed)
+                    "whole-MoE self-check failed for "
+                    + ", ".join(
+                        f"{lane} (dmax {(selfcheck_report or {}).get('dmax', {}).get(lane)})"
+                        for lane in failed
+                    )
                 ),
             }
         )

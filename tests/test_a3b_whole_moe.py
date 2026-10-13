@@ -629,7 +629,21 @@ def test_target_m2_stage1_finalizer_preserves_exact_two_row_arithmetic():
     assert "probability1 == probability0 && index1 > index0" in source
     assert "bfloat rounded_denominator = bfloat(0.0f)" in source
     assert "merged_probabilities[TOP_K - 1 - output_rank]" in source
-    assert source.count("threadgroup_barrier(mem_flags::mem_threadgroup)") >= 6
+    assert source.count("threadgroup_barrier(mem_flags::mem_threadgroup)") >= 5
+    # Each simdgroup reduces the eight partials itself: no broadcast through a
+    # slot other simdgroups may still be reading (the 2026-10-14 M1 race).
+    assert "simd_values[0] =" not in source
+    assert "simd_sum_values[simd_gid] = local_sum" in source
+    assert "probability / row_sum" in source
+
+
+def test_stage1_softmax_has_no_partial_slot_broadcast():
+    for name, source in kernel_module.all_whole_moe_sources().items():
+        if "local_maximum" not in source:
+            continue
+        assert "simd_values[0] =" not in source, name
+        assert "simd_max_values[simd_gid] = local_maximum" in source, name
+        assert "simd_sum_values[simd_gid] = local_sum" in source, name
 
 
 def test_stage2_sources_encode_selected_q4_and_exact_bf16_swiglu():

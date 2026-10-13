@@ -177,8 +177,11 @@ def _check_qmm_lane(mx, fn, m: int, bits: int, group_size: int, dtype) -> float:
 def _check_qwen_row_owned_router(mx, dtype) -> float:
     """Require bitwise stock routing for every installed M1-M16 row count."""
 
-    if dtype != mx.bfloat16:
+    if dtype not in (mx.bfloat16, mx.float16):
         return float("inf")
+    from .kernels import moe_scalar
+
+    moe_scalar.set_scalar(dtype)
     from .qwen_row_owned_router import qwen_row_owned_route
 
     fixture = mx.arange(16 * 256, dtype=mx.float32).reshape(16, 256)
@@ -204,8 +207,11 @@ def _check_qwen_row_owned_router(mx, dtype) -> float:
 def _check_qwen_combine_tail_m1_m2(mx, dtype) -> float:
     """Require bitwise stock arithmetic for every installed combine shape."""
 
-    if dtype != mx.bfloat16:
+    if dtype not in (mx.bfloat16, mx.float16):
         return float("inf")
+    from .kernels import moe_scalar
+
+    moe_scalar.set_scalar(dtype)
     from .qwen_row_owned_router import (
         qwen_combine_tail_m1,
         qwen_combine_tail_m16,
@@ -326,8 +332,11 @@ def _check_fused_gdn_norm_gate(mx, dtype) -> float:
 
 def _check_gdn_postconv_inline_g(mx, dtype) -> float:
     """Compare the exact A3B M1/M2 stock captures with their fixed routes."""
-    if dtype != mx.bfloat16:
+    if dtype not in (mx.bfloat16, mx.float16):
         return float("inf")
+    from .kernels import moe_scalar
+
+    moe_scalar.set_scalar(dtype)
 
     from .gdn_capture import (
         _a3b_compiled_target_gdn_postconv_m1_tgy4,
@@ -336,10 +345,10 @@ def _check_gdn_postconv_inline_g(mx, dtype) -> float:
     )
 
     conv_values = mx.arange(2 * 8192, dtype=mx.float32).reshape(1, 2, 8192)
-    conv_out = (mx.sin(conv_values * 0.013) * 0.5).astype(mx.bfloat16)
+    conv_out = (mx.sin(conv_values * 0.013) * 0.5).astype(dtype)
     gate_values = mx.arange(64, dtype=mx.float32).reshape(1, 2, 32)
-    a = (mx.sin(gate_values * 0.11) * 0.5).astype(mx.bfloat16)
-    b = (mx.cos(gate_values * 0.07) * 0.5).astype(mx.bfloat16)
+    a = (mx.sin(gate_values * 0.11) * 0.5).astype(dtype)
+    b = (mx.cos(gate_values * 0.07) * 0.5).astype(dtype)
     state_values = mx.arange(32 * 128 * 128, dtype=mx.float32).reshape(
         1, 32, 128, 128
     )
@@ -408,8 +417,11 @@ def _check_gdn_postconv_inline_g(mx, dtype) -> float:
 
 def _check_gdn_postconv_headquarter(mx, dtype) -> float:
     """Compare the exact A3B M1/M2 stock captures with the C1 headquarter routes."""
-    if dtype != mx.bfloat16:
+    if dtype not in (mx.bfloat16, mx.float16):
         return float("inf")
+    from .kernels import moe_scalar
+
+    moe_scalar.set_scalar(dtype)
 
     from .gdn_capture import (
         _a3b_compiled_target_gdn_postconv_m1_headquarter,
@@ -418,10 +430,10 @@ def _check_gdn_postconv_headquarter(mx, dtype) -> float:
     )
 
     conv_values = mx.arange(2 * 8192, dtype=mx.float32).reshape(1, 2, 8192)
-    conv_out = (mx.sin(conv_values * 0.013) * 0.5).astype(mx.bfloat16)
+    conv_out = (mx.sin(conv_values * 0.013) * 0.5).astype(dtype)
     gate_values = mx.arange(64, dtype=mx.float32).reshape(1, 2, 32)
-    a = (mx.sin(gate_values * 0.11) * 0.5).astype(mx.bfloat16)
-    b = (mx.cos(gate_values * 0.07) * 0.5).astype(mx.bfloat16)
+    a = (mx.sin(gate_values * 0.11) * 0.5).astype(dtype)
+    b = (mx.cos(gate_values * 0.07) * 0.5).astype(dtype)
     state_values = mx.arange(32 * 128 * 128, dtype=mx.float32).reshape(
         1, 32, 128, 128
     )

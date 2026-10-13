@@ -837,8 +837,8 @@ def preflight_a3b_k1_target_prefix_full_graph(
     if (
         tuple(m2_hidden.shape) != (1, 2, 2048)
         or tuple(m1_hidden.shape) != (1, 1, 2048)
-        or m2_hidden.dtype != mx.bfloat16
-        or m1_hidden.dtype != mx.bfloat16
+        or m2_hidden.dtype not in (mx.bfloat16, mx.float16)
+        or m1_hidden.dtype != m2_hidden.dtype
     ):
         _fail("compiled A3B target-prefix full-graph preflight returned invalid hidden ownership")
 

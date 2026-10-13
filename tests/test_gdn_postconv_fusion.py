@@ -277,7 +277,7 @@ def test_invalid_external_model_contract_prevents_installation(
     elif mutation == "projection_quantization":
         first.in_proj_a.group_size = 128
     elif mutation == "config_dtype":
-        config["text_config"]["dtype"] = "float16"
+        config["text_config"]["dtype"] = "float32"
 
     with pytest.raises(gdn_capture.A3BGDNPostconvConfigError, match=mutation):
         gdn_capture.prepare_a3b_gdn_postconv(model, config=config)
