@@ -22228,6 +22228,19 @@ def _admission_quant_working(
     }
 
 
+def _m1_mma_pages_prefill() -> bool:
+    """Whether prefill over quantized pages runs on the M1 MMA kernel."""
+
+    try:
+        from mtplx.cache_state import _env_flag_default_m1
+
+        return _env_flag_default_m1("MTPLX_GQA_MMA_PREFILL") and _env_flag_default_m1(
+            "MTPLX_KV_QUANT_MMA_PREFILL"
+        )
+    except Exception:
+        return False
+
+
 def _m1_compact_direct_restore(source: Any, geometry: Any) -> bool:
     """Whether restoring ``source`` takes the M1 build's quantized direct path.
 
@@ -22487,7 +22500,13 @@ def _admission_growth(
             prefill_chunk_tokens=prefill_chunk_tokens,
             verify_tokens=verify_tokens,
         )
-    if layout == "paged_compact_direct":
+    if layout == "paged_compact_direct" or (
+        layout == "paged" and quantized and _m1_mma_pages_prefill()
+    ):
+        # The M1 MMA prefill reads the quantized pages itself and decode
+        # takes the kernel past it: no bf16 mirror is built. A cold 257K
+        # prompt paged from the start (2026-10-13) was otherwise billed a
+        # 29.4 GiB mirror and refused.
         quant_working = 0
         quant_detail = {"route": "m1_mma_pages", "kernel_q_len": 0}
     if repages:
