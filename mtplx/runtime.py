@@ -629,6 +629,11 @@ def load(
     from .moe_sorted_gather import install_switch_glu_rows, install_switch_linear_guard
 
     install_switch_linear_guard()
+    # M1 family: expert-segmented tiles for prefill-width sorted gathers
+    # (kernels/moe_seg_gather_m1; bit-identical, first-use canary per shape).
+    from .kernels.moe_seg_gather_m1 import install_switch_linear as _install_m1_seg
+
+    _install_m1_seg()
     install_switch_glu_rows()
     engine_blocker = engine_version_blocker(_load_runtime_metadata(path))
     if engine_blocker:

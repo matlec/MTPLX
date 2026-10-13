@@ -167,7 +167,7 @@ def _pad(x: mx.array, indices: mx.array, pad: int) -> tuple[mx.array, mx.array]:
     return x, indices
 
 
-def gather_qmm(
+def guarded_gather_qmm(
     x: mx.array,
     w: mx.array,
     scales: mx.array,
@@ -181,7 +181,7 @@ def gather_qmm(
     *,
     sorted_indices: bool = False,
 ) -> mx.array:
-    """``mx.gather_qmm`` with the sorted-rows guard: same arguments, same result."""
+    """``mx.gather_qmm`` with the sorted-rows guard only (no M1 segmented kernel)."""
 
     pad = (
         _call_pad(
@@ -216,6 +216,55 @@ def gather_qmm(
         sorted_indices=sorted_indices,
     )
     return y[: x.shape[0] - pad] if pad else y
+
+
+def gather_qmm(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: mx.array | None = None,
+    lhs_indices: mx.array | None = None,
+    rhs_indices: mx.array | None = None,
+    transpose: bool = True,
+    group_size: int | None = None,
+    bits: int | None = None,
+    mode: str = "affine",
+    *,
+    sorted_indices: bool = False,
+) -> mx.array:
+    """``mx.gather_qmm`` with the sorted-rows guard: same arguments, same result.
+
+    On the M1 family a prefill-width sorted call runs the expert-segmented
+    kernel (``mtplx.kernels.moe_seg_gather_m1``, bit-identical); the row
+    guard only ever pads on tensor-unit GPUs, where that kernel never runs.
+    """
+
+    from mtplx.kernels import moe_seg_gather_m1 as _m1_seg
+
+    if not guard_active() and _m1_seg.applies(
+        x, w, scales, biases, rhs_indices,
+        lhs_indices=lhs_indices, transpose=transpose, group_size=group_size,
+        bits=bits, mode=mode, sorted_indices=sorted_indices,
+    ):
+        y = _m1_seg.gather_qmm(
+            x, w, scales, biases, rhs_indices,
+            group_size=int(group_size), bits=int(bits),
+        )
+        if y is not None:
+            return y
+    return guarded_gather_qmm(
+        x,
+        w,
+        scales,
+        biases,
+        lhs_indices=lhs_indices,
+        rhs_indices=rhs_indices,
+        transpose=transpose,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        sorted_indices=sorted_indices,
+    )
 
 
 def sort_rows(x: mx.array, indices: mx.array):
