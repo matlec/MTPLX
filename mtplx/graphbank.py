@@ -2708,6 +2708,7 @@ class CompiledVerifyBank:
         self.capture_backend = resolve_gdn_capture_backend(capture_backend)
         self.parity = bool(parity)
         self.parity2 = bool(parity2)
+        self._prewarm_walked = False
         if self.parity and self.parity2:
             raise ValueError(
                 "CompiledVerifyBank: parity and parity2 are mutually exclusive"
@@ -4441,11 +4442,18 @@ class CompiledVerifyBank:
             return result
         if (
             not _PREWARM_DONE
+            and not self._prewarm_walked
             and not self.parity
             and not self.parity2
             and not extended_window
             and _prewarm_enabled()
         ):
+            # One walk per bank (one bank per generation): a walk clamped by
+            # this cache's capacity cannot add coverage on the next call of the
+            # same generation, and re-walking reads the paged offsets, which
+            # waits for every queued forward (11 ms per call when the rounds
+            # are pipelined). Later generations still extend the ladder (F6).
+            self._prewarm_walked = True
             # First compiled dispatch of a generation while coverage is
             # incomplete (the first one of the process is normally the
             # startup warmup generation): walk the PAGED bucket ladder so
@@ -5269,6 +5277,28 @@ class CompiledVerifyBank:
 
     def _resolve_bucket(self, cache: Any, length: int) -> int | None:
         """Static paged-attention ceiling for this call, or None on overflow."""
+        hint = getattr(self, "offset_bound_hint", None)
+        if hint is not None:
+            # Device-resident rounds (mtplx/resident_decode.py) queue this
+            # forward before the previous one finished: reading the offsets
+            # would wait for it. Their host upper bound of every offset keeps
+            # the precondition offset + M <= bucket without a read.
+            min_capacity = None
+            for idx, kind, _n in self._spec or []:
+                if kind != VERIFY_SPEC_KIND_FULL_ATTN:
+                    continue
+                entry = cache[idx]
+                if hasattr(entry, "capacity"):
+                    capacity = int(entry.capacity)
+                    min_capacity = capacity if min_capacity is None else min(min_capacity, capacity)
+            max_needed = int(hint) + int(length)
+            self._last_context_estimate = max_needed
+            if min_capacity is None:
+                return 0
+            if max_needed > min_capacity:
+                return None
+            bucket = min(min_capacity, _next_pow2(max_needed + 512))
+            return bucket if max_needed <= bucket else min_capacity
         # One eval for every paged offset instead of a serial sync per entry
         # inside size() below (#318; helper docstring has the mechanism).
         # Mirrors this loop's own iteration exactly.

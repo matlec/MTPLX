@@ -1014,7 +1014,10 @@ def _make_linear_gated_delta_from_conv_tape_kernel():
     )
 
 
-def _make_linear_gated_delta_from_conv_tape_replay_kernel():
+def _make_linear_gated_delta_from_conv_tape_replay_kernel(dynamic_steps: bool = False):
+    """``dynamic_steps``: the step count is read from a device ``steps`` input
+    instead of the ``Steps`` template (device-resident commits pick it after
+    the verify without a host read); the per-step arithmetic is unchanged."""
     if not mx.metal.is_available():
         return None
 
@@ -1080,6 +1083,16 @@ def _make_linear_gated_delta_from_conv_tape_replay_kernel():
           state_t[s_idx] = static_cast<StT>(state[i]);
         }
     """
+    if dynamic_steps:
+        loop = "for (int t = 0; t < Steps; ++t) {"
+        if source.count(loop) != 1:
+            raise RuntimeError("tape replay source patch point moved")
+        return mx.fast.metal_kernel(
+            name="mtplx_linear_gated_delta_from_conv_tape_replay_dyn_v1",
+            input_names=["tape", "conv_out", "g", "state_in", "T", "steps"],
+            output_names=["state_out"],
+            source=source.replace(loop, "for (int t = 0; t < steps[0]; ++t) {"),
+        )
     return mx.fast.metal_kernel(
         name="mtplx_linear_gated_delta_from_conv_tape_replay_v1",
         input_names=["tape", "conv_out", "g", "state_in", "T"],
@@ -1977,6 +1990,62 @@ def _linear_gated_delta_from_conv_tape_replay(
         threadgroup=(32, tgy, 1),
         output_shapes=[state.shape],
         output_dtypes=[state_type],
+    )
+    return state_out
+
+
+_TAPE_REPLAY_DYNAMIC_KERNEL: Any = None
+
+
+def linear_gated_delta_from_conv_tape_replay_steps(
+    tape: mx.array,
+    conv_out: mx.array,
+    g: mx.array,
+    state: mx.array,
+    gdn_meta: Any,
+    steps: mx.array,
+):
+    """``_linear_gated_delta_from_conv_tape_replay`` with a device step count
+    (int32 scalar, 1..T). Same kernel body, so the same state bits."""
+
+    global _TAPE_REPLAY_DYNAMIC_KERNEL
+    if _TAPE_REPLAY_DYNAMIC_KERNEL is None:
+        _TAPE_REPLAY_DYNAMIC_KERNEL = _make_linear_gated_delta_from_conv_tape_replay_kernel(
+            dynamic_steps=True
+        )
+    if _TAPE_REPLAY_DYNAMIC_KERNEL is None:
+        return None
+    B, T, conv_dim = conv_out.shape
+    if int(conv_dim) != _gdn_meta_int(gdn_meta, "conv_dim"):
+        return None
+    Dk = _gdn_meta_int(gdn_meta, "head_k_dim")
+    Dv = _gdn_meta_int(gdn_meta, "head_v_dim")
+    Hk = _gdn_meta_int(gdn_meta, "num_k_heads")
+    Hv = _gdn_meta_int(gdn_meta, "num_v_heads")
+    if Dk % 32 != 0:
+        return None
+    try:
+        tgy = int(os.environ.get("MTPLX_LINEAR_GDN_FROM_CONV_TGY", "8"))
+    except ValueError:
+        tgy = 8
+    if tgy not in {4, 8, 16, 32} or Dv % tgy != 0:
+        tgy = 8 if Dv % 8 == 0 else 4
+    (state_out,) = _TAPE_REPLAY_DYNAMIC_KERNEL(
+        inputs=[tape, conv_out, g, state, T, steps.astype(mx.int32).reshape(1)],
+        template=[
+            ("InT", conv_out.dtype),
+            ("StT", state.dtype),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+            ("KeyDim", _gdn_meta_int(gdn_meta, "key_dim")),
+            ("ConvDim", _gdn_meta_int(gdn_meta, "conv_dim")),
+        ],
+        grid=(32, Dv, B * Hv),
+        threadgroup=(32, tgy, 1),
+        output_shapes=[state.shape],
+        output_dtypes=[state.dtype],
     )
     return state_out
 

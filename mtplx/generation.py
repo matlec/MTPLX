@@ -3975,6 +3975,8 @@ class GenerationStats:
     sampled_draft_chain_rounds: int = 0
     sampled_draft_chain_cuts: int = 0
     sampled_draft_chain_status: str = "off"
+    # MTPLX_M1_RESIDENT_DECODE: device-resident rounds (mtplx/resident_decode.py).
+    resident_decode: dict[str, Any] | None = None
     # MTPLX_CHAIN_EARLY_VERIFY: rounds whose verify was dispatched straight
     # after the chained draft on the device-predicted tokens, and rounds where
     # the host's float64 pick disagreed with the kept device token.
@@ -13125,6 +13127,25 @@ def generate_mtpk(
             _sampled_chain_status = (
                 "installed" if _sampled_chain_plan is not None else f"declined:{_sc_reason}"
             )
+    from . import resident_decode as _resident_decode
+
+    _resident_ok = (
+        _resident_decode.enabled()
+        and _greedy_chain_eligible
+        and _deferred_draft_eligible
+        and _batched_bonus_eligible
+        and int(speculative_depth) == 1
+        and verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+        and not family_capture_commit_active
+        and not qsa_mtp_precompute_active
+        and _loop_guard is None
+        and _thinking_guard is None
+        and _draft_k20_prescatter_plan is None
+        and draft_core == "stock"
+        and vision_splice is None
+    )
+    _resident_mtp = None
+    _resident_stats: dict[str, Any] = {"enabled": bool(_resident_ok)}
     from .mlx_process_env import enter_decode_command_buffer_limits as _enter_decode_cb
     _enter_decode_cb()
     while len(tokens) < max_tokens:
@@ -14126,6 +14147,126 @@ def generate_mtpk(
         draft_hidden = hidden
         next_token = primary
         device_draft_token = None
+        if (
+            _resident_ok
+            and primary_already_emitted
+            and cycle_depth == 1
+            and not _steer_active
+            and compiled_verify_bank is not None
+            and not compiled_verify_bank.permanent_eager
+            and mtp_cache is not None
+            and not ccopy_active
+            and len(tokens) + 8 < max_tokens
+        ):
+            # MTPLX_M1_RESIDENT_DECODE: pipelined device-resident rounds (see
+            # mtplx/resident_decode.py). They hand back a round start the
+            # stock loop resumes from exactly; one try per generation.
+            _resident_ok = False
+            try:
+                if _resident_mtp is None:
+                    _resident_mtp = _resident_decode.ResidentMTP(
+                        rt,
+                        mtp_cache,
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        reserve=max(_DEVICE_CORE_HISTORY_RESERVE, max_tokens + 256),
+                        hidden=draft_hidden,
+                        primary=mx.array([[int(primary)]], dtype=mx.int32),
+                    )
+
+                def _resident_verify(ids, committed_upper):
+                    set_native_mlp_context(int(committed_upper))
+                    with (
+                        _decode_trunk_scope(vision_splice),
+                        model_forward_kind("target_verify"),
+                        exact_verify(True),
+                    ):
+                        compiled_verify_bank.offset_bound_hint = len(prompt_ids) + int(
+                            committed_upper
+                        )
+                        try:
+                            return compiled_verify_bank.forward_ar_capture(
+                                ids,
+                                cache=cache,
+                                return_hidden=True,
+                                hidden_variant=base_hidden_variant,
+                                committed_count=int(committed_upper) - 1,
+                            )
+                        finally:
+                            compiled_verify_bank.offset_bound_hint = None
+
+                def _resident_reserve(committed_upper):
+                    return (
+                        _paged_round_reservation(
+                            cache,
+                            depth=1,
+                            offset_bound=len(prompt_ids) + int(committed_upper) + _PAGED_OFFSET_BOUND_SLACK,
+                        )
+                        is None
+                    )
+
+                def _resident_tokens(new_tokens):
+                    nonlocal mtp_history_live_appended
+                    tokens.extend(int(t) for t in new_tokens)
+                    # The stock loop counts the appended accepted draft only.
+                    mtp_history_live_appended += len(new_tokens) - 1
+                    emit_new_tokens()
+
+                def _resident_should_stop():
+                    if abort_check is not None and abort_check():
+                        return True
+                    if (
+                        mtp_history_live_reset_threshold > 0
+                        and mtp_history_live_appended >= mtp_history_live_reset_threshold
+                    ):
+                        return True
+                    return (
+                        repetition_config.enabled
+                        and _trim_repeated_suffix(
+                            list(tokens), repetition_config, repetition_long_cycle
+                        )
+                        is not None
+                    )
+
+                _rr = _resident_decode.run_resident_rounds(
+                    cache=cache,
+                    mtp=_resident_mtp,
+                    verify=_resident_verify,
+                    reserve_round=_resident_reserve,
+                    hidden=draft_hidden,
+                    primary=int(primary),
+                    committed=len(tokens),
+                    max_tokens=max_tokens,
+                    stop_token_ids=stop_token_ids,
+                    should_stop=_resident_should_stop,
+                    on_tokens=_resident_tokens,
+                    context_limit=_resident_decode.max_context() - len(prompt_ids),
+                )
+            except _resident_decode.ResidentUnsupported as exc:
+                _resident_stats["unsupported"] = str(exc)
+                _rr = None
+            if _rr is not None:
+                verify_calls += _rr.rounds
+                drafted += _rr.rounds
+                drafted_by_depth[0] += _rr.rounds
+                accepted += _rr.accepted
+                accepted_by_depth[0] += _rr.accepted
+                rejected += _rr.rounds - _rr.accepted
+                bonus_tokens += _rr.accepted
+                correction_tokens += _rr.rounds - _rr.accepted
+                verify_time += _rr.verify_time_s
+                draft_time += _rr.draft_time_s
+                _resident_stats.update(
+                    rounds=int(_rr.rounds),
+                    accepted=int(_rr.accepted),
+                    wall_s=round(float(_rr.wall_s), 4),
+                    exit=_rr.exit_reason,
+                    tokens=len(_rr.tokens),
+                )
+                pending_primary = int(_rr.primary)
+                hidden = _rr.hidden
+                if _rr.logits is not None:
+                    logits = _rr.logits
+                continue
 
         # Copy-streak draft substitution: propose the prompt continuation as
         # this cycle's depth-1 draft and skip MTP head compute entirely.  The
@@ -17201,6 +17342,7 @@ def generate_mtpk(
         sampled_draft_chain_rounds=_sampled_chain_rounds,
         sampled_draft_chain_cuts=_sampled_chain_cuts,
         sampled_draft_chain_status=_sampled_chain_status,
+        resident_decode=dict(_resident_stats),
         sampled_draft_chain_early_verify_rounds=_early_verify_rounds,
         sampled_draft_chain_edge_keeps=_early_verify_edge_keeps,
         graphbank={
