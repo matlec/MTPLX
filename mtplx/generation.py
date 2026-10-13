@@ -16051,6 +16051,10 @@ def generate_mtpk(
             if (
                 sampler.temperature > 0
                 or a3b_target_prefix_route is not None
+                # M1 MoE batched lane: the greedy correction is the batched
+                # argmax of this row, so it becomes the pending primary
+                # instead of a second argmax sync at the next cycle's top.
+                or (_batched_bonus_eligible and _batched_target_tokens is not None)
             ) and (
                 constraint is None
                 or constraint.validate_prefix(
