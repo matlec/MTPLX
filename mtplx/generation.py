@@ -2512,6 +2512,27 @@ def _iter_prefill_chunk_spans(
     )
 
 
+def _release_restored_entry_applies(restored: Any, session_id: str | None) -> bool:
+    """Whether a turn drops the bank entry it restored by copy (M1 default).
+
+    Only a clone restore of the turn's own conversation from a compact
+    (quantized) entry: the live pages own their copy, and the turn banks the
+    conversation again at its end. ``MTPLX_M1_RELEASE_RESTORED_ENTRY=0`` keeps
+    the entry (it then doubles the conversation's KV until the turn ends).
+    """
+    from .cache_state import _env_flag_default_m1, is_compact_kv_state
+
+    if not _env_flag_default_m1("MTPLX_M1_RELEASE_RESTORED_ENTRY"):
+        return False
+    entry = getattr(restored, "entry", None)
+    if entry is None or not session_id or getattr(entry, "session_id", None) != session_id:
+        return False
+    if str(getattr(restored, "restore_mode", "")) != "clone":
+        return False
+    states = getattr(getattr(entry, "cache_snapshot", None), "states", None) or ()
+    return any(is_compact_kv_state(state) for state in states)
+
+
 def _m1_paged_prefill_enabled(context_tokens: int) -> bool:
     """M1 family with quantized KV: a long prompt prefills straight into the pages.
 
@@ -7131,6 +7152,12 @@ def restore_or_prefill_prompt_state(
             }
             _done_at = getattr(restored.entry, "cold_encode_completed_at", None)
             exact_served["encode_completed"] = _done_at is not None
+            if _release_restored_entry_applies(restored, session_id):
+                exact_served["released_entry_bytes"] = int(
+                    session_bank.release_restored_entry(
+                        restored.entry, session_id=session_id
+                    )
+                )
             if _done_at is not None:
                 exact_served["encode_completed_age_s"] = round(
                     max(0.0, time.monotonic() - float(_done_at)), 3

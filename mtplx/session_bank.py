@@ -4340,6 +4340,46 @@ class SessionBank:
             moved += 1
         return {"entries": moved, "held_bytes": held, "longest_prefix_tokens": longest}
 
+    def release_restored_entry(
+        self, entry: SessionBankEntry, *, session_id: str | None
+    ) -> int:
+        """Let RAM go of an entry its own conversation just restored by copy.
+
+        M1 build (``MTPLX_M1_RELEASE_RESTORED_ENTRY``): the turn restored
+        ``entry`` into fresh live pages and banks the conversation again when
+        it ends, so until then the entry only doubles the conversation's KV
+        (10.3 GiB at 256K beside the 9.6 GiB restored, and the end-of-turn
+        snapshot on top). The entry leaves the bank and its quantized KV
+        states are dropped; a published SSD copy stays on disk. Returns the
+        bytes the bank gave back, 0 when the entry is not this session's or
+        not banked any more.
+        """
+
+        if entry is None or not session_id or entry.session_id != session_id:
+            return 0
+        if self._entries.get(tuple(entry.token_ids)) is not entry:
+            return 0
+        held = int(entry.held_nbytes)
+        self._evict_entry(
+            entry,
+            reason="restored_into_live_pages",
+            cancel_queued_persistence=not self.entry_is_durable(entry),
+        )
+        import dataclasses
+
+        from .cache_state import is_compact_kv_state
+
+        snapshot = getattr(entry, "cache_snapshot", None)
+        states = getattr(snapshot, "states", None)
+        if states is not None and any(is_compact_kv_state(state) for state in states):
+            # The snapshot is frozen: rebind it without the quantized KV,
+            # which an evicted entry never restores again.
+            entry.cache_snapshot = dataclasses.replace(
+                snapshot,
+                states=tuple(None if is_compact_kv_state(state) else state for state in states),
+            )
+        return held
+
     def release_entries_no_disk_can_take(
         self, keys: Any, *, reason: str = "released_no_ssd"
     ) -> dict[str, Any]:

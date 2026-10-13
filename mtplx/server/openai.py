@@ -22228,6 +22228,20 @@ def _admission_quant_working(
     }
 
 
+def _m1_releases_source(source: Any, session_id: str | None) -> bool:
+    """Whether the turn will drop its own conversation's restored entry
+    (``generation._release_restored_entry_applies``)."""
+
+    if source is None or not session_id or getattr(source, "session_id", None) != session_id:
+        return False
+    try:
+        from mtplx.cache_state import _env_flag_default_m1
+
+        return _env_flag_default_m1("MTPLX_M1_RELEASE_RESTORED_ENTRY")
+    except Exception:
+        return False
+
+
 def _m1_mma_pages_prefill() -> bool:
     """Whether prefill over quantized pages runs on the M1 MMA kernel."""
 
@@ -22324,6 +22338,7 @@ def _admission_growth(
     slack_rows: int = 0,
     compact_direct: bool = False,
     repage_layers: int = 1,
+    released_source_bytes: int = 0,
 ) -> dict[str, Any]:
     """New memory one request needs at its peak, on top of what is measured.
 
@@ -22544,7 +22559,9 @@ def _admission_growth(
         publish_copy = max(0, int(publish_bytes))
     else:
         publish_copy = live_total
-    decode_start = live_decode + publish_copy
+    # A turn that drops the entry it restored (M1, ``_m1_releases_source``)
+    # holds the restored pages and its end-of-turn snapshot without it.
+    decode_start = max(0, live_decode + publish_copy - max(0, int(released_source_bytes)))
     return {
         "layout": layout,
         "reused_tokens": int(R),
@@ -23333,6 +23350,13 @@ def _run_prefill_admission(
             slack_rows=slack_rows,
             repage_layers=_admission_repage_layers(runtime),
             compact_direct=bool(copies) and _m1_compact_direct_restore(source, geometry),
+            released_source_bytes=(
+                int(getattr(source, "held_nbytes", 0) or 0)
+                if bool(copies)
+                and _m1_releases_source(source, session_id)
+                and _m1_compact_direct_restore(source, geometry)
+                else 0
+            ),
         )
         model["scratch_source"] = scratch_source
         calibration = getattr(runtime, "prefill_scratch_calibration", None)
