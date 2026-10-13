@@ -1376,6 +1376,11 @@ _M1_MOE_LANE_ENV = {
     # temperature 1.0, same seeds, same text: 75.8 -> 82.2 tok/s at 2K and
     # 65.8 -> 72.3 at 30K (on the dense 27B it measured no gain).
     "MTPLX_CHAIN_EARLY_VERIFY": "1",
+    # Prefill: the blocked-sequential GDN kernel (kernels/gdn_blocked_prefill)
+    # for the 30 linear-attention layers: 5.75 -> 3.77 ms per layer at a
+    # 2,048-token chunk; 8K cold prefill 939 -> 967 tok/s (alternating
+    # processes, 2 each). Calls under 16 tokens (decode) keep the stock path.
+    "MTPLX_GDN_BLOCKED_PREFILL": "1",
 }
 
 
