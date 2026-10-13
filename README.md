@@ -47,8 +47,8 @@ Three-turn conversations over a long prompt (turn 1 reads it cold, turns 2–3 a
 ~300 tokens, up to 256 generated tokens per turn), Qwen3.8-27B, 8-bit KV,
 temperature 0, M1 Max 64 GB. From the
 [apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench)
-(this build v2.12.2-m1.1, 256K v2.12.2-m1.2; MTPLX upstream 2.12.0 and
-Splash 1.3.0-m1.1 run the same way).
+(this build v2.12.2-m1.1, 256K v2.12.2-m1.2; MTPLX upstream 2.12.0 run the same
+way). The benchmark also compares other engines.
 
 **Whole conversation**
 
@@ -56,23 +56,17 @@ Splash 1.3.0-m1.1 run the same way).
 |---|---|---|---|---|---|---|
 | **this build** | **33 s** | **61 s** | **3.3 min** | **7.3 min** | **18.4 min** | **59.4 min** |
 | MTPLX upstream | 42 s | 86 s | 5.0 min | 11.3 min | 30.6 min | — |
-| Splash 1.3.0-m1.1 | 35 s | 68 s | 3.8 min | 8.7 min | 23.1 min | 68.6 min |
 
 **Decode**, tok/s, mean of the three turns
 
 | | 2K | 8K | 32K | 64K | 128K | 256K |
 |---|---|---|---|---|---|---|
-| **this build** | 29.4 | 29.2 | **28.1** | **25.5** | **19.8** | **14.2** |
+| **this build** | **29.4** | **29.2** | **28.1** | **25.5** | **19.8** | **14.2** |
 | MTPLX upstream | 23.6 | 22.5 | 14.0 | 8.7 | 5.0 | — |
-| Splash 1.3.0-m1.1 | **33.6** | **29.6** | 25.4 | 21.4 | 14.3 | 10.2 |
 
-Follow-up turns start in 0.5–2.9 s (Splash: 2.7–10 s). Peak memory is higher than
-Splash's: 32–45 GB at 2K–128K and 50 GB at 256K, against 24–28 GB and 33 GB. With
-sampling (temperature 1.0) decode is 31.6 / 28.3 / 23.9 tok/s at 2K / 32K / 64K
-(Splash 31.5 / 25.8 / 18.5).
-
-**Pick Splash** if memory is tight or most turns are short prompts with long
-answers. **Pick this build** for long prompts and multi-turn agent sessions.
+Follow-up turns start in 0.5–2.9 s (upstream: 0.6–3.5 s at 2K–128K). Peak wired
+memory is 32–45 GB at 2K–128K and 50 GB at 256K. With sampling (temperature 1.0)
+decode is 31.6 / 28.3 / 23.9 tok/s at 2K / 32K / 64K (upstream 23.2 / 14.2 / 8.9).
 
 ## Install
 
@@ -106,7 +100,7 @@ prefill and the chained draft.
 |---|---|
 | `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16` | measured, recommended (turbo profile by default on M1) |
 | `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality-FP16` | measured (8-bit; 9 GB more memory, ~10–15% slower decode) |
-| Qwen3.6-35B-A3B (MoE) | runs, not tuned yet: Splash decodes it much faster today |
+| Qwen3.6-35B-A3B (MoE) | runs, not tuned yet |
 
 ## Switches
 
