@@ -1405,6 +1405,14 @@ _M1_A3B_ENV = {
     # 30K 77.4 -> 84.2, 115K 57.0 -> 59.4.
     "MTPLX_M1_RESIDENT_DECODE": "1",
     "MTPLX_M1_RESIDENT_INPLACE_KV": "1",
+    # Sampled requests too: the device predicts each round with the request's
+    # pre-drawn uniforms and the host confirms it with the stock float64
+    # arithmetic (a disagreement rewinds caches and generator and the stock
+    # loop runs that round). Output law exact; same seed, same text at 2K in
+    # 10/10 seeds (past ~20K of history the compiled draft's last bits can
+    # pick another token). A3B T=1.0: 2K 88.3 -> 102.7 tok/s, 30K 77.6 ->
+    # 82.4, 115K 58.1 -> 59.7.
+    "MTPLX_M1_RESIDENT_SAMPLED": "1",
     "MTPLX_QWEN_ROW_OWNED_ROUTER": "1",
     "MTPLX_QWEN_COMBINE_TAIL": "1",
     "MTPLX_QWEN_MOE_PACK_GATE_UP": "1",

@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 import contextlib
+import functools
 import inspect
 import json
 import os
@@ -13144,8 +13145,49 @@ def generate_mtpk(
         and draft_core == "stock"
         and vision_splice is None
     )
+    # Sampled rounds: the device predicts with the request's pre-drawn
+    # uniforms, the host confirms with the stock float64 arithmetic.
+    _resident_sampled = (
+        _resident_decode.enabled()
+        and _resident_decode.sampled_enabled()
+        and sampler.temperature > 0
+        and draft_sampler.temperature > 0
+        and _sampled_chain_plan is not None
+        and int(speculative_depth) == 1
+        and verify_strategy in {"capture_commit", "graphbank_capture_commit"}
+        and not family_capture_commit_active
+        and not qsa_mtp_precompute_active
+        and _loop_guard is None
+        and _thinking_guard is None
+        and draft_core == "stock"
+        and vision_splice is None
+        and constraint is None
+        and not _penalties_active
+        and not _QWEN4_BLOCK_VERIFY
+        and _batch_target_arrays_enabled()
+        and not online_correction_cache
+        and not prompt_correction_cache
+        and adaptive_policy is None
+        and adaptive_width_policy is None
+        and mtp_corrector is None
+        and mtp_cache_policy == "persistent"
+        and _mtp_history_uses_committed_cache(mtp_history_policy)
+        and a3b_target_prefix_route is None
+        and not target_prefix_verify
+    )
+    _resident_ok = _resident_ok or _resident_sampled
+    _resident_next_step = 0
     _resident_mtp = None
-    _resident_stats: dict[str, Any] = {"enabled": bool(_resident_ok)}
+    _resident_stats: dict[str, Any] = {
+        "enabled": bool(_resident_ok),
+        "sampled": bool(_resident_sampled),
+        "entries": 0,
+        "rounds": 0,
+        "accepted": 0,
+        "tokens": 0,
+        "mismatches": 0,
+        "wall_s": 0.0,
+    }
     from .mlx_process_env import enter_decode_command_buffer_limits as _enter_decode_cb
     _enter_decode_cb()
     while len(tokens) < max_tokens:
@@ -14149,6 +14191,7 @@ def generate_mtpk(
         device_draft_token = None
         if (
             _resident_ok
+            and step >= _resident_next_step
             and primary_already_emitted
             and cycle_depth == 1
             and not _steer_active
@@ -14160,10 +14203,19 @@ def generate_mtpk(
         ):
             # MTPLX_M1_RESIDENT_DECODE: pipelined device-resident rounds (see
             # mtplx/resident_decode.py). They hand back a round start the
-            # stock loop resumes from exactly; one try per generation.
+            # stock loop resumes from exactly. Greedy: one try per generation;
+            # sampled: back after one stock round when the host disagreed.
             _resident_ok = False
             try:
-                if _resident_mtp is None:
+                if _resident_mtp is None and _resident_sampled:
+                    _resident_mtp = _resident_decode.ResidentSampledMTP(
+                        rt,
+                        mtp_cache,
+                        plan=_sampled_chain_plan,
+                        mtp_hidden_variant=mtp_hidden_variant,
+                        reserve=max(_DEVICE_CORE_HISTORY_RESERVE, max_tokens + 256),
+                    )
+                elif _resident_mtp is None:
                     _resident_mtp = _resident_decode.ResidentMTP(
                         rt,
                         mtp_cache,
@@ -14178,7 +14230,7 @@ def generate_mtpk(
                     with (
                         _decode_trunk_scope(vision_splice),
                         model_forward_kind("target_verify"),
-                        exact_verify(True),
+                        exact_verify(sampler.temperature <= 0),
                     ):
                         compiled_verify_bank.offset_bound_hint = len(prompt_ids) + int(
                             committed_upper
@@ -14241,7 +14293,16 @@ def generate_mtpk(
 
                 if _resident_decode.inplace_kv_enabled():
                     _resident_decode.own_kv_pages(cache)
-                _rr = _resident_decode.run_resident_rounds(
+                _resident_run = (
+                    functools.partial(
+                        _resident_decode.run_resident_rounds_sampled,
+                        sampler=sampler,
+                        rng=rng,
+                    )
+                    if _resident_sampled
+                    else _resident_decode.run_resident_rounds
+                )
+                _rr = _resident_run(
                     cache=cache,
                     mtp=_resident_mtp,
                     verify=_resident_verify,
@@ -14269,13 +14330,19 @@ def generate_mtpk(
                 correction_tokens += _rr.rounds - _rr.accepted
                 verify_time += _rr.verify_time_s
                 draft_time += _rr.draft_time_s
-                _resident_stats.update(
-                    rounds=int(_rr.rounds),
-                    accepted=int(_rr.accepted),
-                    wall_s=round(float(_rr.wall_s), 4),
-                    exit=_rr.exit_reason,
-                    tokens=len(_rr.tokens),
+                _resident_stats["entries"] += 1
+                _resident_stats["rounds"] += int(_rr.rounds)
+                _resident_stats["accepted"] += int(_rr.accepted)
+                _resident_stats["tokens"] += len(_rr.tokens)
+                _resident_stats["mismatches"] += int(_rr.mismatches)
+                _resident_stats["wall_s"] = round(
+                    float(_resident_stats["wall_s"]) + float(_rr.wall_s), 4
                 )
+                _resident_stats["exit"] = _rr.exit_reason
+                if _rr.exit_reason == "mismatch":
+                    # The stock loop runs the disputed round; come back after.
+                    _resident_ok = True
+                    _resident_next_step = step + 1
                 pending_primary = int(_rr.primary)
                 hidden = _rr.hidden
                 if _rr.logits is not None:
@@ -16941,6 +17008,14 @@ def generate_mtpk(
         emit_new_tokens()
         emit_trace()
 
+    if _resident_mtp is not None:
+        # A generation that ended in stock rounds after a resident exit still
+        # holds the tensor-offset draft history; hand python-int containers to
+        # the final commit and the session bank.
+        for _rd_cache in (mtp_cache, mtp_history_cache):
+            for _rd_i, _rd_entry in enumerate(_rd_cache or []):
+                if hasattr(_rd_entry, "demote"):
+                    _rd_cache[_rd_i] = _rd_entry.demote()
     if token_callback is not None and _stream_gate.window > 0:
         # Armed-stream reconcile (F35): the trim decision is known here —
         # flush the held tail in full (no trim) or the post-trim remainder.

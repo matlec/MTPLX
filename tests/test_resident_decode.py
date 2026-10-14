@@ -110,3 +110,63 @@ def test_inplace_row_writes_match_slice_update():
 def test_inplace_kv_off_by_default(monkeypatch):
     monkeypatch.delenv("MTPLX_M1_RESIDENT_INPLACE_KV", raising=False)
     assert rd.inplace_kv_enabled() is False
+
+
+def test_device_pick_matches_numpy_choice():
+    import numpy as np
+
+    from mtplx.qwen4_draft_device_chain import host_pick
+    from mtplx.sampling import SparseDistribution
+
+    rng = np.random.default_rng(3)
+    for _ in range(50):
+        ids = np.sort(rng.choice(1000, 20, replace=False))
+        probs = rng.random(20)
+        probs /= probs.sum()
+        u = float(rng.random())
+        host = host_pick(SparseDistribution(ids, probs, 1000), u)
+        dev = int(
+            rd.device_pick(
+                mx.array(ids, dtype=mx.int32), mx.array(probs, dtype=mx.float32), mx.array(u, dtype=mx.float32)
+            ).item()
+        )
+        assert dev == host
+
+
+def test_device_round_decision_matches_host_residual():
+    import numpy as np
+
+    from mtplx.qwen4_draft_device_chain import host_pick
+    from mtplx.sampling import SparseDistribution, residual_distribution
+
+    rng = np.random.default_rng(5)
+    checked = 0
+    for _ in range(60):
+        t_ids = np.sort(rng.choice(200, (2, 20), replace=True), axis=1)
+        t_ids = np.stack([np.sort(rng.choice(200, 20, replace=False)) for _ in range(2)])
+        t_p = rng.random((2, 20))
+        t_p /= t_p.sum(axis=1, keepdims=True)
+        q_ids = np.sort(rng.choice(200, 20, replace=False))
+        q_p = rng.random(20)
+        q_p /= q_p.sum()
+        d = int(q_ids[rng.integers(0, 20)])
+        u_acc, u_post = float(rng.random()), float(rng.random())
+        acc, bonus, corr = rd.device_round_decision(
+            mx.array(t_ids, dtype=mx.int32), mx.array(t_p, dtype=mx.float32),
+            mx.array(q_ids, dtype=mx.int32), mx.array(q_p, dtype=mx.float32),
+            mx.array([[d]], dtype=mx.int32),
+            mx.array(u_acc, dtype=mx.float32), mx.array(u_post, dtype=mx.float32),
+        )
+        target0 = SparseDistribution(t_ids[0], t_p[0], 200)
+        q = SparseDistribution(q_ids, q_p, 200)
+        p_d, q_d = target0.probability(d), q.probability(d)
+        host_acc = u_acc <= min(1.0, p_d / q_d)
+        if abs(u_acc - min(1.0, p_d / q_d)) < 1e-5:
+            continue  # float32 edge: the host would rewind this round
+        assert bool(int(acc.item())) == host_acc
+        if host_acc:
+            assert int(bonus.item()) == host_pick(SparseDistribution(t_ids[1], t_p[1], 200), u_post)
+        else:
+            assert int(corr.item()) == host_pick(residual_distribution(target0, q), u_post)
+        checked += 1
+    assert checked > 40
