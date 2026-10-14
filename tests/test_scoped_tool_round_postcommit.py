@@ -132,3 +132,48 @@ def test_scoped_tool_turn_history_carries_this_turns_think(tok, monkeypatch):
 def test_scoped_without_committed_stream_keeps_empty_scaffold(tok, monkeypatch):
     history_ids = _history_ids(tok, monkeypatch, None)
     assert THINK not in tok.decode(history_ids)
+
+
+def test_scoped_client_without_reasoning_echo_keeps_empty_scaffold(tok, monkeypatch):
+    # An earlier tool round came back without reasoning (OpenCode-style
+    # client): its next request renders this turn with an empty scaffold,
+    # so the postcommit must keep producing exactly that.
+    monkeypatch.setattr(oa, "_reasoning_history_scoped_active", lambda state: True)
+    monkeypatch.setattr(oa, "_reasoning_history_preserve_echo_active", lambda state: False)
+    monkeypatch.setattr(oa, "_reasoning_effort_for_state", lambda *a, **kw: "medium")
+    earlier = [
+        SYSTEM,
+        U1,
+        {"role": "assistant", "content": "", "tool_calls": CALL},
+        {"role": "tool", "tool_call_id": "call_1", "content": "412 snake.html"},
+    ]
+    call2 = [{**CALL[0], "id": "call_2"}]
+    prompt = _encode(tok, earlier)
+    next_prompt = _encode(
+        tok,
+        earlier
+        + [
+            {"role": "assistant", "content": "", "tool_calls": call2},
+            {"role": "tool", "tool_call_id": "call_2", "content": "412 snake.html"},
+        ],
+    )
+    generated = oa._encode_rendered_chat_text(
+        tok, f"{THINK}\n</think>\n\n" + tok.decode(next_prompt[len(prompt):]).split("</think>\n\n", 1)[1].split("<|im_end|>")[0] + "<|im_end|>"
+    )
+    state = SimpleNamespace(
+        args=SimpleNamespace(strip_assistant_reasoning_history=False, tool_prompt_mode="hybrid"),
+        runtime=SimpleNamespace(tokenizer=tok),
+    )
+    history_ids, _ = oa._history_ids_for_postcommit(
+        state,
+        messages=oa.ChatCompletionRequest(model="m", messages=earlier).messages,
+        assistant_content="",
+        assistant_tool_calls=call2,
+        thinking_enabled=True,
+        reasoning_effort="medium",
+        tool_specs=TOOLS,
+        tool_prompt_mode="hybrid",
+        committed_stream_ids=prompt + generated,
+    )
+    assert THINK not in tok.decode(history_ids)
+    assert next_prompt[: len(history_ids)] == history_ids

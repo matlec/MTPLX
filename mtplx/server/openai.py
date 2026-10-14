@@ -27840,13 +27840,16 @@ def _history_ids_for_postcommit(
         and _reasoning_history_scoped_active(state)
         and history_messages
         and str(history_messages[-1].role).lower() == "assistant"
+        and not _client_drops_reasoning_echo(messages)
     ):
         # Scoped mode keeps <think> for the active round, and agent clients
-        # (omp) echo this turn's reasoning on the tool continuation. Without
-        # the interior here the render shows an empty think scaffold, the
-        # generation-final check refuses, and the next request re-prefills
-        # the whole response (a 12k-token write cost ~25-70 s per round,
-        # Qwen3.6-35B-A3B omp Kyoto run 2026-10-14).
+        # that echo reasoning (omp) send this turn's interior back on the tool
+        # continuation. Without it here the render shows an empty think
+        # scaffold, the generation-final check refuses, and the next request
+        # re-prefills the whole response (a 12k-token write cost ~25-70 s per
+        # round, Qwen3.6-35B-A3B omp Kyoto run 2026-10-14). Clients seen
+        # dropping reasoning (OpenCode) keep the empty scaffold, which is
+        # exactly what they send next.
         interior = _scoped_current_turn_interior(state, committed_stream_ids)
         if interior is not None:
             history_messages = [
@@ -27907,6 +27910,25 @@ def _history_ids_for_postcommit(
     finally:
         _record_phase(timing, "vision_splice_s", phase_started)
     return expanded_ids, history_splice
+
+
+def _client_drops_reasoning_echo(messages: Sequence[ChatMessage]) -> bool:
+    """True when an earlier assistant turn in this request came back without
+    any reasoning field: the client does not echo reasoning, so its next
+    request renders this turn with an empty think scaffold. Unknown (no
+    earlier assistant turn) counts as echoing."""
+    for message in messages:
+        if str(message.role).lower() != "assistant":
+            continue
+        if not (_content_to_text(message.content).strip() or message.tool_calls):
+            continue
+        if not (
+            _message_extra(message, "reasoning_content")
+            or _message_extra(message, "reasoning")
+            or _message_extra(message, "reasoning_details")
+        ):
+            return True
+    return False
 
 
 def _scoped_current_turn_interior(
