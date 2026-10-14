@@ -21,7 +21,7 @@ MTPLX のプロジェクトとは関係のない非公式のフォークです�
 - **M1 向けの attention の kernel**：キャッシュ済みの部分に対する prefill の attention を、M1 向けに調整した [metal-flash-attention](https://github.com/philipturner/metal-flash-attention)（head size 256）で計算します。verify の attention と射影も M1 の GPU に合わせています。
 - **decode でホストとの往復を減らす**：verify の各行と KV の位置を 1 回でまとめて読み、draft の 3 段を GPU 上で続けて作ります。MTP のキャッシュはその場で書き込みます。32K の文脈では、decode の 1 ラウンドが約 5% 短くなります。
 - **64 GB で長い文脈を扱う**：KV を 8bit のページで持ち、32K トークン以上のプロンプトは最初から 8bit のページに読み込みます。メモリガードの見積もりをこのフォークでの実測に合わせ、エンジンが RAM の 13/16 まで使えるようにしました。256K トークンの会話が既定の設定で動きます。
-- **MoE（mixture-of-experts）のモデル**：35B-A3B では、上流の MoE の融合 kernel を FP16 の checkpoint に移植し（競合のバグも修正）、verify を capture_commit にし、1 ラウンドあたりのホストとの同期を減らし、prefill の gather を expert ごとに区切りました。decode は v2.12.2-m1.2 の 1.6〜2.7 倍で、8K 以上では Splash より速くなりました（[ベンチ](https://github.com/shunya1810/apple-silicon-llm-bench/blob/main/README.ja.md)）。モデルに依存しない部分は M1 のすべての MoE のモデルに入ります（`MTPLX_M1_MOE_LANE=0` で止まります）。dense のモデルは変わりません。
+- **MoE（mixture-of-experts）のモデル**：35B-A3B では、上流の MoE の融合 kernel を FP16 の checkpoint に移植し（競合のバグも修正）、verify を capture_commit にし、1 ラウンドあたりのホストとの同期を減らし、prefill の gather を expert ごとに区切りました。decode は v2.12.2-m1.2 の 1.6〜2.7 倍で、8K 以上では Splash より速くなりました（[ベンチ](https://github.com/shunya1810/apple-silicon-llm-bench/blob/main/README.ja.md)）。v2.12.2-m1.5 では、MTP の round を GPU の上で続けて回し（前の round の結果を host が読む前に次の round を積みます。greedy の出力は今までと同じで、sampling にも対応）、prefill では GDN と attention の射影を Neural Engine で計算して GPU の MoE と並行に動かします。decode は m1.4 より 8〜26% 速く（2K で 111.8 tok/s、128K で 61.2）、会話のベンチではどの長さでも Splash を上回りました。モデルに依存しない部分は M1 のすべての MoE のモデルに入ります（`MTPLX_M1_MOE_LANE=0` で止まります）。dense のモデルは変わりません。
 - **エージェントでの会話の修正**（どの Mac でも有効）：トークンの区切り方の違いで同じ会話が別の会話として扱われる問題、ツールの引数の空白が消える問題、KV を広げられないときに回答ごと失敗する問題などを直しました。詳しくは [CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.md) を見てください。
 
 ## 計測結果
@@ -56,7 +56,7 @@ MTPLX のプロジェクトとは関係のない非公式のフォークです�
 - ネイティブ拡張をビルドするための、Metal のツールチェーンが入った Xcode
 
 ```bash
-git clone --branch v2.12.2-m1.4 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.5 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # 1 分ほど。mfa_attn: ok / ane_ffn: ok と表示されれば完了
 ```

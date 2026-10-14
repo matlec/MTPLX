@@ -1,8 +1,75 @@
-# v2.12.2-m1.4 / m1.3 / m1.2 / m1.1 / v2.12.2-m1 / v2.12.0-m1 〜 m1.3 変更内容まとめ
+# v2.12.2-m1.5 / m1.4 / m1.3 / m1.2 / m1.1 / v2.12.2-m1 / v2.12.0-m1 〜 m1.3 変更内容まとめ
 
 - **ベースリポジトリ：** MTPLX 2.12.2（本家 `youssofal/MTPLX` の v2.12.2）。`v2.12.0-m1.3` までは 2.12.0 がベースです
-- **対象：** タグ `v2.12.2-m1.4`（ブランチ `m1max-longctx`）。下の「変更点一覧」の M1 向けの変更はそのまま引き継いでいます
+- **対象：** タグ `v2.12.2-m1.5`（ブランチ `m1max-longctx`）。下の「変更点一覧」の M1 向けの変更はそのまま引き継いでいます
 - **本家との差分：** コード、テストコード、各種ドキュメント（`docs/m1max-longctx/`）、起動・検証スクリプト
+
+## v2.12.2-m1.5 での変更（2026-10-14）
+
+M1 系の Mac で、MoE のモデル（Qwen3.6-35B-A3B）の decode と prefill をさらに速くしました。dense のモデルの出力は変わりません（27B を同じ条件で交互に計測し、greedy の出力が一致しました）。
+
+### Qwen3.6-35B-A3B での結果
+
+[apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench) の 3 ターンの会話です。M1 Max 64GB、8bit の KV、temperature 0 で、m1.5 と Splash 1.3.0-m1.1 を 2026-10-14 の午後に交互に計測しました（2K〜64K は 2 回の中央値、128K は 1 回）。m1.4 は同じ日の午前の計測です。
+
+| decode（tok/s、3 ターンの平均） | 2K | 8K | 32K | 64K | 128K |
+|---|---|---|---|---|---|
+| v2.12.2-m1.4 | 90.1 | 87.6 | 77.1 | 69.4 | 56.7 |
+| **v2.12.2-m1.5** | **111.8** | **110.8** | **86.4** | **76.5** | **61.2** |
+| Splash 1.3.0-m1.1 | 96.1 | 80.8 | 63.8 | 57.7 | 43.9 |
+
+| 会話全体の時間 | 2K | 8K | 32K | 64K | 128K |
+|---|---|---|---|---|---|
+| v2.12.2-m1.4 | 10.9 秒 | 17.3 秒 | 47.3 秒 | 1.8 分 | 4.9 分 |
+| **v2.12.2-m1.5** | **9.3 秒** | **14.4 秒** | **41.3 秒** | **1.5 分** | **4.3 分** |
+| Splash 1.3.0-m1.1 | 9.5 秒 | 18.1 秒 | 60.7 秒 | 2.5 分 | 7.7 分 |
+
+- 2K でも、decode（+16%）と会話全体の時間で Splash を上回りました（m1.4 では 2K の decode が約 4% 遅れていました）。
+- cold の prefill は、2K で 1,109 tok/s、8K で 1,218、32K で 1,054、64K で 813、128K で 543 です（Splash は 947、918、674、488、296）。1 ターン目の応答開始は 32K で 30.7 秒、64K で 80.2 秒、128K で 4.0 分です。
+- メモリのピークは 27〜30.5 GB で、m1.4 とほぼ同じです（Splash は 26〜28 GB）。
+- thinking ありの短いプロンプト（Splash の README と同じ種類の条件）では、Splash の decode が 9〜15% 速いです（greedy の 1,024 トークンで 120.8 対 132.0 tok/s）。thinking の文章と定型のコードは、Splash の DFlash2 のブロック単位の draft が最も当てやすい文章です。
+
+### decode: GPU の上で round を続けて回す（A3B）
+
+MTP の depth 1 の 1 round（draft → verify → 受理の判定 → cache の確定）を、host が結果を読む前に次の round まで GPU に積むようにしました（`mtplx/resident_decode.py`）。今までは、verify が終わるたびに host が結果を読み、確定と draft を組み立ててから次の verify を出していたので、2K では 1 round（約 19 ms）のうち約 3.7 ms、GPU が止まっていました。
+
+- 受理の判定、次のトークン、GDN の state の選択（capture した行）、attention と MTP の KV の offset の更新を、すべて GPU の上の配列のまま行います。
+- host は 1 round 遅れで結果を読み、トークンを出します。停止トークン、max_tokens、中断などで抜けるときは、読み終えていない round の頭まで cache を巻き戻します。そこから今までの loop が、続きをそのまま処理します。
+- 積んだ verify の KV の書き込みは、前の round が buffer を持っていても全体をコピーしないよう、その場に書き込みます。入るときに buffer を自分専用にし（session bank と共有していればコピー）、compile の program もほかと分けています。
+- **greedy**: 出力は今までの loop と bit 単位で一致します（2K〜30K、停止、複数ターン、session の復元、max_tokens で確認）。
+- **sampling**: 1 round で使う 3 つの乱数（draft、受理の判定、bonus または残差）を先に引き、GPU が float32 で判定を予測します。host が 1 round 遅れで、今までと同じ float64 の計算で確かめます。食い違えば、cache と乱数の状態をその round の頭まで巻き戻し、今までの loop がその round を処理します。出力の分布は厳密に正しく、同じ seed なら 2K で 10/10、今までと同じ文章になりました。20K を超える長い履歴では、compile した draft の最下位の bit の違いで、同じ seed でも別の文章になることがあります。
+
+| A3B、temperature 1.0 | 今まで | m1.5 |
+|---|---|---|
+| 2K | 88.3 tok/s | 102.7 tok/s |
+| 30K | 77.6 tok/s | 82.4 tok/s |
+| 115K | 58.1 tok/s | 59.7 tok/s |
+
+- `MTPLX_M1_RESIDENT_DECODE=0` で止まります（sampling だけを止めるときは `MTPLX_M1_RESIDENT_SAMPLED=0`、KV の直接の書き込みを止めるときは `MTPLX_M1_RESIDENT_INPLACE_KV=0`）。画像つきのリクエスト、grammar の制約、penalty などは対象外で、今までの loop で動きます。
+
+### prefill: Neural Engine を GPU と並行して使う（A3B）
+
+- prefill の chunk を 2 つに分けます。各 GDN 層では、片方の半分の入力の射影（qkv と z）を Neural Engine で計算し、その間に GPU がもう片方の半分の前の層（MoE）を計算します。attention の層の q/k/v も同じように Neural Engine で計算します（attention の本体は今までどおり GPU です）。
+- routed expert はトークンごとに変わるので、Neural Engine では計算しません。GPU に残る MoE と並行に動かすことで、時間を稼ぎます。
+- Neural Engine の program は層の種類ごとに 1 つで、全層の重みを層ごとの slot に置いたままにします（`native_extensions/ane_ffn` の AneLinear に、重みの slot、入力だけの staging、2048 の入力の幅を足しました。27B の 5120 の幅は今までどおりです）。
+- `MTPLX_ANE_PREFILL_MOE=0` で止まります。native 拡張を作り直していない場合は、自動で GPU だけの prefill に戻ります。
+
+| Neural Engine の prefill だけの効果（A3B、ベンチの 3 ターンの会話。decode は m1.4 のまま） | v2.12.2-m1.4 | Neural Engine あり |
+|---|---|---|
+| 32K の会話全体 | 47.3 秒 | **44.3 秒** |
+| 64K の会話全体 | 108 秒 | **100 秒** |
+| 128K の会話全体 | 291 秒 | **281 秒** |
+| 1 ターン目の応答開始（32K / 64K / 128K） | 35.5 / 94 / 272 秒 | **32.5 / 86 / 262 秒** |
+| メモリのピーク | 27.6〜30.7 GB | 27.0〜30.7 GB |
+
+- サーバーでの cold の prefill は、8K で 1,147 → 1,280 tok/s、30K で 945 → 1,024、60K で 736 → 800 です。
+- 数値は完全には同じになりません（Neural Engine は int8 の活性で計算するため）。ANE なしの prefill と比べて、24,576 位置の次のトークンの一致は 98.25%、平均の KL は 0.0034 でした。dense の 27B の Neural Engine の prefill と同じ種類の近似です。
+- 長いプロンプトの最初の 1 回は、Neural Engine の program の compile で約 4 秒長くかかります。
+
+### そのほかの修正（どのモデルにも効く）
+
+- compiled verify の bank が、完了しない prewarm の walk を verify のたびにやり直していました。walk は bank（1 リクエスト）ごとに 1 回にしました。27B でも、最初のリクエストが 93.8 → 89.9 ms/round になります。
+- attention の kernel（`sdpa_gqa_mma`）が、呼ぶたびに Metal の kernel のオブジェクトを作り直していました。compile していない draft の attention が縮みます（A3B の 30K で 1.17 → 0.83〜0.94 ms/round）。
 
 ## v2.12.2-m1.4 での変更（2026-10-14）
 

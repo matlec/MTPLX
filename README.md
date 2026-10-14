@@ -42,6 +42,11 @@ The original README is in [README.upstream.md](README.upstream.md).
   round, and an expert-segmented sorted gather for prefill. Decode is 1.6–2.7x
   v2.12.2-m1.2 and ahead of Splash from 8K on (see the
   [benchmark](https://github.com/shunya1810/apple-silicon-llm-bench#qwen36-35b-a3b-moe)).
+  v2.12.2-m1.5 keeps the MTP rounds on the GPU (the next round is queued before the host
+  reads the previous one; greedy text identical, sampled requests too) and runs the
+  prefill's GDN and attention projections on the Neural Engine alongside the GPU's experts:
+  decode +8–26% over m1.4 (111.8 tok/s at 2K, 61.2 at 128K), ahead of Splash at every
+  length in the conversation benchmark.
   The model-agnostic parts apply to every MoE model on M1 (`MTPLX_M1_MOE_LANE=0` turns
   them off); dense models are unchanged.
 - **Agent-session fixes** (any Mac): session identity across token seams, tool
@@ -82,7 +87,7 @@ Needs an M1-family Mac (measured on an M1 Max 64 GB, macOS 26), the
 model are used), and Xcode with the Metal toolchain for the native extensions.
 
 ```bash
-git clone --branch v2.12.2-m1.4 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.5 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # about a minute; prints mfa_attn: ok / ane_ffn: ok
 ```
