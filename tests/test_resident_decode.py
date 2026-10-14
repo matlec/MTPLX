@@ -170,3 +170,40 @@ def test_device_round_decision_matches_host_residual():
             assert int(corr.item()) == host_pick(residual_distribution(target0, q), u_post)
         checked += 1
     assert checked > 40
+
+
+class _StockKV:
+    """Stock-like KV container: python-int offset, trimmable."""
+
+    def __init__(self, offset):
+        self.offset = offset
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        self.offset -= n
+        return n
+
+
+def test_validate_cache_refuses_stock_attention_before_anything_moves():
+    stock = _StockKV(10)
+    with pytest.raises(rd.ResidentUnsupported):
+        rd.validate_cache([stock])
+    assert stock.offset == 10
+    rd.validate_cache([_Attn(5)])
+
+
+def test_device_commit_trims_stock_containers_on_the_host():
+    for accepted, expected in ((1, 10), (0, 9)):
+        stock = _StockKV(10)
+        rd.device_commit([stock], {}, mx.array(accepted, dtype=mx.int32))
+        assert stock.offset == expected
+
+
+def test_snapshot_restores_int_offsets():
+    stock = _StockKV(7)
+    snap = rd._snapshot([stock], [])
+    stock.offset = 12
+    rd._restore(snap)
+    assert stock.offset == 7

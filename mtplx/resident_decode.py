@@ -102,6 +102,29 @@ def _select_row(value: mx.array, index: mx.array) -> mx.array:
     return mx.take_along_axis(value, sel, axis=1)[:, 0]
 
 
+def _tensor_offset(entry: Any) -> bool:
+    leaves = getattr(entry, "cache", None)
+    return (
+        isinstance(leaves, list)
+        and len(leaves) >= 3
+        and isinstance(leaves[2], mx.array)
+        and leaves[2].ndim == 0
+    )
+
+
+def validate_cache(cache: list[Any]) -> None:
+    """Raise :class:`ResidentUnsupported` BEFORE any state moves unless every
+    full-attention entry is a tensor-offset adapter (the compiled bank has
+    promoted the cache). A restored session's bank serves its first rounds
+    eager on stock containers; the caller retries a round later."""
+
+    for entry in cache:
+        if entry is None or hasattr(entry, "conv_state") or not getattr(entry, "is_trimmable", lambda: False)():
+            continue
+        if not _tensor_offset(entry):
+            raise ResidentUnsupported(f"attention_entry:{type(entry).__name__}")
+
+
 def device_commit(cache: list[Any], captures: dict, accepted: mx.array) -> None:
     """Commit a 2-row verify window keeping ``1 + accepted`` rows, on device."""
 
@@ -112,14 +135,20 @@ def device_commit(cache: list[Any], captures: dict, accepted: mx.array) -> None:
     )
 
     if captures.get("__final_only__"):
-        raise ResidentUnsupported("final_only_captures")
-    keep = accepted.astype(mx.int32)
-    trim = (1 - keep).astype(mx.int32)
+        raise RuntimeError("resident commit: final-only captures after a queued verify")
     for layer_idx, entry in enumerate(cache):
         capture = captures.get(layer_idx)
         if capture is not None and hasattr(entry, "state"):
             if "conv_states" not in capture or int(capture.get("capture_start", 0)) != 0:
-                raise ResidentUnsupported("capture_layout")
+                # Nothing has moved yet in this commit, but the verify has run:
+                # fail the request rather than continue on a half-applied round.
+                raise RuntimeError("resident commit: unsupported capture layout")
+    keep = accepted.astype(mx.int32)
+    trim = (1 - keep).astype(mx.int32)
+    host_trim = None
+    for layer_idx, entry in enumerate(cache):
+        capture = captures.get(layer_idx)
+        if capture is not None and hasattr(entry, "state"):
             conv_state = mx.contiguous(_select_row(capture["conv_states"], keep))
             if "tape" in capture:
                 replayed = linear_gated_delta_from_conv_tape_replay_steps(
@@ -131,15 +160,21 @@ def device_commit(cache: list[Any], captures: dict, accepted: mx.array) -> None:
                     keep + 1,
                 )
                 if replayed is None:
-                    raise ResidentUnsupported("tape_replay")
+                    raise RuntimeError("resident commit: tape replay unavailable")
                 gdn_state = _maybe_contiguous_authoritative_gdn_leaf(replayed)
             else:
                 gdn_state = mx.contiguous(_select_row(capture["states"], keep))
             replace_recurrent_cache_state(entry, [conv_state, gdn_state])
         elif capture is None and entry is not None and getattr(entry, "is_trimmable", lambda: False)():
-            leaves = getattr(entry, "cache", None)
-            if not (isinstance(leaves, list) and len(leaves) >= 3 and isinstance(leaves[2], mx.array)):
-                raise ResidentUnsupported(f"attention_entry:{type(entry).__name__}")
+            if not _tensor_offset(entry):
+                # The bank fell back to an eager verify on stock containers
+                # (python-int offsets): trim on the host for this round.
+                if host_trim is None:
+                    host_trim = int(trim.item())
+                if host_trim:
+                    entry.trim(host_trim)
+                continue
+            leaves = entry.cache
             rollback = getattr(entry, "rollback_state", None)
             if rollback is not None:
                 for slot in range(len(rollback)):
@@ -162,6 +197,8 @@ def _snapshot(cache: list[Any], mtp_cache: list[Any]) -> list[tuple[Any, int, An
             snap.append((entry, -1, list(entry.cache)))
         elif isinstance(getattr(entry, "cache", None), list) and len(entry.cache) >= 3:
             snap.append((entry, 2, entry.cache[2]))
+        elif isinstance(getattr(entry, "offset", None), int):
+            snap.append((entry, "int", int(entry.offset)))
     return snap
 
 
@@ -169,7 +206,9 @@ def _restore(snap: list[tuple[Any, int, Any]]) -> None:
     from .cache_state import replace_recurrent_cache_state
 
     for entry, slot, value in snap:
-        if slot == 2:
+        if slot == "int":
+            entry.offset = value
+        elif slot == 2:
             entry.cache[2] = value
             rollback = getattr(entry, "rollback_state", None)
             if rollback is not None:
@@ -294,6 +333,7 @@ def run_resident_rounds(
     one round and returns False when it cannot.
     """
 
+    validate_cache(cache)
     stops = set(int(t) for t in (stop_token_ids or ()))
     res = ResidentResult()
     started = time.perf_counter()
@@ -689,6 +729,7 @@ def run_resident_rounds_sampled(
 
     import copy
 
+    validate_cache(cache)
     stops = set(int(t) for t in (stop_token_ids or ()))
     res = ResidentResult()
     started = time.perf_counter()

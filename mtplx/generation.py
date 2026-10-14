@@ -14317,7 +14317,15 @@ def generate_mtpk(
                     context_limit=_resident_decode.max_context() - len(prompt_ids),
                 )
             except _resident_decode.ResidentUnsupported as exc:
+                # Raised before any state moved (validate_cache): the stock
+                # round below runs as if nothing happened; try again next
+                # round (a restored session's bank promotes after its first
+                # eager rounds).
                 _resident_stats["unsupported"] = str(exc)
+                _resident_stats["retries"] = int(_resident_stats.get("retries", 0)) + 1
+                if _resident_stats["retries"] <= 32:
+                    _resident_ok = True
+                    _resident_next_step = step + 1
                 _rr = None
             if _rr is not None:
                 verify_calls += _rr.rounds
