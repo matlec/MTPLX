@@ -27832,6 +27832,36 @@ def _history_ids_for_postcommit(
                     )
                     history_messages[-1:] = current
                 substitution_walked = True
+    if (
+        not substitution_walked
+        and committed_stream_ids
+        and thinking_enabled
+        and assistant_tool_calls
+        and _reasoning_history_scoped_active(state)
+        and history_messages
+        and str(history_messages[-1].role).lower() == "assistant"
+    ):
+        # Scoped mode keeps <think> for the active round, and agent clients
+        # (omp) echo this turn's reasoning on the tool continuation. Without
+        # the interior here the render shows an empty think scaffold, the
+        # generation-final check refuses, and the next request re-prefills
+        # the whole response (a 12k-token write cost ~25-70 s per round,
+        # Qwen3.6-35B-A3B omp Kyoto run 2026-10-14).
+        interior = _scoped_current_turn_interior(state, committed_stream_ids)
+        if interior is not None:
+            history_messages = [
+                _scrub_inbound_committed_reasoning(message)
+                for message in history_messages
+            ]
+            last = history_messages[-1]
+            if not (
+                _message_extra(last, "reasoning_content")
+                or _message_extra(last, "reasoning")
+            ):
+                history_messages[-1] = _copy_chat_message(
+                    last, reasoning_content=interior
+                )
+            substitution_walked = True
     if not substitution_walked:
         history_messages = [
             _scrub_inbound_committed_reasoning(message) for message in history_messages
@@ -27877,6 +27907,35 @@ def _history_ids_for_postcommit(
     finally:
         _record_phase(timing, "vision_splice_s", phase_started)
     return expanded_ids, history_splice
+
+
+def _scoped_current_turn_interior(
+    state: ServerState, committed_stream_ids: Sequence[int]
+) -> str | None:
+    """Think interior of the turn generated this request (the stream's last
+    assistant turn), decoding only that turn. None when the turn has no
+    think scaffold or the stream cannot be decoded."""
+    ids = list(committed_stream_ids)
+    tokenizer = state.runtime.tokenizer
+    start = 0
+    try:
+        im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    except Exception:
+        im_start = None
+    if isinstance(im_start, int) and im_start >= 0:
+        for index in range(len(ids) - 1, -1, -1):
+            if ids[index] == im_start:
+                start = index
+                break
+    try:
+        text = tokenizer.decode(_decodable_ids(state, ids[start:]))
+    except Exception:
+        return None
+    turns = _committed_assistant_turns(text, gemma4=False)
+    if not turns:
+        return None
+    interior = turns[-1][0]
+    return interior if interior else None
 
 
 def _record_phase(
