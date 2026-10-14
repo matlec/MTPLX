@@ -4194,17 +4194,21 @@ def inplace_write_rows(buf: Any, update: Any, offset: Any) -> Any:
     global _INPLACE_ROWS_KERNEL
     if _INPLACE_ROWS_KERNEL is None:
         _INPLACE_ROWS_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_inplace_write_rows",
+            name="mtplx_inplace_write_rows_v2",
             input_names=["buf", "upd", "offset"],
             output_names=["done"],
             source="""
+                // A device offset past the buffer (a stale or corrupt round)
+                // must not write outside it: skip the rows, report -1.
                 uint i = thread_position_in_grid.x;
-                if (i < N) {
+                int off = offset[0];
+                bool fits = off >= 0 && (size_t)off * RowElems + N <= (size_t)Rows * RowElems;
+                if (i < N && fits) {
                     device T* dst = (device T*)(buf);
-                    dst[(size_t)offset[0] * RowElems + i] = upd[i];
+                    dst[(size_t)off * RowElems + i] = upd[i];
                 }
                 if (i == 0) {
-                    done[0] = 1;
+                    done[0] = fits ? 1 : -1;
                 }
             """,
             ensure_row_contiguous=False,
@@ -4217,7 +4221,12 @@ def inplace_write_rows(buf: Any, update: Any, offset: Any) -> Any:
     n = int(update.size)
     (done,) = _INPLACE_ROWS_KERNEL(
         inputs=[buf, mx.contiguous(update), offset.astype(mx.int32).reshape(1)],
-        template=[("T", buf.dtype), ("N", n), ("RowElems", row_elems)],
+        template=[
+            ("T", buf.dtype),
+            ("N", n),
+            ("RowElems", row_elems),
+            ("Rows", int(buf.shape[0])),
+        ],
         grid=(max(n, 1), 1, 1),
         threadgroup=(min(256, max(n, 1)), 1, 1),
         output_shapes=[(1,)],
@@ -4238,20 +4247,24 @@ def inplace_write_axis2(buf: Any, update: Any, offset: Any) -> Any:
     global _INPLACE_AXIS2_KERNEL
     if _INPLACE_AXIS2_KERNEL is None:
         _INPLACE_AXIS2_KERNEL = mx.fast.metal_kernel(
-            name="mtplx_inplace_write_axis2",
+            name="mtplx_inplace_write_axis2_v2",
             input_names=["buf", "upd", "offset"],
             output_names=["done"],
             source="""
+                // Rows past the capacity (a stale or corrupt device offset)
+                // are skipped instead of written into the next head.
                 uint i = thread_position_in_grid.x;
-                if (i < N) {
+                int off = offset[0];
+                bool fits = off >= 0 && off + S <= Cap;
+                if (i < N && fits) {
                     uint d = i % D;
                     uint s = (i / D) % S;
                     uint bh = i / (D * S);
                     device T* dst = (device T*)(buf);
-                    dst[((size_t)bh * Cap + (size_t)offset[0] + s) * D + d] = upd[i];
+                    dst[((size_t)bh * Cap + (size_t)off + s) * D + d] = upd[i];
                 }
                 if (i == 0) {
-                    done[0] = 1;
+                    done[0] = fits ? 1 : -1;
                 }
             """,
             ensure_row_contiguous=False,

@@ -1088,10 +1088,15 @@ def _make_linear_gated_delta_from_conv_tape_replay_kernel(dynamic_steps: bool = 
         if source.count(loop) != 1:
             raise RuntimeError("tape replay source patch point moved")
         return mx.fast.metal_kernel(
-            name="mtplx_linear_gated_delta_from_conv_tape_replay_dyn_v1",
+            name="mtplx_linear_gated_delta_from_conv_tape_replay_dyn_v2",
             input_names=["tape", "conv_out", "g", "state_in", "T", "steps"],
             output_names=["state_out"],
-            source=source.replace(loop, "for (int t = 0; t < steps[0]; ++t) {"),
+            # Clamp the device step count to the tape: a corrupt count must
+            # not spin the GPU or read past the tape.
+            source=source.replace(
+                loop,
+                "for (int t = 0, steps_ = min(max(steps[0], 0), int(T)); t < steps_; ++t) {",
+            ),
         )
     return mx.fast.metal_kernel(
         name="mtplx_linear_gated_delta_from_conv_tape_replay_v1",

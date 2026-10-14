@@ -35,6 +35,15 @@ def test_device_step_tape_replay_is_bit_identical():
     tape = mx.random.normal((B, T, Hv, Dv)).astype(mx.float32)
     g = mx.random.uniform(0.5, 1.0, (B, T, Hv)).astype(mx.float32)
     state = mx.random.normal((B, Hv, Dv, Dk)).astype(mx.float32)
+    # A corrupt device count is clamped to the tape instead of spinning.
+    for steps, device_steps in ((2, 1 << 30), (2, 3)):
+        ref = _linear_gated_delta_from_conv_tape_replay(
+            tape, conv_out, g, state, meta, steps=steps
+        )
+        got = linear_gated_delta_from_conv_tape_replay_steps(
+            tape, conv_out, g, state, meta, mx.array(device_steps, dtype=mx.int32)
+        )
+        assert mx.array_equal(ref, got).item()
     for steps in (1, 2):
         ref = _linear_gated_delta_from_conv_tape_replay(
             tape, conv_out, g, state, meta, steps=steps
@@ -105,6 +114,31 @@ def test_inplace_row_writes_match_slice_update():
     out = mx.depends([work], [done])[0]
     mx.eval(out)
     assert mx.array_equal(out, ref).item()
+
+
+def test_inplace_row_writes_skip_offsets_past_the_buffer():
+    from mtplx.cache_state import inplace_write_axis2, inplace_write_rows
+
+    for offset in (63, 64, 1 << 20, -1):
+        buf = mx.random.randint(-100, 100, (64, 2, 8)).astype(mx.int8)
+        mx.eval(buf)
+        work = buf + mx.array(0, dtype=buf.dtype)
+        mx.eval(work)
+        upd = mx.ones((2, 2, 8), dtype=mx.int8)
+        done = inplace_write_rows(work, upd, mx.array(offset, dtype=mx.int32))
+        mx.eval(done)
+        assert done.item() == -1
+        assert mx.array_equal(work, buf).item()
+
+        buf = mx.random.normal((1, 2, 64, 16)).astype(mx.bfloat16)
+        mx.eval(buf)
+        work = buf + mx.array(0, dtype=buf.dtype)
+        mx.eval(work)
+        upd = mx.ones((1, 2, 2, 16), dtype=mx.bfloat16)
+        done = inplace_write_axis2(work, upd, mx.array(offset, dtype=mx.int32))
+        mx.eval(done)
+        assert done.item() == -1
+        assert mx.array_equal(work, buf).item()
 
 
 def test_inplace_kv_off_by_default(monkeypatch):
