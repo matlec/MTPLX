@@ -75,3 +75,38 @@ def test_disabled_by_default(monkeypatch):
     assert rd.enabled() is False
     monkeypatch.setenv("MTPLX_M1_RESIDENT_MAX_CONTEXT", "1234")
     assert rd.max_context() == 1234
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="metal kernel")
+def test_inplace_row_writes_match_slice_update():
+    from mtplx.cache_state import inplace_write_axis2, inplace_write_rows
+
+    buf = mx.random.randint(-100, 100, (64, 2, 8)).astype(mx.int8)
+    upd = mx.random.randint(-100, 100, (2, 2, 8)).astype(mx.int8)
+    offset = mx.array(17, dtype=mx.int32)
+    ref = mx.slice_update(buf, upd, offset, axes=(0,))
+    mx.eval(ref)
+    work = buf + mx.array(0, dtype=buf.dtype)
+    mx.eval(work)
+    done = inplace_write_rows(work, upd, offset)
+    out = mx.depends([work], [done])[0]
+    # A reader with no freshly produced input gets no barrier after the
+    # writer (see inplace_write_rows); evaluate the write first.
+    mx.eval(out)
+    assert mx.array_equal(out, ref).item()
+
+    buf = mx.random.normal((1, 2, 32, 16)).astype(mx.bfloat16)
+    upd = mx.random.normal((1, 2, 2, 16)).astype(mx.bfloat16)
+    ref = mx.slice_update(buf, upd, offset, axes=(2,))
+    mx.eval(ref)
+    work = buf + mx.array(0, dtype=buf.dtype)
+    mx.eval(work)
+    done = inplace_write_axis2(work, upd, offset)
+    out = mx.depends([work], [done])[0]
+    mx.eval(out)
+    assert mx.array_equal(out, ref).item()
+
+
+def test_inplace_kv_off_by_default(monkeypatch):
+    monkeypatch.delenv("MTPLX_M1_RESIDENT_INPLACE_KV", raising=False)
+    assert rd.inplace_kv_enabled() is False

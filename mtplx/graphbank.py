@@ -676,6 +676,20 @@ class TensorOffsetKVCache(RotaryOrigin):
             self.cache[1][:, :, off_i:end, :] = values
             self.cache[2] = self.cache[2] + steps
             return self.cache[0], self.cache[1]
+        from .cache_state import inplace_write_axis2, traced_inplace_kv_active
+
+        if traced_inplace_kv_active():
+            # Device-resident rounds (mtplx/resident_decode.py): the previous
+            # round still holds this buffer, so a functional slice_update
+            # would copy all of it; write the rows in place behind a token.
+            offset = self.cache[2]
+            done_k = inplace_write_axis2(self.cache[0], keys, offset)
+            done_v = inplace_write_axis2(self.cache[1], values, offset)
+            self.rollback_state[0] = offset
+            self.cache[0] = mx.depends([self.cache[0]], [done_k])[0]
+            self.cache[1] = mx.depends([self.cache[1]], [done_v])[0]
+            self.cache[2] = offset + steps
+            return self.cache[0], self.cache[1]
         # Compiled trace: keep the compile-visible functional path so
         # mx.compile(inputs=..., outputs=...) can donate the buffers in the
         # replayed graph.
@@ -2897,12 +2911,17 @@ class CompiledVerifyBank:
         text trace has no such input and stays the graph it always was.
         """
 
-        return (
+        key = (
             int(length),
             str(hidden_variant or ""),
             int(bucket),
             int(self._rope_delta is not None),
         )
+        if getattr(self, "inplace_kv_hint", False):
+            # Resident rounds trace in-place page writes: never shared with
+            # the functional (copy-on-write) trace of the same window.
+            key = (*key, "inplace_kv")
+        return key
 
     def _rope_args(self) -> tuple[mx.array, ...]:
         """The delta as a positional graph input, or nothing for text."""
@@ -4615,7 +4634,11 @@ class CompiledVerifyBank:
             # Same positional contract as the installed replay: ids, the
             # auxiliary when the runtime prepares one, the rotary delta of an
             # image request, the state leaves.
-            with compiled_dispatch((id(fn), tuple(getattr(input_ids, "shape", ())))):
+            from .cache_state import traced_inplace_kv
+
+            with compiled_dispatch((id(fn), tuple(getattr(input_ids, "shape", ())))), traced_inplace_kv(
+                bool(getattr(self, "inplace_kv_hint", False))
+            ):
                 outputs = (
                     fn(input_ids, compiled_aux, *self._rope_args(), *state_in)
                     if compiled_aux is not None
@@ -5098,9 +5121,10 @@ class CompiledVerifyBank:
         )
         data["compiled_entry_count"] = len(self._compiled)
         data["compiled_keys"] = [
-            f"m{length}:{variant or 'default'}:b{bucket}"
-            + (":rope_delta" if rope_delta_input else "")
-            for length, variant, bucket, rope_delta_input in sorted(self._compiled)
+            f"m{key[0]}:{key[1] or 'default'}:b{key[2]}"
+            + (":rope_delta" if key[3] else "")
+            + "".join(f":{extra}" for extra in key[4:])
+            for key in sorted(self._compiled)
         ]
         # The generic lane's own receipt: an image request replays the trace
         # that takes the rotary delta as an input; a text request the text
@@ -5545,6 +5569,9 @@ class CompiledVerifyBank:
             # anything, so every image request of the process shares one
             # trace whatever its delta, and text requests keep theirs.
             rope_delta_input,
+            # Bank-key extras (``inplace_kv`` for resident rounds): a trace of
+            # in-place page writes must never serve a copy-on-write caller.
+            tuple(key[4:]),
         )
         entry = _SHARED_VERIFY_STEPS.get(global_key)
         if entry is not None:

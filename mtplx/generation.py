@@ -14183,6 +14183,7 @@ def generate_mtpk(
                         compiled_verify_bank.offset_bound_hint = len(prompt_ids) + int(
                             committed_upper
                         )
+                        compiled_verify_bank.inplace_kv_hint = _resident_decode.inplace_kv_enabled()
                         try:
                             return compiled_verify_bank.forward_ar_capture(
                                 ids,
@@ -14193,13 +14194,24 @@ def generate_mtpk(
                             )
                         finally:
                             compiled_verify_bank.offset_bound_hint = None
+                            compiled_verify_bank.inplace_kv_hint = False
 
                 def _resident_reserve(committed_upper):
+                    bound = len(prompt_ids) + int(committed_upper) + _PAGED_OFFSET_BOUND_SLACK
+                    if any(
+                        isinstance(getattr(entry, "capacity", None), int)
+                        and bound + 2 > entry.capacity
+                        for entry in cache
+                        if entry is not None and not hasattr(entry, "conv_state")
+                    ):
+                        # Growth copies the pages: let the queued in-place
+                        # rows land first.
+                        mx.synchronize()
                     return (
                         _paged_round_reservation(
                             cache,
                             depth=1,
-                            offset_bound=len(prompt_ids) + int(committed_upper) + _PAGED_OFFSET_BOUND_SLACK,
+                            offset_bound=bound,
                         )
                         is None
                     )
@@ -14227,6 +14239,8 @@ def generate_mtpk(
                         is not None
                     )
 
+                if _resident_decode.inplace_kv_enabled():
+                    _resident_decode.own_kv_pages(cache)
                 _rr = _resident_decode.run_resident_rounds(
                     cache=cache,
                     mtp=_resident_mtp,

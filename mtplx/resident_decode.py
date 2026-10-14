@@ -46,11 +46,42 @@ def max_context() -> int:
     A queued verify cannot donate the KV buffers the previous, still running
     round holds, so its slice_update copies them; the copy grows with the
     context. M1 Max A3B, greedy: +11% at 2K, +13% at 8K, +4.5% at 16K, +1% at
-    30K (moe-s3/resident, 2026-10-14)."""
+    30K (moe-s3/resident, 2026-10-14). With in-place KV rows
+    (``MTPLX_M1_RESIDENT_INPLACE_KV``) nothing is copied and there is no limit:
+    +17.5% at 2K, +20% at 8K, +8.8% at 30K, +4.1% at 115K."""
+    default = 1 << 30 if inplace_kv_enabled() else 20480
     try:
-        return int(os.environ.get("MTPLX_M1_RESIDENT_MAX_CONTEXT") or 20480)
+        return int(os.environ.get("MTPLX_M1_RESIDENT_MAX_CONTEXT") or default)
     except ValueError:
-        return 20480
+        return default
+
+
+def inplace_kv_enabled() -> bool:
+    """Queued verifies write their KV rows in place (``MTPLX_M1_RESIDENT_INPLACE_KV``)."""
+    return (os.environ.get("MTPLX_M1_RESIDENT_INPLACE_KV") or "").strip() == "1"
+
+
+def own_kv_pages(cache: list[Any]) -> None:
+    """Give this cache its own quantized page buffers before in-place writes.
+
+    A no-op elementwise op donates a buffer nothing else holds and copies one
+    that a session-bank entry or snapshot still shares, so in-place rows can
+    never reach another holder.
+    """
+
+    from .cache_state import TensorOffsetQuantizedPagedKVCache
+
+    owned = []
+    for entry in cache:
+        if isinstance(entry, TensorOffsetQuantizedPagedKVCache) and entry.layout == "pages":
+            for slot in (0, 1, 3, 4):
+                leaf = entry.cache[slot]
+                entry.cache[slot] = None
+                leaf = leaf + mx.array(0, dtype=leaf.dtype)
+                entry.cache[slot] = leaf
+                owned.append(leaf)
+    if owned:
+        mx.eval(*owned)
 
 
 def _select_row(value: mx.array, index: mx.array) -> mx.array:
@@ -197,16 +228,34 @@ class ResidentMTP:
             # the rewind point of the next round.
             return (draft(h, p), *offsets)
 
+        self.inplace = inplace_kv_enabled()
+        if self.inplace:
+            # Own the history buffers (a no-op op copies a shared one) so the
+            # in-place rows of the traced steps reach no other holder.
+            owned = []
+            for entry in mtp_cache:
+                for slot in (0, 1):
+                    leaf = entry.cache[slot]
+                    entry.cache[slot] = None
+                    entry.cache[slot] = leaf + mx.array(0, dtype=leaf.dtype)
+                    owned.append(entry.cache[slot])
+            mx.eval(*owned)
         tree = _device_core_state_tree(mtp_cache)
         self._draft = mx.compile(draft, inputs=tree, outputs=tree)
         self._commit_draft = mx.compile(commit_draft, inputs=tree, outputs=tree)
 
+    def _call(self, fn, *args):
+        from .cache_state import traced_inplace_kv
+
+        with traced_inplace_kv(self.inplace):
+            return fn(*args)
+
     def draft(self, h, p):
-        return self._draft(h, p)
+        return self._call(self._draft, h, p)
 
     def commit_draft(self, h0, d, accepted, h, p):
         """Returns the next draft and the committed history offsets."""
-        out = self._commit_draft(h0, d, accepted, h, p)
+        out = self._call(self._commit_draft, h0, d, accepted, h, p)
         return out[0], list(out[1:])
 
 
@@ -315,6 +364,9 @@ def run_resident_rounds(
         if exit_reason and not can_queue:
             if not inflight:
                 break
+    # Let every queued round (and its in-place rows) land before the stock
+    # loop writes the same rows again.
+    mx.synchronize()
     # Rewind to the start of the oldest round the host did not accept.
     if inflight:
         first = inflight[0]

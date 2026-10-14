@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import contextlib
 import os
 from pathlib import Path
 import sys
@@ -4154,6 +4155,127 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
         }
 
 
+_TRACED_INPLACE_KV = False
+
+
+def traced_inplace_kv_active() -> bool:
+    return _TRACED_INPLACE_KV
+
+
+@contextlib.contextmanager
+def traced_inplace_kv(enabled: bool = True):
+    """Trace quantized page writes as in-place row writes (resident decode)."""
+
+    global _TRACED_INPLACE_KV
+    previous = _TRACED_INPLACE_KV
+    _TRACED_INPLACE_KV = bool(enabled)
+    try:
+        yield
+    finally:
+        _TRACED_INPLACE_KV = previous
+
+
+_INPLACE_ROWS_KERNEL: Any = None
+
+
+def inplace_write_rows(buf: Any, update: Any, offset: Any) -> Any:
+    """Write ``update`` (rows, ...) into ``buf`` (N, ...) at row ``offset`` in
+    place; returns a token to order readers after the write.
+
+    MLX does not know the kernel writes ``buf``: a reader sees the rows only
+    after a barrier that follows this dispatch. Every reader here (paged
+    attention) also takes freshly computed queries, which places a barrier in
+    front of it that orders every earlier dispatch, this write included; the
+    token keeps the write itself ahead of the reader in the graph.
+    """
+
+    import mlx.core as mx
+
+    global _INPLACE_ROWS_KERNEL
+    if _INPLACE_ROWS_KERNEL is None:
+        _INPLACE_ROWS_KERNEL = mx.fast.metal_kernel(
+            name="mtplx_inplace_write_rows",
+            input_names=["buf", "upd", "offset"],
+            output_names=["done"],
+            source="""
+                uint i = thread_position_in_grid.x;
+                if (i < N) {
+                    device T* dst = (device T*)(buf);
+                    dst[(size_t)offset[0] * RowElems + i] = upd[i];
+                }
+                if (i == 0) {
+                    done[0] = 1;
+                }
+            """,
+            ensure_row_contiguous=False,
+        )
+    if buf.dtype != update.dtype:
+        update = update.astype(buf.dtype)
+    row_elems = 1
+    for dim in buf.shape[1:]:
+        row_elems *= int(dim)
+    n = int(update.size)
+    (done,) = _INPLACE_ROWS_KERNEL(
+        inputs=[buf, mx.contiguous(update), offset.astype(mx.int32).reshape(1)],
+        template=[("T", buf.dtype), ("N", n), ("RowElems", row_elems)],
+        grid=(max(n, 1), 1, 1),
+        threadgroup=(min(256, max(n, 1)), 1, 1),
+        output_shapes=[(1,)],
+        output_dtypes=[mx.int32],
+    )
+    return done
+
+
+_INPLACE_AXIS2_KERNEL: Any = None
+
+
+def inplace_write_axis2(buf: Any, update: Any, offset: Any) -> Any:
+    """Write ``update`` (B, H, S, D) into ``buf`` (B, H, cap, D) at axis-2
+    ``offset`` in place; returns a token to order readers after the write."""
+
+    import mlx.core as mx
+
+    global _INPLACE_AXIS2_KERNEL
+    if _INPLACE_AXIS2_KERNEL is None:
+        _INPLACE_AXIS2_KERNEL = mx.fast.metal_kernel(
+            name="mtplx_inplace_write_axis2",
+            input_names=["buf", "upd", "offset"],
+            output_names=["done"],
+            source="""
+                uint i = thread_position_in_grid.x;
+                if (i < N) {
+                    uint d = i % D;
+                    uint s = (i / D) % S;
+                    uint bh = i / (D * S);
+                    device T* dst = (device T*)(buf);
+                    dst[((size_t)bh * Cap + (size_t)offset[0] + s) * D + d] = upd[i];
+                }
+                if (i == 0) {
+                    done[0] = 1;
+                }
+            """,
+            ensure_row_contiguous=False,
+        )
+    if buf.dtype != update.dtype:
+        update = update.astype(buf.dtype)
+    n = int(update.size)
+    (done,) = _INPLACE_AXIS2_KERNEL(
+        inputs=[buf, mx.contiguous(update), offset.astype(mx.int32).reshape(1)],
+        template=[
+            ("T", buf.dtype),
+            ("N", n),
+            ("D", int(buf.shape[3])),
+            ("S", int(update.shape[2])),
+            ("Cap", int(buf.shape[2])),
+        ],
+        grid=(max(n, 1), 1, 1),
+        threadgroup=(min(256, max(n, 1)), 1, 1),
+        output_shapes=[(1,)],
+        output_dtypes=[mx.int32],
+    )
+    return done
+
+
 class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
     """GraphBank-safe QUANTIZED paged KV cache with an array-backed offset.
 
@@ -4460,6 +4582,19 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
             for flat, shape, (buf_idx, update) in zip(flats, shapes, updates):
                 flat[off_i : off_i + steps] = update
                 self.cache[buf_idx] = flat.reshape(shape)
+        elif traced_inplace_kv_active():
+            # Device-resident rounds (mtplx/resident_decode.py): the previous
+            # round still holds these pages when this verify is queued, so a
+            # functional slice_update cannot donate them and copies every page
+            # (1.96 ms/layer at 128K q8). The rows land in place behind a
+            # dependency token instead; the resident entry made the pages
+            # exclusive to this cache and only rows past the offset change.
+            self.rollback_state[0] = offset
+            for buf_idx, update in updates:
+                shape = self.cache[buf_idx].shape
+                flat = self._flat_pages(buf_idx)
+                done = inplace_write_rows(flat, update, offset)
+                self.cache[buf_idx] = mx.depends([flat.reshape(shape)], [done])[0]
         else:
             self.rollback_state[0] = offset
             for slot, (buf_idx, update) in enumerate(updates, start=1):

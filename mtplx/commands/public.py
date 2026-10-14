@@ -1399,9 +1399,12 @@ _M1_MOE_GDN_ENV = {
 # GDN postconv): +4.5%. MTPLX_LINEAR_GDN_FROM_CONV_TGY=4 measured no gain.
 _M1_A3B_ENV = {
     # Greedy depth-1 rounds queued on the device before the host reads the
-    # previous one (mtplx/resident_decode.py), up to 20K of context; greedy
-    # text identical. A3B: 2K 89.6 -> 99.7 tok/s, 8K 89.4 -> 100.9.
+    # previous one (mtplx/resident_decode.py), with the KV rows of a queued
+    # verify written in place; greedy text identical, session bank entries
+    # untouched. A3B tok/s: 2K 88.9 -> 104.5, 8K 90.1 -> 108.4,
+    # 30K 77.4 -> 84.2, 115K 57.0 -> 59.4.
     "MTPLX_M1_RESIDENT_DECODE": "1",
+    "MTPLX_M1_RESIDENT_INPLACE_KV": "1",
     "MTPLX_QWEN_ROW_OWNED_ROUTER": "1",
     "MTPLX_QWEN_COMBINE_TAIL": "1",
     "MTPLX_QWEN_MOE_PACK_GATE_UP": "1",
