@@ -17836,6 +17836,10 @@ def _round_timing_series(stats: dict[str, Any]) -> list[dict[str, float]]:
             for key, value in timing.items()
             if isinstance(value, (int, float))
         }
+        copy = event.get("context_copy")
+        if row and isinstance(copy, dict) and copy.get("block"):
+            row["copy_block"] = int(copy.get("block") or 0)
+            row["copy_accepted"] = int(copy.get("accepted") or 0)
         if row:
             series.append(row)
     return series

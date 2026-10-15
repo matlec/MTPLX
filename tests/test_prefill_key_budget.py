@@ -51,5 +51,8 @@ def test_only_the_a3b_lane_turns_on_context_copy_with_ramp():
 
     assert _M1_A3B_ENV["MTPLX_CONTEXT_COPY"] == "1"
     assert _M1_A3B_ENV["MTPLX_RAMP_ENABLED"] == "1"
+    assert _M1_A3B_ENV["MTPLX_RAMP_BLOCK"] == "96"
+    assert _M1_A3B_ENV["MTPLX_CCOPY_BANK_ROUTE"] == "1"
+    assert int(_M1_A3B_ENV["MTPLX_CCOPY_BANK_MAX_LEN"]) >= 97
     assert "MTPLX_CONTEXT_COPY" not in _M1_MOE_ENV
     assert "MTPLX_CONTEXT_COPY" not in _M1_MOE_GDN_ENV

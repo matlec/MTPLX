@@ -1434,6 +1434,13 @@ _M1_A3B_ENV = {
     # 104 -> 108 (2026-10-15). The M1-wide default stays off (dense 27B).
     "MTPLX_CONTEXT_COPY": "1",
     "MTPLX_RAMP_ENABLED": "1",
+    # 96-token blocks through the compiled verify bank's extended window: a
+    # 97-row verify costs ~2 ms per extra row while an accepted copy token
+    # saves a ~5 ms round share. kyoto.html rewrite 172 (48, eager) -> 182
+    # (48, bank) -> 193 tok/s (96, bank); novel text unchanged (108).
+    "MTPLX_RAMP_BLOCK": "96",
+    "MTPLX_CCOPY_BANK_ROUTE": "1",
+    "MTPLX_CCOPY_BANK_MAX_LEN": "97",
 }
 _MOE_EXPERT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 
