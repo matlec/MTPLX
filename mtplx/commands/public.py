@@ -1374,6 +1374,11 @@ _M1_MOE_ENV = {
     # tok/s, 30K 901 -> 942. The memory admission still narrows a chunk.
     "MTPLX_PREFILL_CHUNK_SIZE_DENSE": "4096",
     "MTPLX_PREFILL_CHUNK_SIZE_REPAGE": "4096",
+    # ...but rows x context capped (halving the chunk) so one chunk's
+    # attention stays a GPU command macOS does not abort for stalling the
+    # display: 4,096 rows ran clean at 77K and were aborted at ~95K
+    # (35B-A3B, display awake, 2026-10-15). 77-98K -> 2,048, 128K -> 1,024.
+    "MTPLX_PREFILL_CHUNK_KEY_BUDGET": str(4096 * 49152),
 }
 # MoE with qwen3-next Gated DeltaNet layers (backend ``qwen3_next``):
 _M1_MOE_GDN_ENV = {

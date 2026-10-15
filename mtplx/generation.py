@@ -2384,13 +2384,38 @@ def _long_context_prefill_chunk(chunk: int, context_tokens: int | None = None) -
             cap = 0
     else:
         cap = 512 if m1_long_context_defaults() else 0
-    if cap <= 0:
-        return chunk
     if context_tokens is None:
         context_tokens = _env_int("MTPLX_CURRENT_PREFILL_CONTEXT_TOKENS", 0)
+    chunk = _key_budget_prefill_chunk(int(chunk), int(context_tokens or 0))
+    if cap <= 0:
+        return chunk
     if context_tokens <= _env_int("MTPLX_PREFILL_LONG_CONTEXT_THRESHOLD", 163840):
         return chunk
     return max(1, min(int(chunk), int(cap)))
+
+
+def _key_budget_prefill_chunk(chunk: int, context_tokens: int) -> int:
+    """Narrow the chunk so rows x context stays under a budget (M1 family).
+
+    A prefill chunk's attention is one GPU command of rows x keys work; past
+    a point macOS aborts it for stalling the display
+    (kIOGPUCommandBufferCallbackErrorImpactingInteractivity). On Qwen3.6-35B-A3B
+    (M1 Max, display awake) 4,096 rows at a 77K prompt ran 20 minutes clean
+    and 4,096 at ~95K was aborted (2026-10-15). The budget,
+    ``MTPLX_PREFILL_CHUNK_KEY_BUDGET`` rows x tokens (off by default; the M1
+    MoE launch lane sets 4096 x 48K), halves the chunk until it fits, down to
+    512 rows.
+    """
+    raw = (os.environ.get("MTPLX_PREFILL_CHUNK_KEY_BUDGET") or "").strip()
+    try:
+        budget = int(raw) if raw else 0
+    except ValueError:
+        budget = 0
+    if budget <= 0 or context_tokens <= 0:
+        return chunk
+    while chunk > 512 and chunk * context_tokens > budget:
+        chunk //= 2
+    return max(1, chunk)
 
 
 def _prefill_chunk_size(context_tokens: int | None = None) -> int:

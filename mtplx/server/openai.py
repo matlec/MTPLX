@@ -31894,7 +31894,7 @@ def _run_generation(
             # user is active (kIOGPUCommandBufferCallbackErrorImpactingInteractivity,
             # or a full GPU hang/restart). Before any token is out, drop this
             # session's possibly half-written entries and run the request again
-            # with shorter prefill chunks (shorter GPU commands) instead of
+            # with half-width prefill chunks (shorter GPU commands) instead of
             # failing it (omp on Qwen3.6-35B-A3B, turn-boundary re-prefills,
             # 2026-10-14/15).
             _gpu_abort_retries = 0
@@ -32054,12 +32054,18 @@ def _run_generation(
                     except Exception:
                         pass
                     _divisor = max(
-                        1, int(os.environ.get("MTPLX_GPU_ABORT_RETRY_CHUNK_DIVISOR", "4"))
+                        1, int(os.environ.get("MTPLX_GPU_ABORT_RETRY_CHUNK_DIVISOR", "2"))
                     )
                     if _divisor > 1:
-                        prefill_chunk_tokens = max(
-                            512, int(prefill_chunk_tokens or 2048) // _divisor
-                        )
+                        # Halve the width the aborted attempt actually ran (the
+                        # auto width, key budget included), not a fixed 2,048.
+                        if prefill_chunk_tokens is None:
+                            from mtplx.generation import _prefill_chunk_size
+
+                            _ran = _prefill_chunk_size(len(prompt_ids))
+                        else:
+                            _ran = int(prefill_chunk_tokens)
+                        prefill_chunk_tokens = max(512, int(_ran) // _divisor)
                     if request_observability is not None:
                         request_observability.setdefault("gpu_display_aborts", []).append(
                             {
