@@ -12880,6 +12880,21 @@ def generate_mtpk(
         # continuation predictiveness and can cost more to verify than they commit,
         # while grounded re-emission matches into the prompt (see the PR benchmarks).
         ccopy_index.sync(prompt_ids)
+    def _ccopy_would_fire() -> bool:
+        """Whether the capture-lane copy round would fire at the current tail
+        (the same find() and gates as the block round below)."""
+        if (
+            not ccopy_active
+            or not _ccopy_capture_lane
+            or ccopy_index is None
+            or len(tokens) < ccopy_suspend_until
+        ):
+            return False
+        pos, ext = ccopy_index.find(
+            _JoinedTokens(prompt_ids, tokens), max_pos=len(prompt_ids)
+        )
+        return pos is not None and ext >= ccopy_min_ext and int(pos) < len(prompt_ids)
+
     wants_policy_metrics = bool(
         getattr(adaptive_policy, "wants_draft_metrics", False)
     )
@@ -13201,6 +13216,8 @@ def generate_mtpk(
         and not target_prefix_verify
     )
     _resident_ok = _resident_ok or _resident_sampled
+    _resident_copy_hybrid = _resident_decode.copy_hybrid_enabled()
+    _resident_copy_exit = [False]
     _resident_next_step = 0
     _resident_mtp = None
     _resident_stats: dict[str, Any] = {
@@ -14223,7 +14240,10 @@ def generate_mtpk(
             and compiled_verify_bank is not None
             and not compiled_verify_bank.permanent_eager
             and mtp_cache is not None
-            and not ccopy_active
+            and (
+                not ccopy_active
+                or (_resident_copy_hybrid and not _ccopy_would_fire())
+            )
             and len(tokens) + 8 < max_tokens
         ):
             # MTPLX_M1_RESIDENT_DECODE: pipelined device-resident rounds (see
@@ -14232,6 +14252,19 @@ def generate_mtpk(
             # sampled: back after one stock round when the host disagreed.
             _resident_ok = False
             try:
+                if _resident_mtp is not None:
+                    from .graphbank import TensorOffsetKVCache as _RdTOKV
+
+                    if _resident_mtp.mtp_cache is not mtp_cache or not all(
+                        isinstance(_e, _RdTOKV) for _e in mtp_cache
+                    ):
+                        # The stock rounds in between (context-copy blocks)
+                        # replaced MTP cache entries; the compiled draft is
+                        # bound to the old ones. Rebuild it over the live cache.
+                        _resident_mtp = None
+                        _resident_stats["rebuilds"] = int(
+                            _resident_stats.get("rebuilds", 0)
+                        ) + 1
                 if _resident_mtp is None and _resident_sampled:
                     _resident_mtp = _resident_decode.ResidentSampledMTP(
                         rt,
@@ -14303,6 +14336,11 @@ def generate_mtpk(
                 def _resident_should_stop():
                     if abort_check is not None and abort_check():
                         return True
+                    if ccopy_active and _ccopy_would_fire():
+                        # A prompt match: the stock loop's copy block round
+                        # commits far more per verify than a resident round.
+                        _resident_copy_exit[0] = True
+                        return True
                     if (
                         mtp_history_live_reset_threshold > 0
                         and mtp_history_live_appended >= mtp_history_live_reset_threshold
@@ -14372,8 +14410,14 @@ def generate_mtpk(
                     float(_resident_stats["wall_s"]) + float(_rr.wall_s), 4
                 )
                 _resident_stats["exit"] = _rr.exit_reason
-                if _rr.exit_reason == "mismatch":
-                    # The stock loop runs the disputed round; come back after.
+                if _rr.exit_reason == "mismatch" or _resident_copy_exit[0]:
+                    # The stock loop runs the disputed round (or the copy
+                    # rounds); come back after.
+                    if _resident_copy_exit[0]:
+                        _resident_stats["copy_exits"] = int(
+                            _resident_stats.get("copy_exits", 0)
+                        ) + 1
+                        _resident_copy_exit[0] = False
                     _resident_ok = True
                     _resident_next_step = step + 1
                 pending_primary = int(_rr.primary)

@@ -50,6 +50,15 @@ def sampled_enabled() -> bool:
     return (os.environ.get("MTPLX_M1_RESIDENT_SAMPLED") or "").strip() == "1"
 
 
+def copy_hybrid_enabled() -> bool:
+    """Resident rounds beside context-copy (``MTPLX_M1_RESIDENT_COPY_HYBRID``,
+    default on): with copy active the rounds stay resident until the copy
+    proposer finds a prompt match, hand the stream to the stock loop's copy
+    block rounds, and come back once the match is spent. Off keeps the old
+    rule (copy active means no resident rounds)."""
+    return (os.environ.get("MTPLX_M1_RESIDENT_COPY_HYBRID") or "1").strip() != "0"
+
+
 def max_context() -> int:
     """Context (prompt + completion) up to which rounds stay resident.
 
