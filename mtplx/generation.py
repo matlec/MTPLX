@@ -12849,6 +12849,14 @@ def generate_mtpk(
         # excludes draft substitution.  The compiled route is kept.
         ccopy_disabled_reason = "whole_moe_keeps_compiled_route"
     ccopy_ema, ccopy_seen, ccopy_suspend_until = 0.5, 0, 0
+    # Adaptive copy block (MTPLX_CCOPY_ADAPTIVE_BLOCK=<start>, 0 = off): the
+    # block starts short, doubles after a fully accepted block and shrinks to
+    # the accepted run after a partial one, inside [8, the ladder/RAMP cap].
+    # A fixed 96-token RAMP block on an omp heptagon session missed 2 of 3
+    # rounds (36% of 107K copied tokens accepted, 405 s of 97-row verifies
+    # spent on rounds that kept <30%), while a whole-file rewrite accepts ~91%.
+    _ccopy_adapt_start = max(0, int(os.environ.get("MTPLX_CCOPY_ADAPTIVE_BLOCK", "0") or 0))
+    ccopy_adapt_block = _ccopy_adapt_start
     ccopy_backoff = 64   # doubles on each suspension (self-repetitive novel text would
                          # otherwise re-trigger copy rounds after every backoff and pay
                          # the probe cost recurrently); a paying round resets it.
@@ -13629,6 +13637,8 @@ def generate_mtpk(
                     else ccopy_probation_k
                 )
                 _cc_klen = block_for_ext(_cc_ext, _cc_k_now)
+                if ccopy_adapt_block > 0:
+                    _cc_klen = min(_cc_klen, ccopy_adapt_block)
                 _cc_block = [int(t) for t in prompt_ids[_cc_pos:_cc_pos + _cc_klen]]
                 _cc_block = _cc_block[: max(1, max_tokens - len(tokens))]
                 if constraint is not None:
@@ -13903,6 +13913,11 @@ def generate_mtpk(
                 ccopy_accepted += _cc_nacc
                 if _cc_nacc:
                     ccopy_blocks_accepted += 1
+                if ccopy_adapt_block > 0:
+                    if _cc_nacc >= len(_cc_block):
+                        ccopy_adapt_block = min(ccopy_adapt_block * 2, 1 << 12)
+                    else:
+                        ccopy_adapt_block = max(8, 1 << max(3, int(_cc_nacc + 1).bit_length()))
                 ccopy_ema = 0.7 * ccopy_ema + 0.3 * (_cc_nacc / len(_cc_block))
                 ccopy_seen += 1
                 if _cc_nacc / len(_cc_block) >= 0.5:
