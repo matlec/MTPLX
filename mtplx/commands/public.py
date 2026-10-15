@@ -1426,6 +1426,14 @@ _M1_A3B_ENV = {
     "MTPLX_A3B_GDN_POSTCONV_IMPL": "headquarter",
     "MTPLX_A3B_WHOLE_MOE_FUSION": "1",
     "MTPLX_M1_WHOLE_MOE_ANY_ROUTE": "1",
+    # Context-copy with RAMP's 48-token blocks, beside the resident rounds
+    # (A3B only: without the resident lane copy costs novel text ~10%)
+    # (resident_decode.copy_hybrid_enabled): agent output is mostly file
+    # re-emission (70% of an omp Kyoto session's tokens sat in the prompt).
+    # A3B thinking-on, sampled: a file rewrite 110 -> 172 tok/s, novel text
+    # 104 -> 108 (2026-10-15). The M1-wide default stays off (dense 27B).
+    "MTPLX_CONTEXT_COPY": "1",
+    "MTPLX_RAMP_ENABLED": "1",
 }
 _MOE_EXPERT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 
