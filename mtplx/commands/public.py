@@ -1446,6 +1446,11 @@ _M1_A3B_ENV = {
     "MTPLX_CCOPY_ADAPTIVE_BLOCK": "16",
     "MTPLX_CCOPY_BANK_ROUTE": "1",
     "MTPLX_CCOPY_BANK_MAX_LEN": "97",
+    # Copy blocks of 17-80 rows through the MMA split-K attention (4-row
+    # chunks) instead of the dequantized-state fallback past 16 rows. 85K
+    # history, q8 KV: T=17 240 -> 127 ms, T=33 295 -> 232, T=65 480 -> 426;
+    # T=97 is faster on the fallback (572 vs 602), so the cap stays at 80.
+    "MTPLX_GQA_MMA_MAX_Q": "80",
 }
 _MOE_EXPERT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 

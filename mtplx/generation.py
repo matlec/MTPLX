@@ -12857,6 +12857,18 @@ def generate_mtpk(
     # spent on rounds that kept <30%), while a whole-file rewrite accepts ~91%.
     _ccopy_adapt_start = max(0, int(os.environ.get("MTPLX_CCOPY_ADAPTIVE_BLOCK", "0") or 0))
     ccopy_adapt_block = _ccopy_adapt_start
+    # Yield gate (MTPLX_CCOPY_YIELD_GATE=1): suspend copy rounds while they
+    # commit fewer tokens per second than the rounds between them. At depth
+    # each extra verify row costs ~7 ms (a 9-row verify at 80K: 77 ms for 3.6
+    # tokens), so on an omp heptagon session copy rounds ran at 42-73 tok/s
+    # against 68-90 tok/s for the resident rounds in every 16K bucket past
+    # 16K, while a short whole-file rewrite still copies at ~2x.
+    _cc_yield_gate = _env_truthy("MTPLX_CCOPY_YIELD_GATE")
+    ccopy_yield_ema: float | None = None
+    ccopy_base_ema: float | None = None
+    ccopy_yield_seen = 0
+    ccopy_yield_suspensions = 0
+    _cc_mark: tuple[int, float] | None = None
     ccopy_backoff = 64   # doubles on each suspension (self-repetitive novel text would
                          # otherwise re-trigger copy rounds after every backoff and pay
                          # the probe cost recurrently); a paying round resets it.
@@ -13684,6 +13696,17 @@ def generate_mtpk(
                     )
             if _cc_block:
                 _cc_T = 1 + len(_cc_block)
+                _cc_round_t0 = time.perf_counter()
+                if _cc_yield_gate and _cc_mark is not None:
+                    _cc_gap_tok = len(tokens) - _cc_mark[0]
+                    _cc_gap_s = _cc_round_t0 - _cc_mark[1]
+                    if _cc_gap_tok >= 4 and _cc_gap_s > 0:
+                        _cc_rate = _cc_gap_tok / _cc_gap_s
+                        ccopy_base_ema = (
+                            _cc_rate
+                            if ccopy_base_ema is None
+                            else 0.7 * ccopy_base_ema + 0.3 * _cc_rate
+                        )
                 if qsa_mtp_precompute_active:
                     started_indexer_stage = time.perf_counter()
                     target_indexer_plans = precompute_and_stage_qsa_replay_caches(
@@ -13931,6 +13954,28 @@ def generate_mtpk(
                     ccopy_backoff = min(ccopy_backoff * 2, 4096)
                     ccopy_ema, ccopy_seen = 0.5, 0
                     ccopy_suspensions += 1
+                if _cc_yield_gate:
+                    _cc_now = time.perf_counter()
+                    _cc_y = (_cc_nacc + 1) / max(_cc_now - _cc_round_t0, 1e-6)
+                    ccopy_yield_ema = (
+                        _cc_y
+                        if ccopy_yield_ema is None
+                        else 0.7 * ccopy_yield_ema + 0.3 * _cc_y
+                    )
+                    ccopy_yield_seen += 1
+                    _cc_mark = (len(tokens), _cc_now)
+                    if (
+                        ccopy_yield_seen >= 3
+                        and ccopy_base_ema is not None
+                        and ccopy_yield_ema < ccopy_base_ema
+                        and len(tokens) >= ccopy_suspend_until
+                    ):
+                        ccopy_suspend_until = len(tokens) + ccopy_backoff
+                        ccopy_backoff = min(ccopy_backoff * 2, 4096)
+                        ccopy_ema, ccopy_seen = 0.5, 0
+                        ccopy_yield_ema, ccopy_yield_seen = None, 0
+                        ccopy_suspensions += 1
+                        ccopy_yield_suspensions += 1
                 event["accepted_depths"] = int(_cc_nacc)
                 event["context_copy"] = {
                     "block": len(_cc_block),

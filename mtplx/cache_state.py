@@ -442,6 +442,15 @@ def _vllm_metal_reference_path() -> Path:
     return Path(__file__).resolve().parents[1] / "REFERENCES:TOOLS" / "vllm-metal"
 
 
+def _gqa_mma_max_q() -> int:
+    """Widest query window the M1 MMA split-K attention takes (it runs as
+    4-row chunks); wider windows fall back to the dequantized ``state``."""
+    try:
+        return max(1, int(os.environ.get("MTPLX_GQA_MMA_MAX_Q") or 16))
+    except ValueError:
+        return 16
+
+
 def _paged_attention_impl_from_env() -> str:
     return (
         os.environ.get("MTPLX_VLLM_METAL_PAGED_ATTN_IMPL", "")
@@ -3984,7 +3993,7 @@ class TensorOffsetVllmMetalPagedKVCache(RotaryOrigin):
             k_strides=(dim, heads * dim),
             v_strides=(vdim, heads * vdim),
             ceiling=int(self._static_attention_max_offset() or self.capacity),
-            max_q_len=16,
+            max_q_len=_gqa_mma_max_q(),
         )
 
     def _static_attention_max_offset(self) -> int | None:
@@ -4722,7 +4731,7 @@ class TensorOffsetQuantizedPagedKVCache(TensorOffsetVllmMetalPagedKVCache):
             k_scales=self.cache[3],
             v_scales=self.cache[4],
             s_strides=s_strides,
-            max_q_len=16,
+            max_q_len=_gqa_mma_max_q(),
         )
 
     @property
