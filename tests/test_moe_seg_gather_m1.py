@@ -10,7 +10,7 @@ from mtplx.kernels import moe_seg_gather_m1 as seg
 
 def _case(rows_per_token: int, skew: bool, dtype=mx.float16, n: int = 256, k: int = 512):
     mx.random.seed(3)
-    experts, tokens = 16, 256
+    experts, tokens = 16, 512  # 2,048 routed rows: the seg-gather threshold
     w = (mx.random.normal((experts, n, k)) * 0.02).astype(dtype)
     wq, scales, biases = mx.quantize(w, group_size=64, bits=4)
     x = (mx.random.normal((tokens, k)) * 0.5).astype(dtype)

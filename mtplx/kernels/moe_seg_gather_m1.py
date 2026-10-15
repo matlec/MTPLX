@@ -41,8 +41,12 @@ BM = 32
 BN = 64
 BK = 32
 THREADS = 128
-#: Fewer routed rows keep MLX's kernel (decode and verify widths).
-MIN_ROWS = 1024
+#: Fewer routed rows keep MLX's kernel (decode, verify and short prefill
+#: widths). Qwen3.6-35B-A3B per MoE layer (M1 Max, 2026-10-16), seg vs MLX:
+#: 128 tokens (1,024 routed rows) 7.07 vs 6.30 ms, 192: 7.54 vs 7.14, 256:
+#: 7.88 vs 7.94, 384: 8.56 vs 9.33 -- the crossover is ~2,048 routed rows.
+#: MTPLX_M1_MOE_SEG_GATHER_MIN_ROWS overrides.
+MIN_ROWS = int(os.environ.get("MTPLX_M1_MOE_SEG_GATHER_MIN_ROWS", "2048") or 2048)
 _ENV = "MTPLX_M1_MOE_SEG_GATHER"
 
 _HEADERS = (
