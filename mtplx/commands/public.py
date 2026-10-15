@@ -1451,6 +1451,10 @@ _M1_A3B_ENV = {
     # history, q8 KV: T=17 240 -> 127 ms, T=33 295 -> 232, T=65 480 -> 426;
     # T=97 is faster on the fallback (572 vs 602), so the cap stays at 80.
     "MTPLX_GQA_MMA_MAX_Q": "80",
+    # A tool result or user message (<= 96 tokens) appended to a deep q8
+    # history: split-K attention over the pages instead of dequantizing the
+    # whole prefix per layer (cache_state._splitk_window_q8).
+    "MTPLX_KV_QUANT_SPLITK_MAX_Q": "96",
 }
 _MOE_EXPERT_KEYS = ("num_experts", "num_local_experts", "n_routed_experts", "moe_num_experts")
 

@@ -2158,6 +2158,55 @@ class VllmMetalPagedKVCache:
         values = memo["mirror_v"][:offset].transpose(1, 0, 2)[None, ...]
         return keys, values
 
+    def _splitk_window_q8(self, queries: Any, *, scale: float, mask: Any | None) -> Any | None:
+        """A short window (a tool result or user message appended to a deep
+        cached history) over the q8 pages on the split-K MMA kernel, or None.
+
+        ``MTPLX_KV_QUANT_SPLITK_MAX_Q`` rows at most (default 0 = off). The
+        prefill route dequantizes the whole prefix per layer and its kernel
+        takes ~60 ms flat for up to 64 rows at 160K; the split-K kernel reads
+        the pages in place at ~0.63 ms per row. One layer, 160K: 32 rows
+        59.7 -> 20.7 ms, 96 rows 69.8 -> 60.9 ms (128 rows: 69.7 vs 81.0).
+        """
+        try:
+            cap = int(os.environ.get("MTPLX_KV_QUANT_SPLITK_MAX_Q") or 0)
+        except ValueError:
+            cap = 0
+        q_len = int(queries.shape[2])
+        if cap <= 0 or q_len > cap:
+            return None
+        if self.turboquant or int(self.kv_quant_config.bits) != 8:
+            return None
+        if mask is not None and not (isinstance(mask, str) and mask == "causal"):
+            return None
+        if self.key_cache is None or self.key_scale_cache is None:
+            return None
+        if not _env_flag_default_m1("MTPLX_GQA_MMA"):
+            return None
+        if int(self.offset) < q_len:
+            return None
+        from .kernels.sdpa_gqa_mma import sdpa_gqa_mma
+
+        heads = int(self.key_cache.shape[2])
+        dim = int(self.key_cache.shape[3])
+        vdim = int(self.value_cache.shape[3])
+        return sdpa_gqa_mma(
+            queries=queries,
+            keys=self.key_cache,
+            values=self.value_cache,
+            offset=int(self.offset),
+            scale=float(scale),
+            num_kv_heads=heads,
+            k_strides=(dim, heads * dim),
+            v_strides=(vdim, heads * vdim),
+            ceiling=int(self.key_cache.shape[0]) * int(self.key_cache.shape[1]),
+            kv_bits=8,
+            k_scales=self.key_scale_cache,
+            v_scales=self.value_scale_cache,
+            s_strides=(1, heads),
+            max_q_len=cap,
+        )
+
     def _mma_prefill_q8(
         self,
         queries: Any,
@@ -3087,6 +3136,12 @@ class VllmMetalPagedKVCache:
                     self.attention_time_s += time.perf_counter() - started
                     return kernel_out
             if q_len > max_q_len:
+                splitk_out = self._splitk_window_q8(queries, scale=scale, mask=mask)
+                if splitk_out is not None:
+                    self.paged_attention_calls += 1
+                    self.kv_quant_attention_calls += 1
+                    self.attention_time_s += time.perf_counter() - started
+                    return splitk_out
                 # Prefill-width window over q8 pages (a suffix after a bank
                 # restore): the MMA prefill kernel reads the pages in place.
                 # Without it the fallback below builds an offset-sized bf16
