@@ -284,6 +284,28 @@ def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ss
     layers = inner.layers
     if not any(_is_moe_layer(layer) for layer in layers):
         return None
+    # Past MTPLX_ANE_PREFILL_MOE_MAX_CONTEXT keys the ANE path gains little (77K
+    # turn re-prefill: 106 vs 111 s) and its extra working memory trips the
+    # system-memory abort beside a desktop's apps (7 of 17 prefills failed vs 0
+    # of 11 GPU-only, 2026-10-15); attention dominates there anyway.
+    limit = int(os.environ.get("MTPLX_ANE_PREFILL_MOE_MAX_CONTEXT", "32768"))
+    if limit > 0:
+        offset = 0
+        for layer, c in zip(layers, cache):
+            if not layer.is_linear and c is not None:
+                try:
+                    offset = int(getattr(c, "offset", 0) or 0)
+                except Exception:
+                    offset = limit + 1
+                break
+        if offset + S > limit:
+            if not _STATE.get("logged_context_cap"):
+                _STATE["logged_context_cap"] = True
+                print(f"[ane-prefill-moe] GPU-only past {limit} keys (offset {offset} + {S} rows)", flush=True)
+            return None
+    if not _STATE.get("logged_engaged"):
+        _STATE["logged_engaged"] = True
+        print(f"[ane-prefill-moe] engaged (offset {offset if limit > 0 else '?'}, {S} rows)", flush=True)
     try:
         lin = _program(inner)
         if _attn_enabled():
