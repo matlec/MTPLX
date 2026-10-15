@@ -61,6 +61,7 @@ def test_a_heartbeating_job_is_waited_for_past_the_bound(monkeypatch) -> None:
 
 def test_a_silent_job_is_still_abandoned_at_the_bound(monkeypatch) -> None:
     monkeypatch.setenv("MTPLX_POSTCOMMIT_WAIT_STALL_S", "0.05")
+    monkeypatch.setenv("MTPLX_POSTCOMMIT_WAIT_FIRST_TICK_S", "0.05")
     session = _session()
     future: Future = Future()  # never resolves, never heartbeats
     record = session.set_pending_postcommit(future)
@@ -126,12 +127,13 @@ def test_the_ceiling_caps_a_job_that_heartbeats_forever(monkeypatch) -> None:
         thread.join(timeout=1.0)
 
 
-def test_progressing_reads_the_heartbeat() -> None:
+def test_progressing_reads_the_heartbeat(monkeypatch) -> None:
+    monkeypatch.setenv("MTPLX_POSTCOMMIT_WAIT_FIRST_TICK_S", "0")
     record = PendingPostcommit(future=Future())
     assert not record.progressing(stall_s=1.0)
     record.mark_started()
-    # Starting is not progress: the first chunk boundary must land inside
-    # the caller's bound for the extension to apply at all.
+    # With no first-chunk window, starting is not progress: the first chunk
+    # boundary must land inside the caller's bound for the extension to apply.
     assert not record.progressing(stall_s=1.0)
     record.note_progress()
     assert record.progressing(stall_s=1.0)
@@ -139,6 +141,28 @@ def test_progressing_reads_the_heartbeat() -> None:
     assert not record.progressing(stall_s=1.0)
     record.note_progress()
     assert record.progressing(stall_s=1.0)
+
+
+def test_a_started_job_gets_a_bounded_first_chunk_window(monkeypatch) -> None:
+    # A deep restore plus its first chunk outlasts the stall window.
+    monkeypatch.setenv("MTPLX_POSTCOMMIT_WAIT_FIRST_TICK_S", "1.0")
+    record = PendingPostcommit(future=Future())
+    record.mark_started()
+    assert record.progressing(stall_s=0.01)
+    record.started_mono_s = time.monotonic() - 2.0
+    assert not record.progressing(stall_s=0.01)
+
+
+def test_the_stall_window_grows_with_the_observed_chunk_gap() -> None:
+    # 4,096-row chunks at 130K take ~13 s, past the 15 s window under load.
+    record = PendingPostcommit(future=Future())
+    record.mark_started()
+    record.last_progress_mono_s = time.monotonic() - 4.0
+    record.note_progress()  # a 4 s chunk
+    record.last_progress_mono_s = time.monotonic() - 6.0
+    assert record.progressing(stall_s=1.0)  # 2.5 x 4 s = 10 s window
+    record.last_progress_mono_s = time.monotonic() - 11.0
+    assert not record.progressing(stall_s=1.0)
 
 
 def test_tool_call_finish_commits_the_generation_boundary() -> None:

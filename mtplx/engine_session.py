@@ -741,6 +741,18 @@ def _postcommit_wait_stall_s() -> float:
     return value if value > 0.0 else 0.0
 
 
+def _postcommit_first_tick_s() -> float:
+    """MTPLX_POSTCOMMIT_WAIT_FIRST_TICK_S: how long a started postcommit may
+    take to reach its first chunk boundary before a waiter abandons it
+    (default 45 s; <= 0 restores the old rule: no progress, no extension)."""
+    raw = os.environ.get("MTPLX_POSTCOMMIT_WAIT_FIRST_TICK_S")
+    try:
+        value = float(raw) if raw is not None and str(raw).strip() else 45.0
+    except (TypeError, ValueError):
+        value = 45.0
+    return value if math.isfinite(value) and value > 0.0 else 0.0
+
+
 def _postcommit_wait_ceiling_s() -> float:
     """MTPLX_POSTCOMMIT_WAIT_CEILING_S: absolute cap on a progress-extended wait."""
     raw = os.environ.get("MTPLX_POSTCOMMIT_WAIT_CEILING_S")
@@ -897,14 +909,24 @@ class PendingPostcommit:
     #: still prefilling from one that is wedged.
     last_progress_mono_s: float | None = None
     progress_ticks: int = 0
+    #: Longest gap between the job's recent heartbeats: a deep-context chunk
+    #: (4,096 rows at 130K) takes longer than the fixed stall window.
+    max_progress_gap_s: float = 0.0
+    started_mono_s: float | None = None
 
     def mark_started(self) -> None:
         if self.started_at_s is None:
             self.started_at_s = time.time()
             self.last_progress_mono_s = time.monotonic()
+            self.started_mono_s = self.last_progress_mono_s
 
     def note_progress(self) -> None:
-        self.last_progress_mono_s = time.monotonic()
+        now = time.monotonic()
+        if self.last_progress_mono_s is not None:
+            self.max_progress_gap_s = max(
+                self.max_progress_gap_s, now - float(self.last_progress_mono_s)
+            )
+        self.last_progress_mono_s = now
         self.progress_ticks += 1
 
     def progressing(self, *, stall_s: float) -> bool:
@@ -916,9 +938,17 @@ class PendingPostcommit:
         the stall window.
         """
         stamp = self.last_progress_mono_s
-        if stamp is None or self.progress_ticks <= 0:
+        if stamp is None:
             return False
-        return (time.monotonic() - float(stamp)) <= float(stall_s)
+        now = time.monotonic()
+        if self.progress_ticks <= 0:
+            # Restoring a deep conversation and its first chunk can outlast
+            # the stall window (a 123K restore + 4,096 rows at 130K: ~20 s on
+            # an M1 Max); a started job gets a bounded first-chunk window.
+            started = self.started_mono_s
+            return started is not None and (now - float(started)) <= _postcommit_first_tick_s()
+        window = max(float(stall_s), 2.5 * float(self.max_progress_gap_s))
+        return (now - float(stamp)) <= window
 
     def mark_finished(self, outcome: dict[str, Any] | None = None) -> None:
         self.finished_at_s = time.time()

@@ -191,6 +191,9 @@ def test_concurrent_newer_record_is_not_cleared(monkeypatch) -> None:
 def test_legacy_wait_timeout_env_precedence_still_works(monkeypatch) -> None:
     monkeypatch.setenv("MTPLX_POSTCOMMIT_WAIT_TIMEOUT_S", "0.2")
     monkeypatch.setenv("MTPLX_POSTCOMMIT_ARRIVAL_WAIT_S", "5.0")
+    # A started job with no chunk yet would get the first-chunk window;
+    # this test is about which bound governs, so take that window away.
+    monkeypatch.setenv("MTPLX_POSTCOMMIT_WAIT_FIRST_TICK_S", "0")
     session = _session()
     future: Future = Future()  # running forever
     _running_record(session, future)
