@@ -1439,6 +1439,11 @@ _M1_A3B_ENV = {
     # saves a ~5 ms round share. kyoto.html rewrite 172 (48, eager) -> 182
     # (48, bank) -> 193 tok/s (96, bank); novel text unchanged (108).
     "MTPLX_RAMP_BLOCK": "96",
+    # ...but grown from 16 tokens only while blocks keep being fully accepted
+    # (generation.py adaptive block): on an omp agent session the fixed 96 kept
+    # 32% of copied tokens and spent 1,754 s on missed 97-row verifies; the
+    # adaptive block lifted turn decode 51-71 -> 74-89 tok/s, rewrite 195.
+    "MTPLX_CCOPY_ADAPTIVE_BLOCK": "16",
     "MTPLX_CCOPY_BANK_ROUTE": "1",
     "MTPLX_CCOPY_BANK_MAX_LEN": "97",
 }
