@@ -11956,6 +11956,24 @@ def _collapse_repeated_user_text(text: str) -> str | None:
     raw = text or ""
     stripped = raw.strip()
     key = _retry_user_key(stripped)
+    if key is not None:
+        # A tandem repeat normalizes (whitespace runs -> one space) to n+n or
+        # n+" "+n up to case, the halves being stripped and the gap between
+        # them whitespace. Any other text cannot match at any split, so skip
+        # the scan below, which re-keyed both halves at every split (O(n^2),
+        # ~0.1 s per request on omp agent transcripts). str.lower never
+        # shortens; text it lengthens (e.g. "\u0130") keeps the full scan.
+        norm = re.sub(r"\s+", " ", stripped)
+        if len(norm.lower()) == len(norm):
+            half = len(norm) // 2
+            if len(norm) % 2 == 0:
+                tandem = norm[:half].lower() == norm[half:].lower()
+            else:
+                tandem = norm[half] == " " and (
+                    norm[:half].lower() == norm[half + 1:].lower()
+                )
+            if not tandem:
+                key = None
     if key is not None and len(stripped) >= 16:
         # OpenCode can persist a cancelled retry as one user part like
         # "Hi, how are you?Hi, how are you?". Collapse exact tandem repeats
@@ -11965,7 +11983,10 @@ def _collapse_repeated_user_text(text: str) -> str | None:
             second = stripped[split:].strip()
             if not first or not second:
                 continue
-            if _retry_user_key(first) == _retry_user_key(second):
+            first_key = _retry_user_key(first)
+            # Both halves too short to key compared equal (None == None) and
+            # cut real messages ("Fix it.   Thanks!" -> "Fix it.").
+            if first_key is not None and first_key == _retry_user_key(second):
                 return first
     collapsed_chitchat = _collapse_repeated_simple_chitchat_text(stripped)
     if collapsed_chitchat is not None:
