@@ -38,15 +38,25 @@ from typing import Any
 import mlx.core as mx
 
 BM = 32
+#: Tile rows below this many routed rows: 16-row tiles waste less on the 1-3
+#: rows a verify or short prefill routes to an expert. A3B MoE layer, BM 16 vs
+#: 32 (M1 Max, 2026-10-16): 128 tokens 5.72 vs 7.15 ms, 256: 6.88 vs 7.97,
+#: 512: 9.19 vs 9.38, 768: 11.48 vs 11.06, 4,096: 43.2 vs 37.2.
+NARROW_BM = 16
+NARROW_MAX_ROWS = int(os.environ.get("MTPLX_M1_MOE_SEG_GATHER_NARROW_MAX_ROWS", "4096") or 4096)
+
+
+def _bm_for(rows: int) -> int:
+    return NARROW_BM if int(rows) <= NARROW_MAX_ROWS else BM
 BN = 64
 BK = 32
 THREADS = 128
 #: Fewer routed rows keep MLX's kernel (decode, verify and short prefill
-#: widths). Qwen3.6-35B-A3B per MoE layer (M1 Max, 2026-10-16), seg vs MLX:
-#: 128 tokens (1,024 routed rows) 7.07 vs 6.30 ms, 192: 7.54 vs 7.14, 256:
-#: 7.88 vs 7.94, 384: 8.56 vs 9.33 -- the crossover is ~2,048 routed rows.
-#: MTPLX_M1_MOE_SEG_GATHER_MIN_ROWS overrides.
-MIN_ROWS = int(os.environ.get("MTPLX_M1_MOE_SEG_GATHER_MIN_ROWS", "2048") or 2048)
+#: widths).
+#: With 16-row tiles below 4,096 routed rows (``_bm_for``) the segmented
+#: gather wins from 1,024 routed rows: 128 tokens 5.72 vs 6.30 ms, 192: 6.36
+#: vs 7.14, 256: 6.88 vs 7.94. MTPLX_M1_MOE_SEG_GATHER_MIN_ROWS overrides.
+MIN_ROWS = int(os.environ.get("MTPLX_M1_MOE_SEG_GATHER_MIN_ROWS", "1024") or 1024)
 _ENV = "MTPLX_M1_MOE_SEG_GATHER"
 
 _HEADERS = (
@@ -369,14 +379,15 @@ def _segmented(x, w, scales, biases, rhs_indices, *, group_size: int, bits: int)
     counts = mx.zeros((experts,), dtype=mx.int32).at[rhs_indices.astype(mx.int32)].add(1)
     zero = mx.zeros((1,), dtype=mx.int32)
     row_start = mx.concatenate([zero, mx.cumsum(counts)])
-    tile_start = mx.concatenate([zero, mx.cumsum((counts + BM - 1) // BM)])
+    bm = _bm_for(rows)
+    tile_start = mx.concatenate([zero, mx.cumsum((counts + bm - 1) // bm)])
     (y,) = _kernel()(
         inputs=[x.reshape(rows, k), w, scales, biases, tile_start, row_start],
         template=[
             ("T", x.dtype), ("GS", int(group_size)), ("BITS", int(bits)),
-            ("KD", k), ("ND", n), ("ED", experts), ("BM", BM), ("BN", BN), ("BK", BK),
+            ("KD", k), ("ND", n), ("ED", experts), ("BM", bm), ("BN", BN), ("BK", BK),
         ],
-        grid=((n // BN) * THREADS, rows // BM + experts, 1),
+        grid=((n // BN) * THREADS, rows // bm + experts, 1),
         threadgroup=(THREADS, 1, 1),
         output_shapes=[(rows, n)],
         output_dtypes=[x.dtype],
@@ -384,11 +395,11 @@ def _segmented(x, w, scales, biases, rhs_indices, *, group_size: int, bits: int)
     return y.reshape(rows, 1, n)
 
 
-def _tables(rhs_indices, experts: int):
+def _tables(rhs_indices, experts: int, bm: int = BM):
     counts = mx.zeros((experts,), dtype=mx.int32).at[rhs_indices.astype(mx.int32)].add(1)
     zero = mx.zeros((1,), dtype=mx.int32)
     row_start = mx.concatenate([zero, mx.cumsum(counts)])
-    tile_start = mx.concatenate([zero, mx.cumsum((counts + BM - 1) // BM)])
+    tile_start = mx.concatenate([zero, mx.cumsum((counts + bm - 1) // bm)])
     return tile_start, row_start
 
 
@@ -405,14 +416,15 @@ def gather_rows_qmm(tokens, row_map, w, scales, biases, rhs_indices, *, group_si
         return None
     experts, n = int(w.shape[0]), int(w.shape[1])
     rows, k = int(row_map.shape[0]), int(tokens.shape[-1])
-    tile_start, row_start = _tables(rhs_indices, experts)
+    bm = _bm_for(rows)
+    tile_start, row_start = _tables(rhs_indices, experts, bm)
     (y,) = kernel(
         inputs=[tokens.reshape(-1, k), w, scales, biases, tile_start, row_start, row_map.astype(mx.uint32)],
         template=[
             ("T", tokens.dtype), ("GS", int(group_size)), ("BITS", int(bits)),
-            ("KD", k), ("ND", n), ("ED", experts), ("BM", BM), ("BN", BN), ("BK", BK),
+            ("KD", k), ("ND", n), ("ED", experts), ("BM", bm), ("BN", BN), ("BK", BK),
         ],
-        grid=((n // BN) * THREADS, rows // BM + experts, 1),
+        grid=((n // BN) * THREADS, rows // bm + experts, 1),
         threadgroup=(THREADS, 1, 1),
         output_shapes=[(rows, n)],
         output_dtypes=[tokens.dtype],
