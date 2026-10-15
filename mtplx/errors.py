@@ -102,6 +102,28 @@ _ALLOCATION_FAILURE_MARKERS = (
 )
 
 
+# macOS aborting a GPU command buffer that stalled the display, or the GPU
+# hanging and restarting under it. The process survives; the command's
+# outputs are garbage, so the request must not continue on them.
+_GPU_DISPLAY_ABORT_MARKERS = (
+    "kiogpucommandbuffercallbackerrorimpactinginteractivity",
+    "kiogpucommandbuffercallbackerrorhang",
+    "kiogpucommandbuffercallbackerrorinnocentvictim",
+    "impacting interactivity",
+    "caused gpu hang",
+)
+
+
+def is_gpu_display_abort(exc: BaseException) -> bool:
+    """Whether ``exc`` is macOS aborting a GPU command (display stall or GPU
+    hang/restart), not a memory refusal or a programming error."""
+
+    if not isinstance(exc, RuntimeError) or is_allocation_failure(exc):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _GPU_DISPLAY_ABORT_MARKERS)
+
+
 def is_allocation_failure(exc: BaseException) -> bool:
     """Whether ``exc`` is the memory refusing an allocation.
 

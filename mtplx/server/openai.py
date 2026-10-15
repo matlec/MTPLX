@@ -140,6 +140,7 @@ from mtplx.constrained import (
 # Allocation failures the daemon survives as per-request memory errors
 # (mtplx.errors, shared with the generation's optional allocations).
 from mtplx.errors import is_allocation_failure as _is_allocation_failure
+from mtplx.errors import is_gpu_display_abort as _is_gpu_display_abort
 from mtplx.gemma4_pair import (
     GEMMA4_BACKEND,
     gemma4_pair_sampler_defaults,
@@ -269,6 +270,42 @@ ADVERTISED_SCHEDULER_MODES = tuple(
 )
 BATCHING_PRESET_CHOICES = tuple(preset.value for preset in SchedulerPreset)
 _STDOUT_LOGGING_BROKEN = False
+
+
+_FAKE_GPU_ABORT_STATE = {"checks": 0, "fired": 0}
+
+
+def _maybe_fake_gpu_display_abort() -> None:
+    """Test hook: MTPLX_DEBUG_FAKE_GPU_ABORT_AFTER_CHUNKS=k raises the macOS
+    display-abort error at the k-th prefill chunk check, once per process
+    (MTPLX_DEBUG_FAKE_GPU_ABORT_TIMES raises it that many times)."""
+    raw = os.environ.get("MTPLX_DEBUG_FAKE_GPU_ABORT_AFTER_CHUNKS")
+    if not raw:
+        return
+    arm_file = os.environ.get("MTPLX_DEBUG_FAKE_GPU_ABORT_ARM_FILE")
+    if arm_file and not os.path.exists(arm_file):
+        # Armed only while the file exists (count from the request after it).
+        return
+    times = int(os.environ.get("MTPLX_DEBUG_FAKE_GPU_ABORT_TIMES", "1"))
+    if _FAKE_GPU_ABORT_STATE["fired"] >= times:
+        return
+    _FAKE_GPU_ABORT_STATE["checks"] += 1
+    if _FAKE_GPU_ABORT_STATE["checks"] >= int(raw):
+        _FAKE_GPU_ABORT_STATE["checks"] = 0
+        _FAKE_GPU_ABORT_STATE["fired"] += 1
+        raise RuntimeError(
+            "[METAL] Command buffer execution failed: Impacting Interactivity "
+            "(0000000e:kIOGPUCommandBufferCallbackErrorImpactingInteractivity)"
+        )
+
+
+def _gpu_abort_retry_budget() -> int:
+    """Retries of a request whose GPU command macOS aborted before any token
+    (MTPLX_GPU_ABORT_RETRIES, default 2; 0 fails the request as before)."""
+    try:
+        return max(0, int(os.environ.get("MTPLX_GPU_ABORT_RETRIES", "2")))
+    except ValueError:
+        return 2
 
 
 def _safe_stdout_print(*values: Any, **kwargs: Any) -> bool:
@@ -31805,6 +31842,7 @@ def _run_generation(
             )
 
             def _prefill_abort_check() -> bool:
+                _maybe_fake_gpu_display_abort()
                 if cancel_event is not None and cancel_event.is_set():
                     return True
                 if _pressure_abort_requested(state):
@@ -31852,141 +31890,193 @@ def _run_generation(
             set_route_tape_sink(_emit_route_tape)
             if ttft_clock is not None:
                 ttft_clock.mark("admission")
-            with (
-                _temporary_env(request_env),
-                prefill_chunk_size_override(prefill_chunk_tokens),
-            ):
-                constraint = (
-                    constraint_spec.build(
-                        state.runtime.tokenizer, prompt_ids=prompt_ids
+            # macOS aborts a GPU command that stalls the display while the
+            # user is active (kIOGPUCommandBufferCallbackErrorImpactingInteractivity,
+            # or a full GPU hang/restart). Before any token is out, drop this
+            # session's possibly half-written entries and run the request again
+            # with shorter prefill chunks (shorter GPU commands) instead of
+            # failing it (omp on Qwen3.6-35B-A3B, turn-boundary re-prefills,
+            # 2026-10-14/15).
+            _gpu_abort_retries = 0
+            while True:
+                try:
+                    with (
+                        _temporary_env(request_env),
+                        prefill_chunk_size_override(prefill_chunk_tokens),
+                    ):
+                        constraint = (
+                            constraint_spec.build(
+                                state.runtime.tokenizer, prompt_ids=prompt_ids
+                            )
+                            if constraint_spec is not None
+                            else None
+                        )
+                        if effective_mode == "ar":
+                            out = generate_ar(
+                                state.runtime,
+                                prompt_ids,
+                                max_tokens=response_max,
+                                sampler=sampler,
+                                seed=generation_seed,
+                                first_token_logprobs_top_k=first_token_logprobs_top_k,
+                                token_callback=record_tokens,
+                                trace_label=trace_label,
+                                trace_metadata=trace_metadata,
+                                prefill_callback=_guarded_prefill_callback,
+                                # The repetition trimmer retracts already-committed
+                                # tokens, which would desync the grammar matcher;
+                                # constrained output is schema-shaped, not freeform.
+                                repetition_stop=(
+                                    False
+                                    if constraint is not None
+                                    else uncapped_repetition_stop
+                                ),
+                                loop_guard=_loop_guard_enabled(),
+                                thinking_guard=thinking_guard_config,
+                                constraint=constraint,
+                                # Warm-prefix parity with the MTP branch (#246): the
+                                # AR lane used to full-prefill unconditionally and
+                                # hardcode cached_tokens 0 / cache_hit false.
+                                session_bank=session_bank,
+                                session_id=session_id,
+                                session_restore_mode=_session_bank_restore_mode(
+                                    session_restore_mode
+                                ),
+                                session_template_hash=session_template_hash,
+                                session_draft_head_identity=session_draft_head_identity,
+                                session_policy_fingerprint=session_policy_fingerprint,
+                                capture_final_state=session_bank is not None,
+                                abort_check=_prefill_abort_check,
+                                store_prefix_snapshot=store_prefix_snapshot,
+                            )
+                        else:
+                            adaptive_policy = _make_adaptive_policy(
+                                state.args, max_depth=effective_depth
+                            )
+                            if vision_splice is not None and vision_splice.cursor:
+                                # Retries and tool-loop redispatches replay the
+                                # full prompt, so the image rows must rewind.
+                                vision_splice.reset()
+                            out = generate_mtpk(
+                                state.runtime,
+                                prompt_ids,
+                                constraint=constraint,
+                                vision_splice=vision_splice,
+                                first_token_logprobs_top_k=first_token_logprobs_top_k,
+                                abort_check=_prefill_abort_check,
+                                max_tokens=response_max,
+                                sampler=sampler,
+                                draft_sampler=effective_draft_sampler,
+                                speculative_depth=effective_depth,
+                                seed=generation_seed,
+                                mtp_hidden_variant="post_norm",
+                                mtp_cache_policy="persistent",
+                                mtp_history_policy=_bank_history_policy(state),
+                                verify_strategy=state.args.verify_strategy,
+                                verify_core=state.args.verify_core,
+                                draft_core=str(
+                                    getattr(state.args, "draft_core", None) or "stock"
+                                ),
+                                token_callback=record_tokens,
+                                session_bank=session_bank,
+                                session_id=session_id,
+                                session_restore_mode=_session_bank_restore_mode(
+                                    session_restore_mode
+                                ),
+                                session_template_hash=session_template_hash,
+                                session_draft_head_identity=session_draft_head_identity,
+                                session_policy_fingerprint=session_policy_fingerprint,
+                                capture_final_state=session_bank is not None,
+                                commit_prompt_state_to_bank=(
+                                    commit_prompt_prefix_to_bank
+                                    and session_bank is not None
+                                    and session_id is not None
+                                    and not prompt_publish_skipped
+                                ),
+                                # Prompt-prefix commits happen before decode mutates
+                                # the same KV/MTP cache objects. They must snapshot or
+                                # skip, not live-lease the mutable prompt cache.
+                                commit_prompt_state_keep_live_ref=False,
+                                trace_label=trace_label,
+                                trace_metadata=trace_metadata,
+                                prefill_callback=_guarded_prefill_callback,
+                                adaptive_policy=adaptive_policy,
+                                repetition_stop=uncapped_repetition_stop,
+                                loop_guard=_loop_guard_enabled(),
+                                thinking_guard=thinking_guard_config,
+                                online_correction_cache=bool(
+                                    state.args.online_correction_cache
+                                ),
+                                online_correction_cache_min_depth=int(
+                                    state.args.online_correction_cache_min_depth
+                                ),
+                                online_correction_cache_key=str(
+                                    state.args.online_correction_cache_key
+                                ),
+                                prompt_correction_cache=bool(
+                                    state.args.prompt_correction_cache
+                                ),
+                                prompt_correction_cache_min_depth=int(
+                                    state.args.prompt_correction_cache_min_depth
+                                ),
+                                online_hidden_corrector_alpha=float(
+                                    state.args.online_hidden_corrector_alpha
+                                ),
+                                online_hidden_corrector_decay=float(
+                                    state.args.online_hidden_corrector_decay
+                                ),
+                                online_hidden_corrector_warmup=int(
+                                    state.args.online_hidden_corrector_warmup
+                                ),
+                                online_hidden_corrector_max_feed_depth=(
+                                    state.args.online_hidden_corrector_max_feed_depth
+                                ),
+                                online_hidden_corrector_key=str(
+                                    state.args.online_hidden_corrector_key
+                                ),
+                                store_prefix_snapshot=store_prefix_snapshot,
+                            )
+                    break
+                except RuntimeError as _gpu_abort:
+                    if (
+                        not _is_gpu_display_abort(_gpu_abort)
+                        or token_times
+                        or _gpu_abort_retries >= _gpu_abort_retry_budget()
+                    ):
+                        raise
+                    _gpu_abort_retries += 1
+                    _gpu_abort.__traceback__ = None
+                    _shed = _own_session_shed("gpu_display_abort")
+                    try:
+                        import mlx.core as mx
+
+                        mx.clear_cache()
+                    except Exception:
+                        pass
+                    _divisor = max(
+                        1, int(os.environ.get("MTPLX_GPU_ABORT_RETRY_CHUNK_DIVISOR", "4"))
                     )
-                    if constraint_spec is not None
-                    else None
-                )
-                if effective_mode == "ar":
-                    out = generate_ar(
-                        state.runtime,
-                        prompt_ids,
-                        max_tokens=response_max,
-                        sampler=sampler,
-                        seed=generation_seed,
-                        first_token_logprobs_top_k=first_token_logprobs_top_k,
-                        token_callback=record_tokens,
-                        trace_label=trace_label,
-                        trace_metadata=trace_metadata,
-                        prefill_callback=_guarded_prefill_callback,
-                        # The repetition trimmer retracts already-committed
-                        # tokens, which would desync the grammar matcher;
-                        # constrained output is schema-shaped, not freeform.
-                        repetition_stop=(
-                            False
-                            if constraint is not None
-                            else uncapped_repetition_stop
-                        ),
-                        loop_guard=_loop_guard_enabled(),
-                        thinking_guard=thinking_guard_config,
-                        constraint=constraint,
-                        # Warm-prefix parity with the MTP branch (#246): the
-                        # AR lane used to full-prefill unconditionally and
-                        # hardcode cached_tokens 0 / cache_hit false.
-                        session_bank=session_bank,
-                        session_id=session_id,
-                        session_restore_mode=_session_bank_restore_mode(
-                            session_restore_mode
-                        ),
-                        session_template_hash=session_template_hash,
-                        session_draft_head_identity=session_draft_head_identity,
-                        session_policy_fingerprint=session_policy_fingerprint,
-                        capture_final_state=session_bank is not None,
-                        abort_check=_prefill_abort_check,
-                        store_prefix_snapshot=store_prefix_snapshot,
-                    )
-                else:
-                    adaptive_policy = _make_adaptive_policy(
-                        state.args, max_depth=effective_depth
-                    )
-                    if vision_splice is not None and vision_splice.cursor:
-                        # Retries and tool-loop redispatches replay the
-                        # full prompt, so the image rows must rewind.
-                        vision_splice.reset()
-                    out = generate_mtpk(
-                        state.runtime,
-                        prompt_ids,
-                        constraint=constraint,
-                        vision_splice=vision_splice,
-                        first_token_logprobs_top_k=first_token_logprobs_top_k,
-                        abort_check=_prefill_abort_check,
-                        max_tokens=response_max,
-                        sampler=sampler,
-                        draft_sampler=effective_draft_sampler,
-                        speculative_depth=effective_depth,
-                        seed=generation_seed,
-                        mtp_hidden_variant="post_norm",
-                        mtp_cache_policy="persistent",
-                        mtp_history_policy=_bank_history_policy(state),
-                        verify_strategy=state.args.verify_strategy,
-                        verify_core=state.args.verify_core,
-                        draft_core=str(
-                            getattr(state.args, "draft_core", None) or "stock"
-                        ),
-                        token_callback=record_tokens,
-                        session_bank=session_bank,
-                        session_id=session_id,
-                        session_restore_mode=_session_bank_restore_mode(
-                            session_restore_mode
-                        ),
-                        session_template_hash=session_template_hash,
-                        session_draft_head_identity=session_draft_head_identity,
-                        session_policy_fingerprint=session_policy_fingerprint,
-                        capture_final_state=session_bank is not None,
-                        commit_prompt_state_to_bank=(
-                            commit_prompt_prefix_to_bank
-                            and session_bank is not None
-                            and session_id is not None
-                            and not prompt_publish_skipped
-                        ),
-                        # Prompt-prefix commits happen before decode mutates
-                        # the same KV/MTP cache objects. They must snapshot or
-                        # skip, not live-lease the mutable prompt cache.
-                        commit_prompt_state_keep_live_ref=False,
-                        trace_label=trace_label,
-                        trace_metadata=trace_metadata,
-                        prefill_callback=_guarded_prefill_callback,
-                        adaptive_policy=adaptive_policy,
-                        repetition_stop=uncapped_repetition_stop,
-                        loop_guard=_loop_guard_enabled(),
-                        thinking_guard=thinking_guard_config,
-                        online_correction_cache=bool(
-                            state.args.online_correction_cache
-                        ),
-                        online_correction_cache_min_depth=int(
-                            state.args.online_correction_cache_min_depth
-                        ),
-                        online_correction_cache_key=str(
-                            state.args.online_correction_cache_key
-                        ),
-                        prompt_correction_cache=bool(
-                            state.args.prompt_correction_cache
-                        ),
-                        prompt_correction_cache_min_depth=int(
-                            state.args.prompt_correction_cache_min_depth
-                        ),
-                        online_hidden_corrector_alpha=float(
-                            state.args.online_hidden_corrector_alpha
-                        ),
-                        online_hidden_corrector_decay=float(
-                            state.args.online_hidden_corrector_decay
-                        ),
-                        online_hidden_corrector_warmup=int(
-                            state.args.online_hidden_corrector_warmup
-                        ),
-                        online_hidden_corrector_max_feed_depth=(
-                            state.args.online_hidden_corrector_max_feed_depth
-                        ),
-                        online_hidden_corrector_key=str(
-                            state.args.online_hidden_corrector_key
-                        ),
-                        store_prefix_snapshot=store_prefix_snapshot,
+                    if _divisor > 1:
+                        prefill_chunk_tokens = max(
+                            512, int(prefill_chunk_tokens or 2048) // _divisor
+                        )
+                    if request_observability is not None:
+                        request_observability.setdefault("gpu_display_aborts", []).append(
+                            {
+                                "error": str(_gpu_abort)[:200],
+                                "retry_prefill_chunk_tokens": prefill_chunk_tokens,
+                                "shed": _json_safe(_shed),
+                            }
+                        )
+                    _safe_stdout_print(
+                        "[mtplx] GPU command aborted by macOS; retrying the request "
+                        + json.dumps(
+                            {
+                                "retry": _gpu_abort_retries,
+                                "prefill_chunk_tokens": prefill_chunk_tokens,
+                                "error": str(_gpu_abort)[:160],
+                            }
+                        )
                     )
         except PostcommitAbort as _prefill_abort:
             # abort_check tripped inside the prefill. Three arms share it: a
