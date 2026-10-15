@@ -13767,6 +13767,7 @@ def generate_mtpk(
                     _cc_g = [int(x) for x in mx.argmax(_cc_accept[0], axis=-1).tolist()]
                 else:
                     mx.eval(_cc_accept)
+                _owner_progress_tick()
                 _cc_t_eval = time.perf_counter()
                 elapsed_verify = time.perf_counter() - started_forward
                 verify_forward_time += elapsed_verify

@@ -31,6 +31,8 @@ from typing import Any, Callable
 
 import mlx.core as mx
 
+from .progress_heartbeat import tick as _owner_progress_tick
+
 
 class ResidentUnsupported(RuntimeError):
     pass
@@ -404,6 +406,7 @@ def run_resident_rounds(
         rnd = inflight[0]
         tw = time.perf_counter()
         d, a0, a1, acc = (int(v) for v in rnd.out.tolist())
+        _owner_progress_tick()  # a settled round: the stream stall watchdog's heartbeat
         res.wait_s += time.perf_counter() - tw
         emitted = [d, a1] if acc else [a0]
         if any(t in stops for t in emitted) or host_committed + len(emitted) >= max_tokens:
@@ -817,6 +820,7 @@ def run_resident_rounds_sampled(
         rnd = inflight[0]
         tw = time.perf_counter()
         d, acc, bonus, corr = (int(v) for v in rnd.out.tolist())
+        _owner_progress_tick()
         res.wait_s += time.perf_counter() - tw
         host = _host_round(plan, sampler, rnd)
         device_emitted = [d, bonus] if acc else [corr]
