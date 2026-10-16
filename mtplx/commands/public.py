@@ -1446,6 +1446,12 @@ _M1_A3B_ENV = {
     "MTPLX_CCOPY_ADAPTIVE_BLOCK": "16",
     "MTPLX_CCOPY_BANK_ROUTE": "1",
     "MTPLX_CCOPY_BANK_MAX_LEN": "97",
+    # Exact prompt matches only: RAMP's mismatch-tolerant re-anchor (3-token
+    # anchors) is a loss next to short blocks (context_copy.ramp_fuzzy_enabled)
+    # and the adaptive block starts at 16. 3-turn conversation bench, decode
+    # with copy off / fuzzy on / fuzzy off: 103.9 / 96.5 / 103.8 tok/s at 2K,
+    # 82.2 / 76.6 / 80.2 at 32K (two rounds each, 2026-10-17).
+    "MTPLX_RAMP_FUZZY": "0",
     # Copy blocks of 17-80 rows through the MMA split-K attention (4-row
     # chunks) instead of the dequantized-state fallback past 16 rows. 85K
     # history, q8 KV: T=17 240 -> 127 ms, T=33 295 -> 232, T=65 480 -> 426;
