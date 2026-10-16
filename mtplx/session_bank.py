@@ -1016,6 +1016,36 @@ class SessionBankEntry:
         return best
 
 
+def _achievable_restore_point(entry: Any, matched: int, gap_limit: int) -> int:
+    """Where a restore from ``entry`` would actually resume for a prompt that
+    matches it for ``matched`` tokens: ``matched`` itself, except that a
+    hybrid entry resumes at its newest recurrent checkpoint at or below it
+    (generation's ``boundary_not_better`` gate; tiny gaps included).
+
+    Candidates are ranked by this, not by ``matched``: after an omp session ran
+    to 219K tokens its entry kept checkpoints 64K apart, and a prompt diverging
+    at 62,056 was served from it at 19,459 (70,078 tokens, 308 s re-read)
+    while the previous turn's 88K entry could resume at 61,952. Boundaries
+    still on disk are not loaded for the ranking (the entry ranks at
+    ``matched``, as before).
+    """
+
+    matched = int(matched)
+    del gap_limit
+    if not getattr(entry, "has_recurrent", False):
+        return matched
+    if not getattr(entry, "gdn_boundaries", None):
+        return matched
+    probe = getattr(entry, "recurrent_boundary_at_or_below", None)
+    if not callable(probe):
+        return matched
+    try:
+        boundary = probe(matched)
+    except Exception:
+        return matched
+    return int(boundary[0]) if boundary is not None else 0
+
+
 def _empty_cache_snapshot(cache: list[Any] | None) -> CacheSnapshot:
     size = len(cache or [])
     return CacheSnapshot(states=tuple(None for _ in range(size)), meta_states=tuple(None for _ in range(size)))
@@ -2127,7 +2157,14 @@ class SessionBank:
         )
         if cold_match is not None:
             matches.append(cold_match)
-        matches.sort(key=lambda item: (item[1], item[0].prefix_len), reverse=True)
+        matches.sort(
+            key=lambda item: (
+                _achievable_restore_point(item[0], int(item[1]), gap_limit),
+                item[1],
+                item[0].prefix_len,
+            ),
+            reverse=True,
+        )
         if matches:
             entry, matched = matches[0]
             cache_source = str(getattr(entry, "cache_source", "ram") or "ram")
