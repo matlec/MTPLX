@@ -46,9 +46,19 @@ def enabled() -> bool:
 
 
 def _attn_enabled() -> bool:
-    """``MTPLX_ANE_PREFILL_MOE_ATTN`` (default on with the pipeline): the attention layers' q/k/v too."""
+    """``MTPLX_ANE_PREFILL_MOE_ATTN=1`` (default off): the attention layers' q/k/v on the ANE too.
 
-    return (os.environ.get("MTPLX_ANE_PREFILL_MOE_ATTN") or "1").strip() != "0"
+    Off because it corrupted prefills: on the 35B-A3B a cold prefill of the first
+    130,000 chars of mtplx/server/openai.py (34,179 tokens) ended in all-NaN logits
+    (HTTP 500) on every one of 5 launches (m1.5 and later builds, with or without
+    the 32K context cap; 129,000 chars too, while 131,000, 125,000 and <=120,000
+    passed); with this part off, 0 of 5 at 125,000-131,000. Checking every
+    projection's output for finiteness (which syncs each one) made the failure
+    disappear, so it looks like an ordering race on the program's output buffer,
+    not overflow. The part saved ~3% of a 31K prefill (30.5 vs 31.4 s).
+    """
+
+    return (os.environ.get("MTPLX_ANE_PREFILL_MOE_ATTN") or "0").strip() == "1"
 
 
 def stats() -> dict[str, Any]:
