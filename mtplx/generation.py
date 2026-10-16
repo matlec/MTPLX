@@ -5679,6 +5679,7 @@ def _restore_near_prefix_prompt_state(
                     restore_point=restore_point,
                     system_edge=_system_prefix_edge(rt, prompt_ids),
                     stable_prefix_len=stable_prefix_len,
+                    query_edge=_last_query_edge(rt, prompt_ids),
                     image_spans=checkpoint_image_spans,
                 )
                 if _gdn_boundary_capture_enabled()
@@ -5844,6 +5845,44 @@ def _system_prefix_edge(rt: Any, prompt_ids: Sequence[int] | None) -> int | None
     return edge if 0 < edge < len(prompt_ids) - 1 else None
 
 
+def _last_query_edge(rt: Any, prompt_ids: Sequence[int] | None) -> int | None:
+    """Where the reply to the prompt's last real user message starts, or None.
+
+    The position of the ``<|im_start|>`` after the last ``<|im_start|>user``
+    turn that is not a tool result (``<tool_response>``); the checkpoint
+    anchors keep the newest checkpoint at or before it (``query_edge``).
+    ``MTPLX_QUERY_EDGE_ANCHOR=0`` turns it off.
+    """
+
+    if not prompt_ids or _env_falsey("MTPLX_QUERY_EDGE_ANCHOR"):
+        return None
+    tokenizer = getattr(rt, "tokenizer", None)
+    if tokenizer is None:
+        return None
+    try:
+        im_start = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        user_ids = list(tokenizer.encode("user\n", add_special_tokens=False))
+        tool_ids = list(tokenizer.encode("<tool_response>", add_special_tokens=False))
+    except Exception:
+        return None
+    if not isinstance(im_start, int) or im_start < 0 or not user_ids:
+        return None
+    ids = [int(token) for token in prompt_ids]
+    width = len(user_ids)
+    for index in range(len(ids) - 1, -1, -1):
+        if ids[index] != im_start or ids[index + 1 : index + 1 + width] != user_ids:
+            continue
+        body = index + 1 + width
+        if tool_ids and ids[body : body + len(tool_ids)] == tool_ids:
+            continue
+        try:
+            edge = ids.index(im_start, body)
+        except ValueError:
+            return None
+        return edge if 0 < edge < len(ids) else None
+    return None
+
+
 def _sink_system_edge(sink: Any) -> int | None:
     """The system edge a checkpoint sink's plan carries (None for a plain
     list or a sink built without one)."""
@@ -5875,6 +5914,7 @@ def _checkpoint_sink(
     restore_point: int | None = None,
     system_edge: int | None = None,
     stable_prefix_len: int | None = None,
+    query_edge: int | None = None,
     ceiling: int | None = None,
     image_spans: Sequence[tuple[int, int]] = (),
     cuts_forwards: bool = True,
@@ -5895,6 +5935,7 @@ def _checkpoint_sink(
             stable_prefix=(
                 None if stable_prefix_len is None else int(stable_prefix_len)
             ),
+            query_edge=None if query_edge is None else int(query_edge),
             ceiling=None if ceiling is None else int(ceiling),
             image_spans=tuple(
                 (int(start), int(end)) for start, end in (image_spans or ())
@@ -7286,6 +7327,7 @@ def restore_or_prefill_prompt_state(
                         restore_point=restored.entry.prefix_len,
                         system_edge=_system_prefix_edge(rt, prompt_ids),
                         stable_prefix_len=stable_prefix_len,
+                        query_edge=_last_query_edge(rt, prompt_ids),
                         image_spans=checkpoint_image_spans,
                         cuts_forwards=vision_splice is None,
                     )
@@ -7406,6 +7448,7 @@ def restore_or_prefill_prompt_state(
             prompt_len=len(prompt_ids),
             system_edge=_system_prefix_edge(rt, prompt_ids),
             stable_prefix_len=stable_prefix_len,
+            query_edge=_last_query_edge(rt, prompt_ids),
             image_spans=checkpoint_image_spans,
             cuts_forwards=vision_splice is None,
         )

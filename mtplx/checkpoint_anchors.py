@@ -27,6 +27,12 @@ frontier advances, in this order:
   three compactions matched 20.7-21.0K tokens and restored at 512, because
   the grid had thinned the 16,896 anchor away at 200K);
 * the stable prompt-prefix edge (the turn the tool-continuation hint rides);
+* the query edge: the newest checkpoint at or before the reply to the last
+  real user message (not a tool result). A Qwen3.6 template drops the
+  finished turn's ``<think>`` blocks when the next user message arrives, so
+  that message diverges right after this edge; across a turn's tool rounds
+  the grid had thinned it away (omp heptagon: divergences at 35,618 and
+  44,475 restored at 27,651 and 35,843);
 * the newest checkpoint;
 * a fixed absolute grid: the first checkpoint in every ``grid_tokens`` cell,
   thinned by halving its resolution when the budget cannot hold every cell
@@ -120,6 +126,7 @@ class AnchorPlan:
     restore_point: int | None = None
     system_edge: int | None = None
     stable_prefix: int | None = None
+    query_edge: int | None = None
     ceiling: int | None = None
     image_spans: tuple[tuple[int, int], ...] = ()
     grid_tokens: int = GRID_TOKENS
@@ -212,6 +219,11 @@ def retain_checkpoints(records: Iterable[Any], plan: AnchorPlan) -> list:
     if plan.ceiling is not None:
         limit = min(limit, int(plan.ceiling))
     below_limit = [position for position in positions if position <= limit]
+    below_query = (
+        [position for position in positions if position <= int(plan.query_edge)]
+        if plan.query_edge is not None
+        else []
+    )
     first_image = plan.first_image_start
     pre_image = (
         [position for position in positions if position <= first_image]
@@ -225,6 +237,7 @@ def retain_checkpoints(records: Iterable[Any], plan: AnchorPlan) -> list:
         plan.restore_point,
         plan.system_edge,
         plan.stable_prefix,
+        below_query[-1] if below_query else None,
         newest,
     ):
         if position is None:
