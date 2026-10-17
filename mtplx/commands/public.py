@@ -1572,6 +1572,30 @@ def _apply_m1_moe_defaults(
     )
 
 
+def _app_pinned_upstream_a3b_verify(args: Any) -> bool:
+    """True when the native app pinned upstream's A3B verify strategy on an M1.
+
+    The app's command builder passes ``--verify-strategy target_prefix`` for
+    Qwen3.6-35B-A3B whatever the machine; on the M1 family the fork's serial
+    default is ``capture_commit`` (see ``_m1_moe_verify_strategy``). Only an
+    app launch (``--app-launch-id``) on the serial scheduler is rewritten: a
+    person typing the flag, a batched scheduler (whose A3B lane requires
+    target_prefix) and ``MTPLX_M1_MOE_VERIFY_STRATEGY`` all keep their choice.
+    """
+
+    import os
+
+    if not getattr(args, "app_launch_id", None):
+        return False
+    if str(getattr(args, "verify_strategy", "") or "") != "target_prefix":
+        return False
+    if str(getattr(args, "scheduler_mode", "serial") or "serial") != "serial":
+        return False
+    if (os.environ.get("MTPLX_M1_MOE_VERIFY_STRATEGY") or "").strip():
+        return False
+    return _m1_moe_verify_strategy() == "capture_commit"
+
+
 def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None:
     # The -FP16 sibling shares the byte-identical INT packs and the measured
     # launch defaults; the app's substring detection already applied them to
@@ -1587,6 +1611,12 @@ def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None
         args.depth = 1
     if "verify-strategy" not in cli_flags:
         args.verify_strategy = _m1_moe_verify_strategy() or "target_prefix"
+    elif _app_pinned_upstream_a3b_verify(args):
+        # The native app always passes upstream's --verify-strategy
+        # target_prefix for this model, which kept the M1 A3B lane (resident
+        # rounds, context-copy: both ride capture_commit) off in every app
+        # chat: 54-64 tok/s vs 108 through the CLI (2026-10-17, same build).
+        args.verify_strategy = _m1_moe_verify_strategy()
     if "draft-temperature" not in cli_flags:
         args.draft_temperature = 0.6
         injected.add("draft-temperature")
