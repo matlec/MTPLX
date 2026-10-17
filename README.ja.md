@@ -29,7 +29,7 @@ M1 Max 64 GB、8bit の KV、長いプロンプトでの 3 ターンの会話で
 - 一度起動した [MTPLX アプリ](https://github.com/youssofal/MTPLX)（このフォークはアプリの Python 実行環境を使います。モデルはアプリのモデル画面からダウンロードします）
 
 ```bash
-git clone --branch v2.12.2-m1.6 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.7 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # 1 分ほど。「mfa_attn: ok」と「ane_ffn: ok」が出れば完了
 ```

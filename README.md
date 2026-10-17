@@ -33,7 +33,7 @@ work), and the [MTPLX app](https://github.com/youssofal/MTPLX) opened once: this
 and the models are downloaded from the app's model screen.
 
 ```bash
-git clone --branch v2.12.2-m1.6 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.7 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # about a minute; ends with "mfa_attn: ok" and "ane_ffn: ok"
 ```
