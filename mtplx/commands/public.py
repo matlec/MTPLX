@@ -1298,6 +1298,7 @@ def _resolved_default_profile_name(args: Any, model: str | None = None) -> str:
     if (
         model_id in _TURBO_DEFAULT_PUBLIC_MODEL_IDS
         or _artifact_recommended_profile(model_ref) == "turbo"
+        or _m1_turbo_default(model_ref)
     ):
         return "turbo"
     return current
