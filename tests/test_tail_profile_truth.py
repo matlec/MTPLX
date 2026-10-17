@@ -12,6 +12,8 @@ resolver so a future default-model flip cannot desynchronize them.
 from __future__ import annotations
 
 import json
+
+import pytest
 from pathlib import Path
 
 import mtplx.commands.forge as forge
@@ -78,6 +80,13 @@ def _speed_win_rows() -> list[dict]:
     ]
 
 
+@pytest.fixture(autouse=True)
+def _upstream_profile_rule(monkeypatch):
+    """These tests pin upstream's per-model rule; the M1 fork's every-model
+    turbo default (MTPLX_M1_TURBO_DEFAULT) has its own test below."""
+    monkeypatch.setenv("MTPLX_M1_TURBO_DEFAULT", "0")
+
+
 # ---------------------------------------------------------------------------
 # Resolver core
 # ---------------------------------------------------------------------------
@@ -91,6 +100,33 @@ def test_resolver_promotes_flagships_and_keeps_others_on_default():
         resolved_default_profile_name_for_ref("someorg/derivative-model")
         == DEFAULT_PROFILE_NAME
     )
+
+
+def test_resolver_m1_family_defaults_measured_qwen35_packs_to_turbo(monkeypatch, tmp_path):
+    monkeypatch.delenv("MTPLX_M1_TURBO_DEFAULT", raising=False)
+
+    def pack(name, model_type, bits):
+        d = tmp_path / name
+        d.mkdir()
+        (d / "config.json").write_text(json.dumps({
+            "model_type": model_type.replace("_text", ""),
+            "text_config": {"model_type": model_type},
+            "quantization": {"bits": bits, "group_size": 64, "mode": "affine"},
+        }))
+        return str(d)
+
+    moe = pack("a3b-finetune", "qwen3_5_moe_text", 4)
+    dense = pack("dense-derivative", "qwen3_5_text", 4)
+    six_bit = pack("six-bit", "qwen3_5_text", 6)
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "1")
+    assert resolved_default_profile_name_for_ref(moe) == "turbo"
+    assert resolved_default_profile_name_for_ref(dense) == "turbo"
+    assert resolved_default_profile_name_for_ref(six_bit) == DEFAULT_PROFILE_NAME
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "0")
+    assert resolved_default_profile_name_for_ref(moe) == DEFAULT_PROFILE_NAME
+    monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "1")
+    monkeypatch.setenv("MTPLX_M1_TURBO_DEFAULT", "0")
+    assert resolved_default_profile_name_for_ref(moe) == DEFAULT_PROFILE_NAME
 
 
 # ---------------------------------------------------------------------------

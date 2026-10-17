@@ -1196,6 +1196,47 @@ _TURBO_DEFAULT_PUBLIC_MODEL_IDS = frozenset(
 )
 
 
+def _m1_turbo_default(model_ref: Any = None) -> bool:
+    """M1 family: the measured Qwen3.5-family packs launch on turbo unless a
+    profile was chosen.
+
+    Turbo is sustained plus the verify kernels, the compiled verify and the
+    packed-GQA verify attention; the fork's M1 lanes were all measured on it.
+    Qwen3.6-35B-A3B through ``bin/mtplx serve`` with no ``--profile``
+    (sustained): 74.4 tok/s, turbo 109.7 tok/s (2026-10-17, same build).
+    Only 4- and 8-bit affine qwen3_5 / qwen3_5_moe / qwen3_next text models
+    (Qwen3.6-35B-A3B, its fine-tunes such as Ornith, Qwen3.8-27B and its
+    derivatives); other families keep upstream's no-unmeasured-promotion rule.
+    ``MTPLX_M1_TURBO_DEFAULT=0`` keeps the upstream sustained default.
+    """
+
+    import os
+
+    if (os.environ.get("MTPLX_M1_TURBO_DEFAULT") or "").strip() == "0":
+        return False
+    try:
+        from mtplx.cache_state import m1_long_context_defaults
+
+        if not m1_long_context_defaults():
+            return False
+    except Exception:
+        return False
+    if model_ref is None:
+        return False
+    try:
+        from mtplx.artifacts import load_config
+
+        config = load_config(model_ref)
+    except Exception:
+        return False
+    text = config.get("text_config") or config
+    model_type = str(text.get("model_type") or config.get("model_type") or "").lower()
+    if model_type not in {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next"}:
+        return False
+    quant = config.get("quantization") or config.get("quantization_config") or {}
+    return int(quant.get("bits") or 0) in (4, 8) and str(quant.get("mode") or "affine") == "affine"
+
+
 def _apply_model_default_profile(args: Any, model_id: str) -> bool:
     """Give the quantized 27B flagships the app's turbo default on the CLI.
 
@@ -1217,6 +1258,7 @@ def _apply_model_default_profile(args: Any, model_id: str) -> bool:
     if (
         model_id not in _TURBO_DEFAULT_PUBLIC_MODEL_IDS
         and _artifact_recommended_profile(model_ref) != "turbo"
+        and not _m1_turbo_default(model_ref)
     ):
         return False
     current = str(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
@@ -1276,6 +1318,7 @@ def resolved_default_profile_name_for_ref(model_ref: str | Path | None) -> str:
     if (
         public_model_id_for_ref(model_ref) in _TURBO_DEFAULT_PUBLIC_MODEL_IDS
         or _artifact_recommended_profile(model_ref) == "turbo"
+        or _m1_turbo_default(model_ref)
     ):
         return "turbo"
     return DEFAULT_PROFILE_NAME
