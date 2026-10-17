@@ -99,9 +99,11 @@ def measure(model: str, depth: int, port: int, max_tokens: int, context: int = 2
             _chat(port, prompt, 11 + i, max_tokens)
         rows = _decode_rows(port, since)
     finally:
-        os.killpg(proc.pid, signal.SIGINT)
         try:
+            os.killpg(proc.pid, signal.SIGINT)
             proc.wait(timeout=60)
+        except ProcessLookupError:
+            pass  # the server already exited (its log says why)
         except subprocess.TimeoutExpired:
             os.killpg(proc.pid, signal.SIGKILL)
         log.close()
@@ -154,7 +156,8 @@ def main() -> None:
         try:
             results.append(measure(model, depth, a.port, a.max_tokens, a.context_window, a.kv))
         except Exception as exc:  # a depth the runtime refuses must not stop the sweep
-            results.append({"depth": depth, "error": str(exc)[:200]})
+            log = Path(os.environ.get("TMPDIR", "/tmp")) / f"m1-depth-sweep-{a.port}.log"
+            results.append({"depth": depth, "error": str(exc)[:200], "server_log": str(log)})
         print(json.dumps(results[-1]), flush=True)
     ok = [r for r in results if r.get("decode_tok_s")]
     if not ok:
