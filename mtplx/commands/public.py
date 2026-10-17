@@ -1554,6 +1554,40 @@ def _m1_moe_lane_env(
     return {key: value for key, value in env.items() if key not in os.environ}
 
 
+def _qwen36_a3b_geometry(model_path: Any) -> bool:
+    """M1 family: a pack with Qwen3.6-35B-A3B's exact geometry and INT4 g64 body.
+
+    The M1 A3B lane's kernels are written for 256 experts / top-8 / 2048 hidden
+    over 40 layers (``_M1_A3B_ENV``). Fine-tunes such as Ornith-1.5-35B-A3B
+    share the shape, so they take the lane and the measured A3B launch
+    defaults like the Youssofal packs instead of matching by id; an fp16 MTP
+    sidecar is brought to the official pack's q4 g32 experts at load
+    (``mtp_patch._qwen36_a3b_text_geometry``).
+    """
+
+    try:
+        from mtplx.cache_state import m1_long_context_defaults
+
+        if not m1_long_context_defaults() or model_path is None:
+            return False
+        from mtplx.artifacts import load_config
+
+        config = load_config(model_path)
+    except Exception:
+        return False
+    text = config.get("text_config") or config
+    quant = config.get("quantization") or config.get("quantization_config") or {}
+    return (
+        str(text.get("model_type") or "").lower().startswith("qwen3_5_moe")
+        and int(text.get("num_experts") or 0) == 256
+        and int(text.get("num_experts_per_tok") or 0) == 8
+        and int(text.get("hidden_size") or 0) == 2048
+        and int(text.get("num_hidden_layers") or 0) == 40
+        and int(quant.get("bits") or 0) == 4
+        and int(quant.get("group_size") or 0) == 64
+    )
+
+
 def _apply_m1_moe_defaults(
     args: Any, inspection: dict[str, Any], model_id: str, model_path: Any
 ) -> None:
@@ -1562,7 +1596,7 @@ def _apply_m1_moe_defaults(
     a3b = model_id in {
         QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
         QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
-    }
+    } or _qwen36_a3b_geometry(model_path)
     args._child_env_defaults = _m1_moe_lane_env(
         moe=a3b or _config_is_moe(model_path),
         gdn=_inspection_backend_id(inspection) == "qwen3_next",
@@ -1595,14 +1629,16 @@ def _app_pinned_upstream_a3b_verify(args: Any) -> bool:
     return _m1_moe_verify_strategy() == "capture_commit"
 
 
-def _apply_qwen36_35b_optimized_speed_defaults(args: Any, model_id: str) -> None:
+def _apply_qwen36_35b_optimized_speed_defaults(
+    args: Any, model_id: str, model_path: Any = None
+) -> None:
     # The -FP16 sibling shares the byte-identical INT packs and the measured
     # launch defaults; the app's substring detection already applied them to
     # it while this exact-id gate skipped it (2026-08-03 parity audit).
     if model_id not in {
         QWEN36_35B_OPTIMIZED_SPEED_PUBLIC_MODEL_ID,
         QWEN36_35B_OPTIMIZED_SPEED_FP16_PUBLIC_MODEL_ID,
-    }:
+    } and not _qwen36_a3b_geometry(model_path):
         return
     cli_flags = getattr(args, "_cli_flags", set()) or set()
     injected = set(getattr(args, "_injected_default_flags", set()) or set())
@@ -10278,7 +10314,7 @@ def cmd_serve_public(args: Any) -> int:
         profile = get_profile(args.profile)
     _apply_model_contract_depth_default(args, inspection, profile)
     _apply_backend_serve_defaults(args, inspection)
-    _apply_qwen36_35b_optimized_speed_defaults(args, model_id)
+    _apply_qwen36_35b_optimized_speed_defaults(args, model_id, runtime_model)
     _apply_m1_moe_defaults(args, inspection, model_id, runtime_model)
     backend_descriptor = descriptor_from_inspection(inspection)
     draft_lm_head = _model_draft_lm_head_spec(inspection, profile) or {

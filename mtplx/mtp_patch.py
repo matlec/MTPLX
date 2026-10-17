@@ -286,6 +286,21 @@ def _text_model(model: Any) -> Any:
     return getattr(model, "language_model", model)
 
 
+def _qwen36_a3b_text_geometry(tcfg: dict) -> bool:
+    """Qwen3.6-35B-A3B's exact text geometry (the M1 A3B lane's kernels' shape)."""
+
+    try:
+        return (
+            str(tcfg.get("model_type") or "").lower().startswith("qwen3_5_moe")
+            and int(tcfg.get("num_experts") or 0) == 256
+            and int(tcfg.get("num_experts_per_tok") or 0) == 8
+            and int(tcfg.get("hidden_size") or 0) == 2048
+            and int(tcfg.get("num_hidden_layers") or 0) == 40
+        )
+    except (TypeError, ValueError):
+        return False
+
+
 def _quantize_mtp_module(mtp: Any, contract: MTPContract) -> None:
     import mlx.nn as nn
 
@@ -846,6 +861,7 @@ def inject_mtp_support(
 
     mtp = _MTPModule(args, n_layers)
     _env_mtp_bits = os.environ.get("MTPLX_MTP_QUANT_BITS", "").strip()
+    _a3b_experts_q4g32 = False
     if not _env_mtp_bits:
         # M1 family default (2026-10-13): an fp16 sidecar's layer is 0.85 GB a draft step reads;
         # q8 halves it (draft -3 ms/round, decode +0.9% at 2K, +1.9% at 32K on an M1 Max).
@@ -853,6 +869,17 @@ def inject_mtp_support(
 
         if m1_long_context_defaults():
             _env_mtp_bits = "8"
+            if (
+                not contract.mtp_prequantized
+                and contract.mtp_quant_bits is None
+                and _qwen36_a3b_text_geometry(tcfg)
+            ):
+                # A Qwen3.6-35B-A3B fine-tune forged with an fp16 MTP sidecar (Ornith-1.5):
+                # quantize only the routed experts to 4-bit g32, the layout the official
+                # Optimized-Speed pack ships, so the M1 A3B lane's MTP whole-MoE binding
+                # (mtp_dense_q4g32_dense) accepts it; router, shared expert and attention
+                # stay fp16 as in that pack.
+                _a3b_experts_q4g32 = True
     if _env_mtp_bits in {"0", "16", "off"}:
         _env_mtp_bits = ""
     if _env_mtp_bits and not contract.mtp_prequantized and contract.mtp_quant_bits is None:
@@ -862,7 +889,16 @@ def inject_mtp_support(
     if contract.mtp_prequantized:
         _quantize_mtp_module(mtp, contract)
     mtp.load_weights(list(mtp_weights.items()), strict=False)
-    if not contract.mtp_prequantized:
+    if _a3b_experts_q4g32:
+        nn.quantize(
+            mtp,
+            group_size=32,
+            bits=4,
+            mode="affine",
+            class_predicate=lambda path, module: hasattr(module, "to_quantized")
+            and ".switch_mlp." in f".{path}.",
+        )
+    elif not contract.mtp_prequantized:
         _quantize_mtp_module(mtp, contract)
     mx.eval(mtp.parameters())
 

@@ -243,6 +243,30 @@ def prepare_a3b_gdn_postconv(
         _fail_a3b_gdn_postconv_configuration(
             "A3B GDN postconv topology requires all 30 GDN modules"
         )
+    # The scalar type follows the weights, not the config's dtype string: a fine-tune
+    # forged to fp16 (Ornith-1.5-35B-A3B) keeps "dtype": "bfloat16" in its config and a
+    # bf16 A_log beside fp16 dt_bias / conv weights. The small GDN parameters are brought
+    # to the norm weight's type (fp16 on the M1 packs); every other tensor is untouched.
+    def _half_dtype(value: Any) -> Any:
+        dtype = getattr(value, "dtype", None)
+        if not isinstance(dtype, mx.Dtype):
+            return None
+        return dtype if dtype in (mx.float16, mx.bfloat16) else None
+
+    weight_dtype = _half_dtype(getattr(getattr(layers[0], "input_layernorm", None), "weight", None))
+    if weight_dtype is not None:
+        moe_scalar.set_scalar(weight_dtype)
+        for gdn in gdns:
+            for name in ("A_log", "dt_bias"):
+                value = getattr(gdn, name, None)
+                current = _half_dtype(value)
+                if current is not None and current != weight_dtype:
+                    setattr(gdn, name, value.astype(weight_dtype))
+            conv = getattr(gdn, "conv1d", None)
+            cw = getattr(conv, "weight", None)
+            current = _half_dtype(cw)
+            if current is not None and current != weight_dtype:
+                conv.weight = cw.astype(weight_dtype)
 
     config_geometry = {
         "linear_num_value_heads": 32,
