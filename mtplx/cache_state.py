@@ -2162,14 +2162,16 @@ class VllmMetalPagedKVCache:
         """A short window (a tool result or user message appended to a deep
         cached history) over the q8 pages on the split-K MMA kernel, or None.
 
-        ``MTPLX_KV_QUANT_SPLITK_MAX_Q`` rows at most (default 0 = off). The
+        ``MTPLX_KV_QUANT_SPLITK_MAX_Q`` rows at most (default 96 on the M1
+        family, 0 elsewhere; the A3B lane sets it explicitly). The
         prefill route dequantizes the whole prefix per layer and its kernel
         takes ~60 ms flat for up to 64 rows at 160K; the split-K kernel reads
         the pages in place at ~0.63 ms per row. One layer, 160K: 32 rows
         59.7 -> 20.7 ms, 96 rows 69.8 -> 60.9 ms (128 rows: 69.7 vs 81.0).
         """
         try:
-            cap = int(os.environ.get("MTPLX_KV_QUANT_SPLITK_MAX_Q") or 0)
+            raw = os.environ.get("MTPLX_KV_QUANT_SPLITK_MAX_Q")
+            cap = int(raw) if raw not in (None, "") else (96 if m1_long_context_defaults() else 0)
         except ValueError:
             cap = 0
         q_len = int(queries.shape[2])
