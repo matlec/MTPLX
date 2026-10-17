@@ -102,7 +102,7 @@ def test_resolver_promotes_flagships_and_keeps_others_on_default():
     )
 
 
-def test_resolver_m1_family_defaults_measured_qwen35_packs_to_turbo(monkeypatch, tmp_path):
+def test_resolver_m1_family_defaults_qwen35_family_packs_to_turbo(monkeypatch, tmp_path):
     monkeypatch.delenv("MTPLX_M1_TURBO_DEFAULT", raising=False)
 
     def pack(name, model_type, bits):
@@ -118,10 +118,12 @@ def test_resolver_m1_family_defaults_measured_qwen35_packs_to_turbo(monkeypatch,
     moe = pack("a3b-finetune", "qwen3_5_moe_text", 4)
     dense = pack("dense-derivative", "qwen3_5_text", 4)
     six_bit = pack("six-bit", "qwen3_5_text", 6)
+    other = pack("other-family", "llama", 4)
     monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "1")
     assert resolved_default_profile_name_for_ref(moe) == "turbo"
     assert resolved_default_profile_name_for_ref(dense) == "turbo"
-    assert resolved_default_profile_name_for_ref(six_bit) == DEFAULT_PROFILE_NAME
+    assert resolved_default_profile_name_for_ref(six_bit) == "turbo"
+    assert resolved_default_profile_name_for_ref(other) == DEFAULT_PROFILE_NAME
     monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "0")
     assert resolved_default_profile_name_for_ref(moe) == DEFAULT_PROFILE_NAME
     monkeypatch.setenv("MTPLX_M1_LONG_CONTEXT", "1")

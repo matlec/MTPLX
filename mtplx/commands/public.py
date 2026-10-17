@@ -1197,16 +1197,18 @@ _TURBO_DEFAULT_PUBLIC_MODEL_IDS = frozenset(
 
 
 def _m1_turbo_default(model_ref: Any = None) -> bool:
-    """M1 family: the measured Qwen3.5-family packs launch on turbo unless a
-    profile was chosen.
+    """M1 family: every Qwen3.5 / 3.6 / 3.8-family pack launches on turbo unless
+    a profile was chosen.
 
     Turbo is sustained plus the verify kernels, the compiled verify and the
     packed-GQA verify attention; the fork's M1 lanes were all measured on it.
     Qwen3.6-35B-A3B through ``bin/mtplx serve`` with no ``--profile``
     (sustained): 74.4 tok/s, turbo 109.7 tok/s (2026-10-17, same build).
-    Only 4- and 8-bit affine qwen3_5 / qwen3_5_moe / qwen3_next text models
-    (Qwen3.6-35B-A3B, its fine-tunes such as Ornith, Qwen3.8-27B and its
-    derivatives); other families keep upstream's no-unmeasured-promotion rule.
+    The family is read from the pack's config (``model_type`` qwen3_5*,
+    qwen3_6*, qwen3_8* or qwen3_next), so fine-tunes and re-quantized packs
+    (Ornith, huihui, the user's own forges) follow without being listed; a
+    quantization turbo's kernels do not cover falls back to the stock matmul
+    per call. Other families keep upstream's no-unmeasured-promotion rule.
     ``MTPLX_M1_TURBO_DEFAULT=0`` keeps the upstream sustained default.
     """
 
@@ -1229,12 +1231,9 @@ def _m1_turbo_default(model_ref: Any = None) -> bool:
         config = load_config(model_ref)
     except Exception:
         return False
-    text = config.get("text_config") or config
-    model_type = str(text.get("model_type") or config.get("model_type") or "").lower()
-    if model_type not in {"qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next"}:
-        return False
-    quant = config.get("quantization") or config.get("quantization_config") or {}
-    return int(quant.get("bits") or 0) in (4, 8) and str(quant.get("mode") or "affine") == "affine"
+    text = config.get("text_config") or {}
+    types = {str(text.get("model_type") or "").lower(), str(config.get("model_type") or "").lower()}
+    return any(t.startswith(("qwen3_5", "qwen3_6", "qwen3_8", "qwen3_next")) for t in types if t)
 
 
 def _apply_model_default_profile(args: Any, model_id: str) -> bool:
