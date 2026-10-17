@@ -26261,6 +26261,70 @@ def _memory_stop_message(memory_stop: Mapping[str, Any]) -> str:
     )
 
 
+# Keys a client reads off a stream's final chunk (the Mac app's typed fields and
+# its decode-rate fallbacks, the benchmark adapters); they survive the size cap.
+STREAM_STATS_CORE_KEYS = frozenset(
+    {
+        "completion_tokens", "prompt_tokens", "cached_tokens", "new_prefill_tokens",
+        "decode_elapsed_s", "decode_tok_s", "ttft_s", "request_elapsed_s",
+        "prefill_tok_s", "prefill_compute_tok_s", "prompt_eval_time_s",
+        "accepted_drafts", "drafted_tokens", "accepted_by_depth", "drafted_by_depth",
+        "verify_calls", "verify_time_s", "cache_source", "session_cache_hit",
+        "cache_miss_reason", "cache_restore_time_s", "ssd_cache_hit",
+        "ssd_cached_tokens", "ssd_suffix_tokens", "ssd_restore_s", "mtp_depth",
+        "context_len", "peak_memory_bytes", "active_memory_bytes", "finish_reason",
+        "generation_mode", "mode", "profile", "session_id", "request_id",
+        "context_copy_rounds", "context_copy_accepted_tokens", "resident_decode",
+    }
+)
+
+
+def _stream_stats_cap_bytes() -> int:
+    """``MTPLX_STREAM_STATS_MAX_BYTES``: the largest ``mtplx_stats`` a stream's final
+    chunk carries (default 12,000; 0 = no cap). OpenCode 2 fails a stream with
+    SseEventTooLarge when one SSE event passes its limit, and the full envelope
+    (~430 keys) was 17-19 KB. Everything stays on ``/metrics``."""
+
+    raw = os.environ.get("MTPLX_STREAM_STATS_MAX_BYTES")
+    try:
+        return 12000 if raw is None or not raw.strip() else max(0, int(raw))
+    except ValueError:
+        return 12000
+
+
+def _cap_stream_stats(
+    public: dict[str, Any], headers: Mapping[str, str] | None, cap: int | None = None
+) -> dict[str, Any]:
+    """Fit a stream's ``mtplx_stats`` under the byte cap. The Mac app
+    (``X-MTPLX-Client: mtplx_app``) keeps the full envelope. Otherwise the core
+    keys, every key outside the public list (stamped only when something
+    happened) and every ``*tok_s`` key stay, then the rest in order while they fit."""
+
+    cap = _stream_stats_cap_bytes() if cap is None else cap
+    if cap <= 0 or len(json.dumps(public)) <= cap:
+        return public
+    lowered = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+    if lowered.get("x-mtplx-client") == "mtplx_app":
+        return public
+    public_keys = set(PUBLIC_MTPLX_STATS_KEYS)
+
+    def cost(key: str) -> int:
+        return len(json.dumps(key)) + len(json.dumps(public[key])) + 4
+
+    keep = {
+        k for k in public
+        if k in STREAM_STATS_CORE_KEYS or k not in public_keys or "tok_s" in k
+    }
+    size = 2 + sum(cost(k) for k in keep)
+    for key in public:
+        if key not in keep and size + cost(key) <= cap:
+            keep.add(key)
+            size += cost(key)
+    out = {k: v for k, v in public.items() if k in keep}
+    out["stats_trimmed"] = {"kept": len(out), "of": len(public), "limit_bytes": cap}
+    return out
+
+
 def _public_mtplx_stats(generated: dict[str, Any]) -> dict[str, Any]:
     stats = generated.get("stats") or {}
     public = {key: stats[key] for key in PUBLIC_MTPLX_STATS_KEYS if key in stats}
@@ -42700,7 +42764,7 @@ def create_app(state: ServerState) -> FastAPI:
                         }
                     ],
                     "usage": _usage_payload(generated),
-                    "mtplx_stats": _public_mtplx_stats(generated),
+                    "mtplx_stats": _cap_stream_stats(_public_mtplx_stats(generated), headers),
                     "timings": _build_timings(generated),
                 }
                 yield mark_sse_sent(f"data: {json.dumps(done)}\n\n")
@@ -43652,7 +43716,7 @@ def create_app(state: ServerState) -> FastAPI:
                         {"index": 0, "text": "", "finish_reason": finish_reason}
                     ],
                     "usage": _usage_payload(generated),
-                    "mtplx_stats": _public_mtplx_stats(generated),
+                    "mtplx_stats": _cap_stream_stats(_public_mtplx_stats(generated), headers),
                     "timings": _build_timings(generated),
                 }
                 yield f"data: {json.dumps(final_payload)}\n\n"
