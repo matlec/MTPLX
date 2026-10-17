@@ -3,7 +3,8 @@
 
     scripts/m1-depth-sweep.py --model ~/.mtplx/models/<pack> [--depths 1,2,3] [--apply-app]
 
-Each depth starts ``bin/mtplx serve`` on its own port with ``--profile turbo`` (the profile the
+Each depth starts ``bin/mtplx serve`` on its own port with ``--profile turbo`` and the app's and
+omp's serving shape (256K context, q8 KV; ``--context-window`` / ``--kv`` change it) (turbo is the profile the
 fork's M1 lanes are measured on; the app's own tune ran under sustained), sends three short
 prompts with thinking on (temperature 0.6, fixed seeds, 1,500 tokens), reads the decode speed
 from the server's request log and stops the server. ``--apply-app`` writes the winner into the
@@ -81,11 +82,12 @@ def _decode_rows(port: int, since: float) -> list[dict]:
     return rows
 
 
-def measure(model: str, depth: int, port: int, max_tokens: int) -> dict:
+def measure(model: str, depth: int, port: int, max_tokens: int, context: int = 262144, kv: str = "q8") -> dict:
     cmd = [
         str(ROOT / "bin" / "mtplx"), "serve", "--model", model, "--depth", str(depth),
         "--profile", "turbo", "--host", "127.0.0.1", "--port", str(port), "--no-auth", "--yes",
         "--warmup-tokens", "0", "--ssd-session-cache", "off",
+        "--context-window", str(context), "--paged-kv-quantization", kv,
     ]
     log = open(Path(os.environ.get("TMPDIR", "/tmp")) / f"m1-depth-sweep-{port}.log", "w")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -141,6 +143,8 @@ def main() -> None:
     ap.add_argument("--depths", default="1,2,3")
     ap.add_argument("--port", type=int, default=18190)
     ap.add_argument("--max-tokens", type=int, default=1500)
+    ap.add_argument("--context-window", type=int, default=262144, help="as the app and omp serve (256K)")
+    ap.add_argument("--kv", default="q8", help="--paged-kv-quantization, as the app and omp serve (q8)")
     ap.add_argument("--apply-app", action="store_true", help="write the fastest depth into the MTPLX app's settings")
     a = ap.parse_args()
     model = str(Path(a.model).expanduser())
@@ -148,7 +152,7 @@ def main() -> None:
     for depth in [int(d) for d in a.depths.split(",")]:
         print(f"[depth-sweep] depth {depth} ...", file=sys.stderr, flush=True)
         try:
-            results.append(measure(model, depth, a.port, a.max_tokens))
+            results.append(measure(model, depth, a.port, a.max_tokens, a.context_window, a.kv))
         except Exception as exc:  # a depth the runtime refuses must not stop the sweep
             results.append({"depth": depth, "error": str(exc)[:200]})
         print(json.dumps(results[-1]), flush=True)
