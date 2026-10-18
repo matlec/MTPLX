@@ -1161,6 +1161,29 @@ class TestPerChunkSupplyCheck:
         assert guard.shed["released_bytes_total"] == 4 * GIB
         assert guard.tripped is None
 
+    def test_one_check_sheds_again_when_a_round_left_the_mac_short(self, monkeypatch):
+        """The same 128K prompt with the fix above: its round freed 2.26 GB
+        against a 1.29 GB target and the floor was still missed with 9.1 GB
+        banked. The same check sheds again while rounds still free memory."""
+
+        released = []
+
+        def own_session_shed(reason):
+            released.append(reason)
+            box["active"] -= 1 * GIB
+            return {"held_bytes": 1 * GIB, "entries": 1}
+
+        guard, box = self._founder_guard(
+            monkeypatch,
+            self._HELD + 2 * GIB,
+            chunk_reserve_bytes=self._CHUNK,
+            own_session_shed=own_session_shed,
+        )
+        assert guard() is False
+        assert len(released) >= 2
+        assert guard.shed["request_continued"] is True
+        assert guard.tripped is None
+
     def test_no_second_shed_after_a_round_that_freed_nothing(self, monkeypatch):
         calls = []
 

@@ -20674,7 +20674,7 @@ class _PrefillSystemGuard:
         self.last_read_s = now_s
         self.checks += 1
         verdict = self._evaluate()
-        if verdict["reason"] is not None and self._may_shed_again():
+        while verdict["reason"] is not None and self._may_shed_again():
             # The engine's own reusable memory goes back before a request is
             # refused, and the Mac is read again. A long prefill keeps growing
             # after a shed that covered one chunk's shortfall, so a later
@@ -20682,6 +20682,10 @@ class _PrefillSystemGuard:
             # something: a cold 128K prompt on a 27B after three idle
             # conversations (8K/32K/64K) was refused with 11.55 GB of their
             # bank entries still in RAM, because only the first round ran.
+            # A round can also free its target and leave the Mac short (the
+            # same prompt: 2.26 GB released against a 1.29 GB target, the
+            # floor still missed with 9.1 GB banked), so the same check
+            # sheds again while rounds still free memory.
             receipt = self._shed_reusable_memory(verdict)
             if receipt.get("released_bytes") or receipt.get("pool_bytes"):
                 verdict = self._evaluate()
