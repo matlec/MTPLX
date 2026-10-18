@@ -20603,8 +20603,11 @@ class _PrefillSystemGuard:
         self.last_read_s: float | None = None
         self.tripped: dict[str, Any] | None = None
         # What the engine gave back before deciding to stop this request
-        # (at most once per request), and whether the request then went on.
+        # (again on a later chunk while the previous round still freed memory,
+        # see _may_shed_again), and whether the request then went on.
         self.shed: dict[str, Any] | None = None
+        self.shed_rounds = 0
+        self._last_shed_released = 0
         self.checks = 0
         caps = getattr(state, "metal_memory_caps", None)
         limit = caps.get("memory_limit_bytes") if isinstance(caps, dict) else None
@@ -20615,6 +20618,17 @@ class _PrefillSystemGuard:
             stats = _mlx_memory_stats_live()
             if _allocator_reading_failure(stats) is None:
                 self.base_held = self._request_held(stats)
+
+    _MAX_SHED_ROUNDS = 8
+
+    def _may_shed_again(self) -> bool:
+        """The first shortfall always sheds; a later one only while the
+        previous round still released memory (idle conversations remain),
+        at most ``_MAX_SHED_ROUNDS`` rounds per request."""
+
+        if self.shed is None:
+            return True
+        return self._last_shed_released > 0 and self.shed_rounds < self._MAX_SHED_ROUNDS
 
     def _request_held(self, stats: Mapping[str, Any]) -> int:
         """MLX's active memory less what the bank and its queued jobs hold:
@@ -20660,14 +20674,27 @@ class _PrefillSystemGuard:
         self.last_read_s = now_s
         self.checks += 1
         verdict = self._evaluate()
-        if verdict["reason"] is not None and self.shed is None:
+        if verdict["reason"] is not None and self._may_shed_again():
             # The engine's own reusable memory goes back before a request is
-            # refused, and the Mac is read again.
-            self.shed = self._shed_reusable_memory(verdict)
-            if self.shed.get("released_bytes") or self.shed.get("pool_bytes"):
+            # refused, and the Mac is read again. A long prefill keeps growing
+            # after a shed that covered one chunk's shortfall, so a later
+            # chunk sheds again while the previous round still freed
+            # something: a cold 128K prompt on a 27B after three idle
+            # conversations (8K/32K/64K) was refused with 11.55 GB of their
+            # bank entries still in RAM, because only the first round ran.
+            receipt = self._shed_reusable_memory(verdict)
+            if receipt.get("released_bytes") or receipt.get("pool_bytes"):
                 verdict = self._evaluate()
-            self.shed["request_continued"] = verdict["reason"] is None
-            self.shed["reason_before"] = self.shed.pop("_reason_before", None)
+            receipt["request_continued"] = verdict["reason"] is None
+            receipt["reason_before"] = receipt.pop("_reason_before", None)
+            self.shed_rounds += 1
+            receipt["round"] = self.shed_rounds
+            self._last_shed_released = int(receipt.get("released_bytes") or 0)
+            if self.shed is not None:
+                receipt["released_bytes_total"] = int(
+                    self.shed.get("released_bytes_total") or self.shed.get("released_bytes") or 0
+                ) + self._last_shed_released
+            self.shed = receipt
             _record_guard_event(self.state, dict(self.shed))
             try:
                 print(

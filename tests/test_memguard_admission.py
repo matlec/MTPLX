@@ -1133,6 +1133,57 @@ class TestPerChunkSupplyCheck:
         assert guard.shed["own_session_released_bytes"] == 2_793_632_912
         assert guard.shed["request_continued"] is True
 
+    def test_a_later_chunk_sheds_again_while_shedding_still_frees(self, monkeypatch):
+        """2026-10-18, M1 Max 64 GB: a cold 128K prompt on the 27B after three
+        idle conversations shed one of them on its first shortfall, went on,
+        and was refused at a later chunk with 11.55 GB of the others' bank
+        entries still in RAM. Each later shortfall sheds again while the
+        previous round still freed something."""
+
+        released = []
+
+        def own_session_shed(reason):
+            released.append(reason)
+            box["active"] -= 2 * GIB
+            return {"held_bytes": 2 * GIB, "entries": 1}
+
+        guard, box = self._founder_guard(
+            monkeypatch,
+            self._HELD + 1 * GIB,
+            chunk_reserve_bytes=self._CHUNK,
+            own_session_shed=own_session_shed,
+        )
+        assert guard() is False           # first shortfall: shed, go on
+        box["active"] += 2 * GIB          # the prefill keeps growing
+        assert guard() is False           # second shortfall: shed again, go on
+        assert len(released) == 2
+        assert guard.shed["round"] == 2
+        assert guard.shed["released_bytes_total"] == 4 * GIB
+        assert guard.tripped is None
+
+    def test_no_second_shed_after_a_round_that_freed_nothing(self, monkeypatch):
+        calls = []
+
+        def own_session_shed(reason):
+            calls.append(reason)
+            if len(calls) == 1:
+                box["active"] -= 2 * GIB
+                return {"held_bytes": 2 * GIB, "entries": 1}
+            return {"held_bytes": 0, "entries": 0}
+
+        guard, box = self._founder_guard(
+            monkeypatch,
+            self._HELD + 1 * GIB,
+            chunk_reserve_bytes=self._CHUNK,
+            own_session_shed=own_session_shed,
+        )
+        assert guard() is False
+        box["active"] += 2 * GIB
+        assert guard() is True            # round 2 frees nothing: refused
+        box["active"] += 2 * GIB
+        assert guard() is True            # tripped stays tripped, no round 3
+        assert len(calls) == 2
+
     def test_a_refusal_after_giving_back_says_how_much(self, monkeypatch):
         def own_session_shed(reason):
             return {"held_bytes": 1 * GIB, "entries": 1}
