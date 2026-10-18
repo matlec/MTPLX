@@ -109,7 +109,7 @@
 ## インストール
 
 ```bash
-git clone --branch v2.12.2-m1.8 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.9 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # 1 分ほど。「mfa_attn: ok」と「ane_ffn: ok」が出れば完了
 ```

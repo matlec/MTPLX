@@ -109,7 +109,7 @@ The largest amount of memory MLX allocated while reading the prompt of each leng
 ## Install
 
 ```bash
-git clone --branch v2.12.2-m1.8 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.9 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # about a minute; done when it prints "mfa_attn: ok" and "ane_ffn: ok"
 ```
