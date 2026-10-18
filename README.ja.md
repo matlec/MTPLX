@@ -5,61 +5,161 @@
 
 [English](README.md) | 日本語
 
-[MTPLX](https://github.com/youssofal/MTPLX) を M1 系の Mac 向けに調整した非公式のフォークです。Qwen3.8-27B と Qwen3.6-35B-A3B で、長いプロンプトとコーディングエージェントの会話を速く処理することを目的にしています。本家と同じく、モデル自身の MTP（multi-token prediction）ヘッドで投機的デコードを行うので、出力の分布は変わりません。OpenAI 互換と Anthropic 互換の API で動きます。中身は MTPLX 2.12.2 に、M1 系の GPU でだけ有効になる変更を加えたものです。
+[MTPLX](https://github.com/youssofal/MTPLX) を M1 系の Mac で速く動かすための非公式のフォークです。MTPLX 2.12.2 に、M1 系の GPU でだけ有効になる変更を加えています。対象は Qwen3.5・Qwen3.6・Qwen3.8 系のモデルで、長いプロンプトとコーディングエージェントでの利用を主な用途にしています。
 
-- **M3 以降の Mac では [本家の MTPLX](https://github.com/youssofal/MTPLX) を使ってください**。このフォークは M3 以降では計測していません。
-- MTPLX のプロジェクトとは関係のない非公式のフォークです。変更は AI（Claude）の支援を受けて作り、MacBook Pro M1 Max（64 GB）1 台で計測しました。本家の README は [README.upstream.md](README.upstream.md) にあります。
+本家と同じく、モデル自身の MTP（multi-token prediction）ヘッドで投機的デコードを行うので、出力の分布は本家と変わりません。OpenAI 互換と Anthropic 互換の API で動きます。
+
+- **M3 以降の Mac では、[本家の MTPLX](https://github.com/youssofal/MTPLX) を使ってください。** 
+- **本家の MTPLX アプリが必要です。** このフォークは、アプリの Python の実行環境と、アプリでダウンロードしたモデルを使います。
+- MTPLX のプロジェクトとは関係のない、非公式のフォークです。変更は AI（Claude）の支援を受けて作り、MacBook Pro M1 Max（64 GB）1 台で計測しました。本家の README は [README.upstream.md](README.upstream.md) にあります。
 
 ## 主な計測値
 
-M1 Max 64 GB、8bit の KV、長いプロンプトでの 3 ターンの会話です（[apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench)。条件は「[計測結果](#計測結果)」を見てください）。
+このフォークと本家 MTPLX 2.12.2（このフォークの元の版）を、同じ Mac・同じ条件で測りました。太字がこのフォークです。
 
-| モデル | このフォーク | 比較の相手 |
-|---|---|---|
-| Qwen3.6-35B-A3B（MoE） | decode 2K で 111.8 tok/s、32K で 86.4、128K で 61.2 | Splash 1.3.0-m1.1: 96.1、63.8、43.9 |
-| Qwen3.8-27B（dense） | decode 2K で 29.4 tok/s、32K で 28.1、128K で 19.8 | 本家 MTPLX 2.12.0: 23.6、14.0、5.0 |
-| A3B のエージェントの会話 | ファイルの書き直しが 219 tok/s（context-copy なしでは 111）、16 万トークンの履歴の後ろに足した短いツールの結果を 0.42 秒で読み込み | v2.12.2-m1.5: 111 tok/s、0.75 秒 |
+### prefill（tok/s）
 
-## インストールと起動
+キャッシュのない状態で、約 8K・32K・64K・128K トークンのプロンプトを読み込む速さです。
 
-次のものが必要です。
+| モデル | | 8K | 32K | 64K | 128K |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B | このフォーク | **1,091** | **912** | **762** | **499** |
+|  | 本家 2.12.2 | 957 | 795 | 607 | 318 |
+| Ornith-1.5-35B-A3B | このフォーク | **1,069** | **1,034** | **766** | **499** |
+|  | 本家 2.12.2 | 954 | 795 | 606 | 317 |
+| Qwen3.8-27B | このフォーク | **224** | **212** | **176** | **139** |
+|  | 本家 2.12.2 | 150 | 139 | 121 | 87 |
+| Huihui-Qwen3.8-27B-abliterated | このフォーク | **234** | **220** | **181** | **141** |
+|  | 本家 2.12.2 | 150 | 139 | 123 | 87 |
+| Swift-1.5-Qwen3.8-27b | このフォーク | **234** | **220** | **181** | **132** |
+|  | 本家 2.12.2 | 150 | 139 | 123 | 86 |
+
+### decode（tok/s）
+
+「短い質問」は、思考（thinking）ありの短い質問 3 本に、1,500 トークンずつ答えさせたときの速さです。8K〜128K は、その長さのプロンプトを読んだ後に、512 トークン答えさせたときの速さです。
+
+| モデル | | 短い質問 | 8K | 32K | 64K | 128K |
+|---|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B | このフォーク | **108.7** | **101.9** | **86.6** | **77.4** | **60.3** |
+|  | 本家 2.12.2 | 58.0 | 53.4 | 46.8 | 39.1 | 24.9 |
+| Ornith-1.5-35B-A3B | このフォーク | **110.5** | **106.8** | **94.6** | **81.9** | **63.8** |
+|  | 本家 2.12.2 | 63.6 | 61.0 | 86.8 | 29.3 | 16.2 |
+| Qwen3.8-27B | このフォーク | **32.5** | **30.2** | **30.2** | **28.5** | **24.5** |
+|  | 本家 2.12.2 | 23.2 | 22.7 | 18.6 | 9.1 | 6.1 |
+| Huihui-Qwen3.8-27B-abliterated | このフォーク | **32.0** | **33.9** | **30.1** | **27.8** | **23.3** |
+|  | 本家 2.12.2 | 24.2 | 22.9 | 19.9 | 10.3 | 6.0 |
+| Swift-1.5-Qwen3.8-27b | このフォーク | **31.5** | **32.3** | **29.0** | **27.0** | **16.9** |
+|  | 本家 2.12.2 | 24.3 | 23.5 | 19.3 | 10.7 | 5.9 |
+
+### ピークのメモリ
+
+それぞれの長さのプロンプトの読み込みと応答の間に、MLX が割り当てたメモリの最大値です。
+
+| モデル | | 8K | 32K | 64K | 128K |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B | このフォーク | **32.6 GB** | **32.6 GB** | **32.6 GB** | **32.6 GB** |
+|  | 本家 2.12.2 | 22.6 GB | 24.7 GB | 27.3 GB | 32.2 GB |
+| Ornith-1.5-35B-A3B | このフォーク | **32.6 GB** | **32.6 GB** | **32.6 GB** | **32.6 GB** |
+|  | 本家 2.12.2 | 23.9 GB | 26.0 GB | 28.6 GB | 33.5 GB |
+| Qwen3.8-27B | このフォーク | **25.1 GB** | **27.8 GB** | **31.8 GB** | **39.9 GB** |
+|  | 本家 2.12.2 | 25.5 GB | 29.7 GB | 36.1 GB | 45.0 GB |
+| Huihui-Qwen3.8-27B-abliterated | このフォーク | **20.2 GB** | **22.9 GB** | **26.9 GB** | **35.0 GB** |
+|  | 本家 2.12.2 | 21.0 GB | 25.2 GB | 31.6 GB | 41.0 GB |
+| Swift-1.5-Qwen3.8-27b | このフォーク | **20.2 GB** | **22.9 GB** | **26.9 GB** | **35.0 GB** |
+|  | 本家 2.12.2 | 21.0 GB | 25.2 GB | 31.6 GB | 41.3 GB |
+
+### 計測の条件
+
+- MacBook Pro M1 Max 64 GB、macOS 26。プロファイルは `turbo`、文脈の上限は 256K、KV キャッシュは 8bit、temperature は 0.6（seed 固定）です。
+- MTP の深さは、このフォークで一番速かった値（「[対象のモデル](#対象のモデル)」の表に記載）を、両方のエンジンで使いました。
+- 長さごとにサーバーを起動し直して、cold の状態から測りました。同じ項目を複数回測ったものは、速いほうの値です（GPU の温度などで、遅い回が出ることがありました）。
+- 本家の Ornith-1.5-35B-A3B の「32K」の decode（86.8 tok/s）は、答えにファイルの引用が多く、本家の context-copy がそれを写したため、ほかの長さより高くなっています。
+- このフォークの Qwen3.6-35B-A3B 系のピーク（32.6 GB）は、モデルを読み込むときの値です。読み込みの際に MoE の重みを並べ替えるので、一時的にメモリが増えます。応答中に使うメモリは 21〜24 GB です（128K で 24.4 GB、本家は 26.2 GB）。
+- Swift-1.5-Qwen3.8-27b は、128K の decode が、同じ形の Huihui-Qwen3.8-27B-abliterated より遅くなりました（16.9 と 23.3 tok/s）。繰り返し測っても同じで、原因は調べている途中です。
+
+## 対象のモデル
+
+### 計測したモデル
+
+| モデル | 種類 | 量子化 | 重み | MTP の深さ |
+|---|---|---|---|---|
+| [Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16](https://huggingface.co/Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16) | MoE（全体 35B、1 トークンあたり 3B） | 4bit（64 値ごと）、一部 8bit | 21 GB | 1 |
+| Ornith-1.5-35B-A3B（[ornith-ai/Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B) を MTPLX の forge で変換） | MoE（Qwen3.6-35B-A3B の派生） | 4bit（64 値ごと）、一部 8bit | 21 GB | 1 |
+| [Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16](https://huggingface.co/Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16) | dense（27B） | 4bit（32 値ごと）、一部 8bit | 20 GB | 3 |
+| Huihui-Qwen3.8-27B-abliterated（[huihui-ai/Huihui-Qwen3.8-27B-abliterated](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated) を MTPLX の forge で変換） | dense（27B） | 4bit（64 値ごと） | 16 GB | 3 |
+| Swift-1.5-Qwen3.8-27b（[ukisai/Swift-1.5-Qwen3.8-27b](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b) を MTPLX の forge で変換） | dense（27B、Qwen3.8-27B の派生） | 4bit（64 値ごと） | 16 GB | 3 |
+
+- 4bit の重みは、32 個または 64 個の値ごとに 1 組の倍率を持ちます。32 個ごとのほうが精度は高くなりますが、重みが大きくなり、decode は遅くなります。
+- [Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality-FP16](https://huggingface.co/Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality-FP16)（8bit）も動作を確かめています。重みが約 9 GB 大きく、decode は Speed より 1〜2 割遅くなります。
+
+### そのほかのモデル
+
+- Qwen3.5・3.6・3.8 系のモデルは、M1 ではプロファイルを指定しないと `turbo` で起動します。系統は `config.json` の `model_type` で判定するので、派生モデルや自分で forge したモデルも対象です。
+- Qwen3.6-35B-A3B と同じ構成のモデル（expert 256 個、1 トークンあたり 8 個、隠れ層の幅 2048、40 層、本体が 4bit・64 値ごと）は、A3B 用の最適化（GPU 上で decode の round を続けて投入する経路、ファイルの書き直しを速くする context-copy など）も有効になります。
+- `turbo` の verify 用の kernel が対応する量子化は、4bit・6bit・8bit の affine です。それ以外の量子化（3bit、mxfp4、3 値など）では、標準の行列積で計算します。
+- ほかの系統のモデルは、本家と同じく `sustained` で起動します。`--profile turbo`、またはアプリの設定のプロファイルで `turbo` を選ぶと、M1 向けの変更が効く場合があります。この組み合わせは計測していません。
+- モデルごとに一番速い MTP の深さは、「[MTP の深さを測り直す](#mtp-の深さを測り直す)」で確かめられます。
+
+## 必要なもの
 
 - M1 系の Mac（計測は M1 Max 64 GB、macOS 26）
 - Metal のツールチェーンが入った Xcode（`xcrun metal` が動くこと）
-- 一度起動した [MTPLX アプリ](https://github.com/youssofal/MTPLX)（このフォークはアプリの Python 実行環境を使います。モデルはアプリのモデル画面からダウンロードします）
+- 一度起動した [MTPLX アプリ](https://github.com/youssofal/MTPLX)。モデルは、アプリのモデル画面からダウンロードします。
+
+## インストール
 
 ```bash
-git clone --branch v2.12.2-m1.7 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.8 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # 1 分ほど。「mfa_attn: ok」と「ane_ffn: ok」が出れば完了
 ```
 
-MTPLX アプリを終了してから（エンジンを 2 つ同時に動かすとメモリに収まりません）、どちらかのモデルでサーバーを起動します。
+ネイティブ拡張（Neural Engine の prefill と、M1 向けの attention）を作らなくてもサーバーは動きますが、prefill は遅くなります。
+
+### アプリから使う
+
+アプリのエンジンを、このフォークに切り替えます。
 
 ```bash
-# Qwen3.6-35B-A3B（MoE）: M1 でエージェントに使うなら最も速い選択
+scripts/m1-app-use-checkout.sh install
+```
+
+アプリを終了して開き直すと、アプリはこのフォークのエンジンで動きます。Dock や Finder など、どこから開いても同じです。この設定は、ログインし直しても残ります。元に戻すときは `scripts/m1-app-use-checkout.sh uninstall` を実行して、アプリを開き直します。
+
+### サーバーとして使う
+
+MTPLX アプリを終了してから（エンジンを 2 つ同時に動かすとメモリに収まりません）、サーバーを起動します。`--model` には、アプリでダウンロードしたモデルのフォルダを指定します。
+
+```bash
 PYTHONPATH="$PWD" "$HOME/Library/Application Support/MTPLX/runtime-venv/bin/python" -m mtplx.cli serve \
   --model "$HOME/.mtplx/models/Youssofal--Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16" \
   --context-window 262144 --paged-kv-quantization q8
-
-# Qwen3.8-27B（dense）: --model を次のパスに替える
-#   "$HOME/.mtplx/models/Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed-FP16"
 ```
 
-応答を確かめます（サーバーは `http://127.0.0.1:8000` で待ち受けます）。
+サーバーは `http://127.0.0.1:8000` で待ち受けます。次のコマンドで応答を確かめます。
 
 ```bash
 curl -s http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/json' \
   -d '{"model": "mtplx", "messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 64}'
 ```
 
-MTPLX アプリの画面からこのフォークを動かすときは、`scripts/open-mtplx-app-with-checkout.command` を使います。詳しくは [docs/m1max-longctx/USAGE.ja.md](docs/m1max-longctx/USAGE.ja.md) を見てください。ネイティブ拡張をビルドしなくてもサーバーは動きますが、prefill が GPU だけの遅い経路になります。
+使い方の詳細は [docs/m1max-longctx/USAGE.ja.md](docs/m1max-longctx/USAGE.ja.md) にあります。
+
+### 新しい版に更新する
+
+```bash
+git fetch --tags
+git checkout <新しいタグ>               # 例: v2.12.2-m1.9
+scripts/build-m1-native-extensions.sh   # ネイティブ拡張が変わった版だけ必要です（リリースノートに書きます）
+```
+
+アプリから使っている場合は、更新した後にアプリを開き直します。
 
 ## コーディングエージェントで使う
 
-OpenAI か Anthropic の API を使うクライアントなら動きます。OpenCode と Claude Code での設定は次のとおりです。
+OpenAI または Anthropic の API を使うクライアントなら、どれでも使えます。
 
-- OpenCode: `~/.config/opencode/opencode.json` にプロバイダーを足します。
+- OpenCode: `~/.config/opencode/opencode.json` に provider を追加します。
 
   ```json
   {
@@ -75,77 +175,54 @@ OpenAI か Anthropic の API を使うクライアントなら動きます。Ope
   }
   ```
 
-- Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8000 claude` で起動します。
+- Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8000 claude`
 
-Qwen3.6 には reasoning effort の段階がなく、thinking のオンとオフだけです。Qwen3.8 は `low` から `xhigh` まで使えます。
+Qwen3.6 系には reasoning effort の段階がなく、思考はオンかオフだけです。Qwen3.8 系は `low` から `xhigh` まで選べます。
 
-## モデル
+## MTP の深さを測り直す
 
-| モデル | メモリのピーク | 補足 |
-|---|---|---|
-| `Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Speed-FP16`（MoE、3B が有効） | 27〜31 GB | v2.12.2-m1.4 から M1 向けに調整。decode の round を GPU の上で続けて回し、prefill で Neural Engine を使い、context-copy を使います |
-| `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16`（dense） | 2K〜128K で 32〜45 GB、256K で 50 GB | このフォークの最初の対象 |
-| `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Quality-FP16`（dense、8bit） | 約 9 GB 多い | 計測済み。decode は Speed より約 10〜15% 遅い |
+MTP の深さ（1 回の draft で先読みするトークンの数）は、モデルによって一番速い値が違います。次のスクリプトは、深さ 1・2・3 で順にサーバーを起動して decode の速さを測り、一番速い深さを示します。1 モデルで 15 分ほどかかります。
 
-## 計測結果
+```bash
+scripts/m1-depth-sweep.py --model "$HOME/.mtplx/models/<モデルのフォルダ>"
+```
 
-数値はすべて MacBook Pro M1 Max 64 GB、macOS 26、8bit の KV、temperature 0 での、[apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench) の 3 ターンの会話です。1 ターン目は長いプロンプトを最初から読み、2〜3 ターン目は約 300 トークンずつ足し、各ターンで最大 256 トークンを生成します。比べるエンジンは同じセッションで交互に動かしました。
+`--apply-app` を付けると、結果をアプリのモデルごとの設定に書き込みます。アプリは終了時に設定を書き戻すので、アプリを終了した状態で実行してください。
 
-**Qwen3.6-35B-A3B**: v2.12.2-m1.5 と Splash 1.3.0-m1.1（2026-10-14。このベンチでの m1.6 の decode は、m1.5 より 2K で 0.6%、32K で 3.8% 遅くなります。32K では context-copy が別の続きを写して外れることがあるためです）
+## このフォークの変更点
 
-| | 2K | 8K | 32K | 64K | 128K |
-|---|---|---|---|---|---|
-| decode（tok/s、このフォーク） | 111.8 | 110.8 | 86.4 | 76.5 | 61.2 |
-| decode（tok/s、Splash） | 96.1 | 80.8 | 63.8 | 57.7 | 43.9 |
-| 会話全体（このフォーク） | 9.3 秒 | 14.4 秒 | 41.3 秒 | 1.5 分 | 4.3 分 |
-| 会話全体（Splash） | 9.5 秒 | 18.1 秒 | 60.7 秒 | 2.5 分 | 7.7 分 |
+- prefill: 計算の一部を Neural Engine に任せて、GPU と並べて処理します。キャッシュした履歴への attention は、M1 向けに調整した flash-attention で計算します。長い履歴に短い追加（ツールの結果など）を読み込むときは、8bit の KV を直接読みます。
+- decode: 1 round ごとの CPU と GPU のやり取りを減らしています。Qwen3.6-35B-A3B 系では、前の round の結果を CPU が読む前に、次の round を GPU に投入します。ファイルを書き直すときは、プロンプトと一致する部分をそのまま写します（context-copy、完全一致のときだけ）。
+- メモリ: KV キャッシュを 8bit のページで持ち、長いプロンプトはそのページに直接 prefill します。メモリの見積もりは、このフォークで測った値に合わせています。64 GB の Mac で、256K トークンの会話が既定の設定のまま動きます。
+- 既定の設定: Qwen3.5・3.6・3.8 系は `turbo` で起動します。アプリから Qwen3.6-35B-A3B 系を起動したときも、A3B 用の経路を使います。
+- エージェントの会話（M1 以外の Mac でも有効）: 履歴の書き換えをまたいで同じ会話を見つけ直す、ツールの引数の空白を保つ、macOS が長い GPU の処理を止めたときに要求をやり直す、保存した状態の一番深いところから再開する、などの修正です。
 
-thinking ありの短いプロンプト（greedy、1,024 トークン）では、Splash の decode が 9〜15% 速くなります。Splash の DFlash 2 のブロック単位の draft は、思考の文章や定型のコードで最もよく当たるからです。
+変更の一つ一つと計測の結果は、[CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.md) と[リリースノート](https://github.com/shunya1810/MTPLX/releases)にあります。
 
-**Qwen3.8-27B**: v2.12.2-m1.1（256K だけ m1.2）と本家 MTPLX 2.12.0
+## 切り替えスイッチ
 
-| | 2K | 8K | 32K | 64K | 128K | 256K |
-|---|---|---|---|---|---|---|
-| decode（tok/s、このフォーク） | 29.4 | 29.2 | 28.1 | 25.5 | 19.8 | 14.2 |
-| decode（tok/s、本家） | 23.6 | 22.5 | 14.0 | 8.7 | 5.0 | — |
-| 会話全体（このフォーク） | 33 秒 | 61 秒 | 3.3 分 | 7.3 分 | 18.4 分 | 59.4 分 |
-| 会話全体（本家） | 42 秒 | 86 秒 | 5.0 分 | 11.3 分 | 30.6 分 | — |
+M1 向けの既定は、一つずつ環境変数で切れます。`MTPLX_M1_LONG_CONTEXT=0` で、すべての M1 向けの既定が切れます。
 
-**エージェントの会話（Qwen3.6-35B-A3B、v2.12.2-m1.6）**: 1.1 万トークンのファイルを thinking あり（temperature 0.6）で書き直すと、decode は context-copy ありで 219 tok/s、なしで 111 tok/s です。新しく文章を書くときは、context-copy ありで 111 tok/s、なしで 105 tok/s です。16 万トークンのキャッシュ済みの履歴の後ろに 42 トークンのツールの結果を足すと、0.42 秒で読み込みます（m1.5 は 0.75 秒）。長いエージェントの会話で、サーバーがリクエストごとにする前処理は 80〜100 ms から約 2 ms になりました。
-
-## 本家からの変更点
-
-- prefill の計算の一部を Neural Engine で行い、そのあいだに GPU が残りを計算します（仕組みは [Splash](https://github.com/incoai/splash) から移植しました）。キャッシュ済みの部分に対する attention は、M1 向けに調整した [metal-flash-attention](https://github.com/philipturner/metal-flash-attention) のブロックで計算します。長い履歴の後ろに短い入力を足すときは、8bit の KV をそのまま読みます。
-- decode では、1 ラウンドあたりのホストとの往復を減らしました。A3B では、ホストが前のラウンドの結果を読む前に、次のラウンドを GPU に積みます（greedy の出力は同じで、sampling の出力の分布も同じです）。ファイルを書き直す応答では、プロンプトと同じ行をそのまま写します（context-copy、完全に一致したところだけ）。
-- メモリについては、KV を 8bit のページで持ち、長いプロンプトは最初から 8bit のページに読み込みます。メモリの見積もりはこのフォークでの実測に合わせました。64 GB で、256K トークンの会話が既定の設定のまま動きます。
-- エージェントの会話（どの Mac でも有効）では、トークンの区切り方が違っても同じ会話として扱えるようにし、ツールの引数の空白が消えないようにしました。macOS が長い GPU の処理を止めたときはリクエストをやり直し、履歴が変わったときは保存した状態のうち最も深い位置から再開します。
-
-変更点とその計測結果は、すべて [CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.md) と [リリースノート](https://github.com/shunya1810/MTPLX/releases) にあります。
-
-## M1 向けの既定を止める
-
-M1 向けの既定は、それぞれ個別に止められます。`MTPLX_M1_LONG_CONTEXT=0` で、すべてまとめて止まります。
-
-| 変数 | M1 での既定 | 止まるもの |
+| 環境変数 | M1 での既定 | 切れるもの |
 |---|---|---|
 | `MTPLX_ANE_PREFILL=0` / `MTPLX_ANE_PREFILL_MOE=0` | オン | Neural Engine の prefill（dense / MoE） |
 | `MTPLX_MFA_PREFILL=0` | オン | flash-attention の prefill |
-| `MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN=0` | オン | draft を続けて作る処理 |
-| `MTPLX_M1_PAGED_PREFILL=0` | 32K 以上でオン | 8bit のページへの直接の読み込み |
-| `MTPLX_M1_ENGINE_RAM_FRACTION=0.75` | 13/16 | エンジンのメモリの上限の引き上げ |
-| `MTPLX_M1_TURBO_DEFAULT=0` | 4bit / 8bit の dense で turbo | turbo のプロファイルを既定にすること |
-| `MTPLX_M1_MOE_LANE=0` | MoE のモデルでオン | MoE 向けの起動時の既定（この表の MoE と A3B の項目を含む） |
-| `MTPLX_M1_RESIDENT_DECODE=0` | A3B でオン | GPU の上で decode のラウンドを続けて回すこと |
-| `MTPLX_CONTEXT_COPY=0` | A3B でオン | context-copy |
+| `MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN=0` | オン | draft を GPU 上で続けて作る経路 |
+| `MTPLX_M1_PAGED_PREFILL=0` | 32K 以上でオン | 8bit のページへの直接の prefill |
+| `MTPLX_M1_ENGINE_RAM_FRACTION=0.75` | メモリの 13/16 | エンジンに割り当てるメモリの上限（既定より小さくするとき） |
+| `MTPLX_M1_TURBO_DEFAULT=0` | Qwen3.5・3.6・3.8 系は `turbo` | `turbo` の既定 |
+| `MTPLX_M1_MOE_LANE=0` | MoE のモデルでオン | MoE 向けの既定すべて（下の 2 行も含む） |
+| `MTPLX_M1_RESIDENT_DECODE=0` | Qwen3.6-35B-A3B 系でオン | GPU 上で round を続けて投入する decode |
+| `MTPLX_CONTEXT_COPY=0` | Qwen3.6-35B-A3B 系でオン | context-copy |
 
-## 制限事項
+## 既知の制限
 
-- 計測は M1 Max 64 GB の 1 台だけです。M1 Pro、M1 Ultra、ほかのメモリ容量でも同じコードが動きますが、試していません。
-- Neural Engine の経路は、Apple の非公開の `AppleNeuralEngine.framework` を使います。macOS の更新で動かなくなる可能性があり、その場合は prefill が GPU だけに戻ります。
-- Neural Engine の prefill は int8 の活性で計算するので、GPU の prefill と bit 単位では一致しません（A3B では、24,576 か所の次のトークンの 98.25% が一致しました）。`MTPLX_ANE_PREFILL=0` / `MTPLX_ANE_PREFILL_MOE=0` で、prefill を GPU だけにできます。
-- thinking のあるモデルは、難しいエージェントの課題でとても長く考え込むことがあります（A3B の長い会話で、131,072 トークンの応答がありました）。既定では思考の長さに上限はありません。`MTPLX_THINKING_BUDGET=<トークン数>` で、ツールを使うリクエストの思考に上限を設定できます。
-- 本家のテストの一部は本家の既定を前提にしているので、M1 向けの既定がオンだと失敗します。`MTPLX_M1_LONG_CONTEXT=0` にすると、ほとんどが通ります。
+- 計測は M1 Max 64 GB の 1 台だけです。M1 Pro、M1 Ultra、ほかのメモリの容量でも同じコードが動きますが、確かめていません。
+- Neural Engine の経路は、Apple の非公開の `AppleNeuralEngine.framework` を使っています。macOS の更新で動かなくなる可能性があり、その場合は GPU の prefill に戻ります。
+- Neural Engine の prefill は int8 で計算するので、GPU の prefill とビット単位では一致しません（Qwen3.6-35B-A3B で、24,576 か所のうち 98.25% で次のトークンが一致）。`MTPLX_ANE_PREFILL=0` / `MTPLX_ANE_PREFILL_MOE=0` で GPU だけの prefill にできます。
+- 思考ありのモデルは、難しいエージェントの作業で非常に長く考えることがあります。思考の長さは既定では制限しません。ツールを渡す要求では、`MTPLX_THINKING_BUDGET=<トークン数>` で上限を付けられます。
+- 本家のテストの一部は本家の既定を前提にしていて、M1 向けの既定がオンだと失敗します。多くは `MTPLX_M1_LONG_CONTEXT=0` で通ります。
 
 ## ライセンスと謝辞
 
-本家と同じ Apache-2.0 です（[LICENSE](LICENSE)、[NOTICE](NOTICE)）。Neural Engine のクライアントと FFN のプログラムの配置は Splash から移植しました（`native_extensions/ane_ffn/NOTICE`）。flash-attention の kernel は metal-flash-attention に従っています（`native_extensions/mfa_attn/MFA_LICENSE.txt`）。
+本家と同じ Apache-2.0 です（[LICENSE](LICENSE)、[NOTICE](NOTICE)）。Neural Engine のクライアントと FFN のプログラムの構成は [Splash](https://github.com/incoai/splash) から取り入れています（`native_extensions/ane_ffn/NOTICE`）。flash-attention の kernel は [metal-flash-attention](https://github.com/philipturner/metal-flash-attention) にならっています（`native_extensions/mfa_attn/MFA_LICENSE.txt`）。
