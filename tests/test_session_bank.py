@@ -722,3 +722,45 @@ def test_session_bank_names_the_oversized_skip_on_the_next_miss():
 
     assert bank.restore(runtime, [7, 8, 9, 10], mode="clone", session_id="session-1") is None
     assert bank.last_miss_reason != "oversized_snapshot_skipped"
+
+
+def _put_hybrid(bank, runtime, tokens, boundaries):
+    return bank.put(
+        runtime=runtime, token_ids=tokens, cache=[_RecurrentLayer()], logits=None,
+        hidden=None, session_id="agent", nbytes_override=10,
+        gdn_boundaries=[(b, CacheSnapshot((), ())) for b in boundaries],
+    )
+
+
+def test_store_on_prefill_entry_is_superseded_by_its_answer(monkeypatch):
+    # The prompt-end checkpoint sits one token short of the prompt, so the
+    # generation-final entry never had a checkpoint at the prompt entry's
+    # length and both stayed: a second 3.8 GB entry at 64K (2026-10-19).
+    monkeypatch.delenv("MTPLX_SESSION_BANK_SUPERSEDE_TAIL_SLACK", raising=False)
+    bank = SessionBank(max_entries=8, max_bytes=4096, per_session_max_bytes=2048)
+    runtime = _hybrid_runtime()
+    prompt = list(range(10))
+    _put_hybrid(bank, runtime, prompt, [4, 9])
+    _put_hybrid(bank, runtime, prompt + [50, 51, 52, 53, 54, 55], [4, 9])
+    assert [e.prefix_len for e in bank._entries.values()] == [16]
+    assert bank.eviction_log[-1]["reason"] == "superseded_by_longer_prefix"
+
+
+def test_supersede_tail_slack_keeps_wider_gaps_and_can_be_disabled(monkeypatch):
+    runtime = _hybrid_runtime()
+    prompt = list(range(10))
+    # A container checkpoint two tokens short is outside the default slack.
+    bank = SessionBank(max_entries=8, max_bytes=4096, per_session_max_bytes=2048)
+    _put_hybrid(bank, runtime, prompt, [4, 8])
+    _put_hybrid(bank, runtime, prompt + [50, 51], [4, 8])
+    assert sorted(e.prefix_len for e in bank._entries.values()) == [10, 12]
+    # The contained entry's own checkpoints must still be present exactly.
+    bank = SessionBank(max_entries=8, max_bytes=4096, per_session_max_bytes=2048)
+    _put_hybrid(bank, runtime, prompt, [4, 9])
+    _put_hybrid(bank, runtime, prompt + [50, 51], [9])
+    assert sorted(e.prefix_len for e in bank._entries.values()) == [10, 12]
+    monkeypatch.setenv("MTPLX_SESSION_BANK_SUPERSEDE_TAIL_SLACK", "0")
+    bank = SessionBank(max_entries=8, max_bytes=4096, per_session_max_bytes=2048)
+    _put_hybrid(bank, runtime, prompt, [4, 9])
+    _put_hybrid(bank, runtime, prompt + [50, 51], [4, 9])
+    assert sorted(e.prefix_len for e in bank._entries.values()) == [10, 12]

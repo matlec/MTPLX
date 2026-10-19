@@ -307,6 +307,26 @@ def _active_session_pin_ttl_s() -> float:
         return DEFAULT_ACTIVE_SESSION_PIN_TTL_S
 
 
+def _supersede_tail_slack() -> int:
+    """How far below a contained entry's own length the container's newest
+    checkpoint may sit and still replace it (tokens; 0 = exact only).
+
+    The prompt-end checkpoint is captured one token short of the prompt
+    (``prefix_len - 1``), so the generation-final entry never held a
+    checkpoint at the store-on-prefill entry's length and the exact-match
+    rule kept both: on an M1 Max 64 GB at 64K that was a second 3.8 GB entry
+    64 tokens shorter, +2.8 GB wired (2026-10-19, mem_probe). Restoring the
+    contained point from the container re-reads at most this many tokens.
+    """
+    raw = os.environ.get("MTPLX_SESSION_BANK_SUPERSEDE_TAIL_SLACK")
+    if raw is None or not str(raw).strip():
+        return 1
+    try:
+        return max(0, int(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 1
+
+
 class CacheMissReason(str, Enum):
     NEW_SESSION = "new_session"
     PREFIX_DIVERGENCE_AT_TOKEN = "prefix_divergence_at_token"
@@ -3803,11 +3823,19 @@ class SessionBank:
                 # 16K entry; doing so turned Hermes' next tool turn into a
                 # 31K re-prefill. Keep the smaller entry unless every restore
                 # point it supplies is present in the container as well.
-                points = [entry.prefix_len, *(int(r[0]) for r in entry.gdn_boundaries)]
+                # The entry's own length may be covered from a checkpoint up
+                # to _supersede_tail_slack() tokens below it (the prompt-end
+                # checkpoint sits one token short); its checkpoints must be
+                # present exactly.
+                slack = _supersede_tail_slack()
+                points = [
+                    (entry.prefix_len, slack),
+                    *((int(r[0]), 0) for r in entry.gdn_boundaries),
+                ]
                 if entry.gdn_boundary_loader is not None or any(
                     (boundary := container.recurrent_boundary_at_or_below(point)) is None
-                    or int(boundary[0]) != point
-                    for point in points
+                    or point - int(boundary[0]) > allowed
+                    for point, allowed in points
                 ):
                     continue
             self._evict_entry(entry, reason="superseded_by_longer_prefix")
