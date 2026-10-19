@@ -4821,6 +4821,28 @@ def _prefill_restored_prompt_suffix(
     if use_committed_mtp and restored.hidden is not None:
         append_history(restored.hidden, [int(suffix[0])], window_start=0)
 
+    if (
+        gdn_boundary_sink is not None
+        and cached_tokens > 0
+        and _cache_has_recurrent_entries(restored.cache)
+        and not any(int(record[0]) == cached_tokens for record in gdn_boundary_sink)
+    ):
+        # The restore point is an anchor (mtplx.checkpoint_anchors), but the
+        # state restored from an entry's end is no boundary record of its
+        # own, and a short suffix has no chunk edge before its prompt-end
+        # anchor: the entry banked for this prompt then resumes no later
+        # than the turn before. The next turn diverges a few tokens before
+        # this prompt's end (the generation prompt's "<think>\n" against the
+        # history's "<think>\n\n</think>"), so a 27B 32K turn 3 re-read 3,062
+        # tokens from 32,406 instead of 83 from here. Captured before the
+        # small-suffix fast path, which returns without the chunk loop.
+        _capture_gdn_boundary(
+            gdn_boundary_sink,
+            cached_tokens,
+            restored.cache,
+            hidden_last=getattr(restored, "hidden", None),
+        )
+
     # kvcache-v2 small-suffix fast path: warm restores usually leave a tail of
     # tens-to-hundreds of tokens, and the chunked body/final split plus its
     # per-chunk forced evals costs more than the math (measured 154-524 tok/s
@@ -6959,9 +6981,21 @@ def restore_or_prefill_prompt_state(
                 "skip_reason": "vision_no_bank_key",
             }
             return
-        if int(state.suffix_tokens or 0) < _store_on_prefill_min_suffix():
+        released_restore = bool(
+            (getattr(state, "restore_served", None) or {}).get("released_entry_bytes")
+        )
+        if (
+            int(state.suffix_tokens or 0) < _store_on_prefill_min_suffix()
+            and not released_restore
+        ):
             # Warm restore or trivial extension: the existing postcommit
             # machinery owns those; storing again would just churn the bank.
+            # Not after a restore that let its entry go (M1,
+            # _release_restored_entry_applies): the bank then holds nothing
+            # at this prompt, and a next request that arrives before this
+            # turn's postcommit lands (aborted for the foreground after
+            # 0.6 s) fell back to the turn before: 27B, 32K, 3,061 tokens
+            # re-read; 246K, the whole prompt (2026-10-18 bench).
             state.prefill_store_snapshot = {
                 "stored": False,
                 "skip_reason": "min_suffix",

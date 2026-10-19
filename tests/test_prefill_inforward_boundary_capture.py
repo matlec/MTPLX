@@ -685,7 +685,10 @@ def test_the_warm_suffix_loop_banks_the_ladders_absolute_positions(tiny, monkeyp
     assert rt.forwards == [48, 22, 1]
     positions = [int(record[0]) for record in sink]
     assert positions == [int(record[0]) for record in ladder_sink]
-    assert all(position > cached for position in positions)
+    # The restore point is recorded first (the state the suffix resumed
+    # from), then the suffix's own ladder.
+    assert positions[0] == cached
+    assert all(position > cached for position in positions[1:])
     assert positions[-1] == len(prompt) - 1
 
 
@@ -722,3 +725,88 @@ def test_only_the_recurrent_containers_are_named_in_the_chunk_eval(tiny):
     expected = [leaf for entry in recurrent for leaf in entry.cache if leaf is not None]
     assert len(leaves) == len(expected) and len(leaves) >= 2 * len(recurrent)
     assert all(a is b for a, b in zip(leaves, expected))
+
+
+# ---------------------------------------------------------------------------
+# The restore point of a warm suffix prefill becomes a checkpoint of its own
+# ---------------------------------------------------------------------------
+
+
+def _restored_after_cold(model, prompt, prefix_len, monkeypatch):
+    from types import SimpleNamespace
+
+    rt, cache, _logits, hidden = _cold(
+        model, prompt[:prefix_len], sink=[], inforward=False, monkeypatch=monkeypatch
+    )
+    restored = SimpleNamespace(
+        cache=cache, hidden=hidden[:, -1:, :], mtp_history_cache=None
+    )
+    return rt, restored
+
+
+@pytest.mark.parametrize("suffix_tokens", [5, 40])
+def test_a_warm_suffix_records_its_restore_point(tiny, monkeypatch, suffix_tokens):
+    """2026-10-19, 27B 32K: turn 2 restored an entry's end (35,385) and read
+    48 tokens through the small-suffix fast path, so its entry had no
+    checkpoint after 32,406; turn 3 diverged 7 tokens before turn 2's prompt
+    end and re-read 3,062 tokens. The restore point is now a checkpoint, on
+    the fast path and the chunked one alike."""
+
+    prompt = _prompt(96)
+    rt, restored = _restored_after_cold(tiny, prompt, 48, monkeypatch)
+    sink: list = []
+    generation._prefill_restored_prompt_suffix(
+        rt,
+        restored,
+        prompt[48 : 48 + suffix_tokens],
+        base_hidden_variant="post_norm",
+        mtp_hidden_variant="post_norm",
+        mtp_history_policy="cycle",
+        tokens_total=48 + suffix_tokens,
+        cached_tokens=48,
+        gdn_boundary_sink=sink,
+    )
+    positions = [int(record[0]) for record in sink]
+    assert positions.count(48) == 1
+
+
+def test_the_restore_point_record_is_the_restored_state(tiny, monkeypatch):
+    prompt = _prompt(96)
+    rt, restored = _restored_after_cold(tiny, prompt, 48, monkeypatch)
+    expected = (48, generation.snapshot_untrimmable_cache(restored.cache), restored.hidden)
+    sink: list = []
+    generation._prefill_restored_prompt_suffix(
+        rt,
+        restored,
+        prompt[48:53],
+        base_hidden_variant="post_norm",
+        mtp_hidden_variant="post_norm",
+        mtp_history_policy="cycle",
+        tokens_total=53,
+        cached_tokens=48,
+        gdn_boundary_sink=sink,
+    )
+    record = next(record for record in sink if int(record[0]) == 48)
+    got_states, got_hidden = _record_leaves(record)
+    want_states, want_hidden = _record_leaves(expected)
+    _assert_same_leaves(got_states, want_states)
+    _assert_same_leaves(got_hidden, want_hidden)
+
+
+def test_a_restore_point_already_in_the_sink_is_not_recorded_twice(tiny, monkeypatch):
+    prompt = _prompt(96)
+    rt, restored = _restored_after_cold(tiny, prompt, 48, monkeypatch)
+    sink: list = []
+    generation._capture_gdn_boundary(sink, 48, restored.cache)
+    generation._prefill_restored_prompt_suffix(
+        rt,
+        restored,
+        prompt[48:53],
+        base_hidden_variant="post_norm",
+        mtp_hidden_variant="post_norm",
+        mtp_history_policy="cycle",
+        tokens_total=53,
+        cached_tokens=48,
+        gdn_boundary_sink=sink,
+    )
+    assert [int(record[0]) for record in sink].count(48) == 1
