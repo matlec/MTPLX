@@ -775,7 +775,7 @@ def install_nax_qlinear_patch() -> dict[str, object]:
             k8 = int(x.shape[-1])
             n8 = int(self["weight"].shape[0])
             if (
-                7 <= m8 <= 8
+                _m1_mma8_min_rows() <= m8 <= 8
                 and x.dtype == mx.float16
                 and k8 % 128 == 0
                 and n8 % 16 == 0
@@ -988,6 +988,14 @@ def _m4_impl() -> str:
     # MTPLX_NAX_M4_IMPL=vk_k while the server boots, and an import-time
     # snapshot silently pinned whichever value happened to be set first.
     return str(os.environ.get("MTPLX_NAX_M4_IMPL", "legacy")).strip().lower()
+
+
+def _m1_mma8_min_rows() -> int:
+    """Fewest rows the MMA lane takes (MTPLX_M1_MMA8_MIN_ROWS, default 7)."""
+    try:
+        return max(5, int(os.environ.get("MTPLX_M1_MMA8_MIN_ROWS") or 7))
+    except ValueError:
+        return 7
 
 
 def _m1_mma8_enabled() -> bool:
