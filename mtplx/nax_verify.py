@@ -763,6 +763,39 @@ def install_nax_qlinear_patch() -> dict[str, object]:
             return original(self, x)
         bits = int(getattr(self, "bits", 0) or 0)
         group_size = int(getattr(self, "group_size", 0) or 0)
+        if (
+            bits in (4, 8)
+            and x.ndim >= 2
+            and current_attention_phase() != "prefill"
+            and _m1_mma8_enabled()
+        ):
+            m8 = 1
+            for d in x.shape[:-1]:
+                m8 *= int(d)
+            k8 = int(x.shape[-1])
+            n8 = int(self["weight"].shape[0])
+            if (
+                7 <= m8 <= 8
+                and x.dtype == mx.float16
+                and k8 % 128 == 0
+                and n8 % 16 == 0
+                and group_size in (32, 64, 128)
+            ):
+                # Depth 6-7 verify on M1 (no NAX): the stock qmm runs 8 rows
+                # one by one (2.8-3.3x the 4-row kernels' time); the MMA lane
+                # dequantizes in registers and costs 1.02-1.12x the 4-row
+                # kernels on the 27B shapes, 4- and 8-bit
+                # (mtplx/kernels/mma8_qmm.py).
+                from .kernels.mma8_qmm import mma8v2_qmm
+
+                y = mma8v2_qmm(
+                    x.reshape(m8, k8), self["weight"], self["scales"], self["biases"],
+                    nt=2, kp=4, group_size=group_size, bits=bits,
+                )
+                y = y.reshape(*x.shape[:-1], n8)
+                if "bias" in self:
+                    y = y + self["bias"]
+                return y
         if bits == 8 and x.ndim >= 2 and current_attention_phase() != "prefill":
             # 8-bit affine (Optimized-Quality): MTPLX verify_kernels family.
             from .verify_kernels import (
@@ -955,6 +988,11 @@ def _m4_impl() -> str:
     # MTPLX_NAX_M4_IMPL=vk_k while the server boots, and an import-time
     # snapshot silently pinned whichever value happened to be set first.
     return str(os.environ.get("MTPLX_NAX_M4_IMPL", "legacy")).strip().lower()
+
+
+def _m1_mma8_enabled() -> bool:
+    """MTPLX_M1_MMA8=1: 4-bit verify matmuls of 7-8 rows on the MMA lane (experiment)."""
+    return str(os.environ.get("MTPLX_M1_MMA8", "")).strip().lower() in {"1", "true", "on"}
 
 
 def _m5_padded_lane() -> bool:
