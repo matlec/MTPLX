@@ -10,6 +10,7 @@ without inheriting Qwen-specific assumptions.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
@@ -36,6 +37,17 @@ class SamplerDefaults:
             "top_p": float(self.top_p),
             "top_k": int(self.top_k),
         }
+
+
+def _experiment_depth_ceiling(default: int) -> int:
+    """MTPLX_EXPERIMENT_DEPTH_CEILING (1-8) raises a family's depth ceiling for
+    measurement runs; the CLI gate reads the same variable
+    (commands/public._public_depth_ceiling). Unset: the release ceiling."""
+
+    raw = os.environ.get("MTPLX_EXPERIMENT_DEPTH_CEILING", "").strip()
+    if raw.isdigit() and 1 <= int(raw) <= 8:
+        return max(int(default), int(raw))
+    return int(default)
 
 
 @dataclass(frozen=True)
@@ -374,7 +386,7 @@ QWEN3_NEXT_DESCRIPTOR = BackendDescriptor(
         display_label="Draft depth",
         default=3,
         minimum=1,
-        maximum=3,
+        maximum=_experiment_depth_ceiling(3),
         unit="depth",
     ),
     uses_external_assistant=False,
@@ -550,8 +562,8 @@ QWEN3_8_DRAFT_SEMANTICS = DraftSemantics(
     # vs D3 at 88.4k and flat-to-down at 16k (MEASUREMENTS 2026-08-26; the
     # head is the binder, distillation is the reopen condition now). The
     # drop-day memory-kill also remains unexplained, so the release cap
-    # stays 3.
-    maximum=3,
+    # stays 3 (MTPLX_EXPERIMENT_DEPTH_CEILING raises it for measurement).
+    maximum=_experiment_depth_ceiling(3),
     unit="depth",
 )
 
