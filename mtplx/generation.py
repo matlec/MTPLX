@@ -5720,6 +5720,20 @@ def _restore_near_prefix_prompt_state(
                 vision_splice.cursor = sum(
                     1 for token in prompt_ids[:restore_point] if token == pad_id
                 )
+            # The exact-restore path lets its own conversation's entry go once
+            # cloned into live pages (_release_restored_entry_applies); a
+            # restore at a checkpoint inside the entry did not, so the KV was
+            # held twice through the suffix and the decode: 27B 246K turn 3
+            # restored at 248,726 from the 249,374 entry and peaked at 44.5 GB
+            # against 37.1 for turn 2. The turn banks the conversation again
+            # when it ends.
+            if _release_restored_entry_applies(
+                SimpleNamespace(entry=entry, restore_mode=storage_restore_mode),
+                session_id,
+            ):
+                served_truth["released_entry_bytes"] = int(
+                    session_bank.release_restored_entry(entry, session_id=session_id)
+                )
             suffix_logits, suffix_hidden, suffix_time, mtp_history_time = (
                 _prefill_restored_prompt_suffix(
                     rt,

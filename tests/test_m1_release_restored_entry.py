@@ -62,3 +62,18 @@ def test_admission_prices_the_released_source_out_of_decode_start():
     kept = srv._admission_growth(geometry, **kwargs)
     released = srv._admission_growth(geometry, **kwargs, released_source_bytes=5 * GIB)
     assert released["decode_start_bytes"] == max(0, kept["decode_start_bytes"] - 5 * GIB)
+
+
+def test_a_checkpoint_restore_inside_the_entry_releases_it_too():
+    """27B 246K turn 3 restored at a checkpoint (248,726) inside its own
+    conversation's 249,374 entry and held both copies through the turn
+    (44.5 GB peak against 37.1). The near-prefix restore now lets the entry
+    go exactly as the exact restore does, right before its suffix prefill."""
+
+    import inspect
+
+    source = inspect.getsource(g._restore_near_prefix_prompt_state)
+    release = source.index("_release_restored_entry_applies(")
+    suffix_prefill = source.index("_prefill_restored_prompt_suffix(")
+    assert release < suffix_prefill
+    assert "release_restored_entry(entry, session_id=session_id)" in source
