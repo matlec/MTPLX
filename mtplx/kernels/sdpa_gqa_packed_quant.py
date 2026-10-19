@@ -56,6 +56,15 @@ def _concrete_offset(offset) -> int | None:
         raise
 
 
+def _split_rows_enabled() -> bool:
+    """Queries of 5-8 rows run as two launches of at most 4 rows
+    (MTPLX_PACKED_QUANT_SPLIT_ROWS=0 keeps the single two-bank launch)."""
+
+    import os
+
+    return str(os.environ.get("MTPLX_PACKED_QUANT_SPLIT_ROWS", "1")).strip().lower() not in {"0", "false", "off"}
+
+
 def _static_blocks(capacity: int, max_offset: int | None) -> int:
     """Block-lane count from the STATIC attention ceiling.
 
@@ -488,6 +497,29 @@ def sdpa_gqa_packed_tail_quant(
     blocks = _static_blocks(capacity, max_offset)
     if blocks <= 0 or blocks % 32:
         return _bail("blocks_geometry")
+
+    if q_len > 4 and _split_rows_enabled():
+        # Rows 4..7 ride a second query bank that costs far more than a second
+        # launch on M1 Max (27B q8 KV, per layer: 2K q4 0.94 ms / q8 3.40 ms,
+        # 32K 1.90 / 38.6 ms, 128K 7.24 / 151.9 ms). Each row's walk is
+        # independent, so rows 0..3 run as a 4-row query whose last row sits
+        # QL-4 keys earlier, and the rest as a query ending at the prompt end:
+        # row j sees n <= n_kv - QL + j either way.
+        head = queries[:, :, :4, :]
+        tail = queries[:, :, 4:, :]
+        first = sdpa_gqa_packed_tail_quant(
+            queries=head, k_q=k_q, k_scale=k_scale, v_q=v_q, v_scale=v_scale,
+            offset=offset_arr.reshape(()) - (q_len - 4), scale=scale, bits=bits,
+            max_q_len=4, max_offset=max_offset,
+        )
+        second = sdpa_gqa_packed_tail_quant(
+            queries=tail, k_q=k_q, k_scale=k_scale, v_q=v_q, v_scale=v_scale,
+            offset=offset_arr.reshape(()), scale=scale, bits=bits,
+            max_q_len=4, max_offset=max_offset,
+        )
+        if first is None or second is None:
+            return _bail("split_rows")
+        return mx.concatenate([first, second], axis=2)
 
     kernel = _quant_partials_kernel()
     reduce_kernel = _paged_reduce_kernel()
