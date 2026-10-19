@@ -46,3 +46,17 @@ def test_the_lane_is_off_by_default(monkeypatch):
     assert nax_verify._m1_mma8_enabled() is False
     monkeypatch.setenv("MTPLX_M1_MMA8", "1")
     assert nax_verify._m1_mma8_enabled() is True
+
+
+def test_a_deep_draft_widens_the_compiled_verify_window(monkeypatch):
+    """Depth 7 verifies 8 tokens; past the default window of 6 every verify
+    ran eager on the generic paged cache (27B 32K: 221 ms against 120)."""
+
+    from mtplx import generation as g
+
+    monkeypatch.delenv("MTPLX_COMPILED_VERIFY_MAX_LEN", raising=False)
+    assert g._compiled_verify_len_for_depth(3) is None
+    assert g._compiled_verify_len_for_depth(5) is None
+    assert g._compiled_verify_len_for_depth(7) == 8
+    monkeypatch.setenv("MTPLX_COMPILED_VERIFY_MAX_LEN", "6")
+    assert g._compiled_verify_len_for_depth(7) is None

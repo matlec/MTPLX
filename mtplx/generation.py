@@ -2559,6 +2559,22 @@ def _release_restored_entry_applies(restored: Any, session_id: str | None) -> bo
     return any(is_compact_kv_state(state) for state in states)
 
 
+def _compiled_verify_len_for_depth(depth: int) -> int | None:
+    """The compiled verify bank's window for a draft depth above 5.
+
+    The bank takes MTPLX_COMPILED_VERIFY_MAX_LEN (default 6) when given None.
+    A deeper draft verifies depth + 1 tokens: past that window every verify
+    ran eager on the generic paged cache, whose attention re-reads the whole
+    context (27B depth 7 at 32K: verify 221 ms eager, 120 ms compiled). An
+    explicit MTPLX_COMPILED_VERIFY_MAX_LEN still decides.
+    """
+
+    if (os.environ.get("MTPLX_COMPILED_VERIFY_MAX_LEN") or "").strip():
+        return None
+    window = int(depth) + 1
+    return window if window > 6 else None
+
+
 def _m1_paged_prefill_enabled(context_tokens: int) -> bool:
     """M1 family with quantized KV: a long prompt prefills straight into the pages.
 
@@ -11616,7 +11632,11 @@ def generate_mtpk(
     compiled_verify_bank = (
         CompiledVerifyBank(
             rt,
-            max_verify_len=4 if qwen4_fixed_m4_compiled_verify else None,
+            max_verify_len=(
+                4
+                if qwen4_fixed_m4_compiled_verify
+                else _compiled_verify_len_for_depth(speculative_depth)
+            ),
             request_max_tokens=max_tokens,
             capacity_plan=fixed_m4_capacity_plan if qwen4_fixed_m4_compiled_verify else None,
             capture_backend=verify_core_backend,
