@@ -4840,6 +4840,7 @@ def _prefill_restored_prompt_suffix(
     if (
         gdn_boundary_sink is not None
         and cached_tokens > 0
+        and vision_splice is None
         and _cache_has_recurrent_entries(restored.cache)
         and not any(int(record[0]) == cached_tokens for record in gdn_boundary_sink)
     ):
@@ -4851,7 +4852,10 @@ def _prefill_restored_prompt_suffix(
         # this prompt's end (the generation prompt's "<think>\n" against the
         # history's "<think>\n\n</think>"), so a 27B 32K turn 3 re-read 3,062
         # tokens from 32,406 instead of 83 from here. Captured before the
-        # small-suffix fast path, which returns without the chunk loop.
+        # small-suffix fast path, which returns without the chunk loop. Not
+        # for an image prompt: its anchors keep to the text outside the
+        # images (mtplx.checkpoint_anchors), and a restore point after an
+        # image is no anchor an older entry can be restored to.
         _capture_gdn_boundary(
             gdn_boundary_sink,
             cached_tokens,
