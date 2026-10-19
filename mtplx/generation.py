@@ -12968,6 +12968,10 @@ def generate_mtpk(
     # spent on rounds that kept <30%), while a whole-file rewrite accepts ~91%.
     _ccopy_adapt_start = max(0, int(os.environ.get("MTPLX_CCOPY_ADAPTIVE_BLOCK", "0") or 0))
     ccopy_adapt_block = _ccopy_adapt_start
+    # The block never shrinks below MTPLX_CCOPY_ADAPTIVE_MIN (default 8). At 7
+    # a missed copy round verifies at most 8 rows, the M1 MMA verify lane's
+    # width (kernels/mma8_qmm.py), instead of 9-17.
+    _ccopy_adapt_min = max(1, int(os.environ.get("MTPLX_CCOPY_ADAPTIVE_MIN", "8") or 8))
     # Yield gate (MTPLX_CCOPY_YIELD_GATE=1): suspend copy rounds while they
     # commit fewer tokens per second than the rounds between them. At depth
     # each extra verify row costs ~7 ms (a 9-row verify at 80K: 77 ms for 3.6
@@ -14052,7 +14056,9 @@ def generate_mtpk(
                     if _cc_nacc >= len(_cc_block):
                         ccopy_adapt_block = min(ccopy_adapt_block * 2, 1 << 12)
                     else:
-                        ccopy_adapt_block = max(8, 1 << max(3, int(_cc_nacc + 1).bit_length()))
+                        ccopy_adapt_block = max(
+                            _ccopy_adapt_min, 1 << int(_cc_nacc + 1).bit_length()
+                        )
                 ccopy_ema = 0.7 * ccopy_ema + 0.3 * (_cc_nacc / len(_cc_block))
                 ccopy_seen += 1
                 if _cc_nacc / len(_cc_block) >= 0.5:
