@@ -19,65 +19,75 @@ This fork and upstream MTPLX 2.12.2 (the version it is based on), measured on th
 
 ### Prefill (tok/s)
 
-How fast a prompt of about 8K, 32K, 64K, 128K and 256K tokens is read with no cache.
+How fast a prompt of about 8K, 32K, 64K and 128K tokens is read with no cache.
 
-| Model | | 8K | 32K | 64K | 128K | 256K |
-|---|---|---|---|---|---|---|
-| Qwen3.6-35B-A3B | this fork | **1,065** | **1,028** | **771** | **499** | **248** |
-|  | upstream 2.12.2 | 957 | 795 | 607 | 318 | 145 |
-| Ornith-1.5-35B-A3B | this fork | **1,069** | **1,034** | **766** | **499** | — |
-|  | upstream 2.12.2 | 954 | 795 | 606 | 317 | — |
-| Qwen3.8-27B | this fork | **233** | **211** | **177** | **139** | **79** |
-|  | upstream 2.12.2 | 150 | 139 | 121 | 87 | failed (507) |
-| Huihui-Qwen3.8-27B-abliterated | this fork | **234** | **220** | **181** | **141** | — |
-|  | upstream 2.12.2 | 150 | 139 | 123 | 87 | — |
-| Swift-1.5-Qwen3.8-27b | this fork | **234** | **220** | **181** | **132** | — |
-|  | upstream 2.12.2 | 150 | 139 | 123 | 86 | — |
+| Model | | 8K | 32K | 64K | 128K |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B | this fork | **1,065** | **1,028** | **771** | **499** |
+|  | upstream 2.12.2 | 957 | 795 | 607 | 318 |
+| Ornith-1.5-35B-A3B | this fork | **1,069** | **1,034** | **766** | **499** |
+|  | upstream 2.12.2 | 954 | 795 | 606 | 317 |
+| Qwen3.8-27B | this fork | **233** | **211** | **177** | **139** |
+|  | upstream 2.12.2 | 150 | 139 | 121 | 87 |
+| Huihui-Qwen3.8-27B-abliterated | this fork | **234** | **220** | **181** | **141** |
+|  | upstream 2.12.2 | 150 | 139 | 123 | 87 |
+| Swift-1.5-Qwen3.8-27b | this fork | **234** | **220** | **181** | **132** |
+|  | upstream 2.12.2 | 150 | 139 | 123 | 86 |
 
 ### Decode (tok/s)
 
-"Short prompts" is three short questions with thinking on, 1,500 tokens each. 8K to 256K is a 512-token answer after a prompt of that length has been read.
+"Short prompts" is three short questions with thinking on, 1,500 tokens each. 8K to 128K is a 512-token answer after a prompt of that length has been read.
 
-| Model | | short prompts | 8K | 32K | 64K | 128K | 256K |
-|---|---|---|---|---|---|---|---|
-| Qwen3.6-35B-A3B | this fork | **107.6** | **101.8** | **86.5** | **76.5** | **60.4** | **38.8** |
-|  | upstream 2.12.2 | 58.0 | 53.4 | 46.8 | 39.1 | 24.9 | 12.4 |
-| Ornith-1.5-35B-A3B | this fork | **110.5** | **106.8** | **94.6** | **81.9** | **63.8** | — |
-|  | upstream 2.12.2 | 63.6 | 61.0 | 86.8 | 29.3 | 16.2 | — |
-| Qwen3.8-27B | this fork | **32.5** | **30.3** | **30.2** | **27.4** | **22.8** | **10.1** |
-|  | upstream 2.12.2 | 23.2 | 22.7 | 18.6 | 9.1 | 6.1 | failed (507) |
-| Huihui-Qwen3.8-27B-abliterated | this fork | **32.0** | **33.9** | **30.1** | **27.8** | **23.3** | — |
-|  | upstream 2.12.2 | 24.2 | 22.9 | 19.9 | 10.3 | 6.0 | — |
-| Swift-1.5-Qwen3.8-27b | this fork | **31.5** | **32.3** | **29.0** | **27.0** | **16.9** | — |
-|  | upstream 2.12.2 | 24.3 | 23.5 | 19.3 | 10.7 | 5.9 | — |
+| Model | | short prompts | 8K | 32K | 64K | 128K |
+|---|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B | this fork | **107.6** | **101.8** | **86.5** | **76.5** | **60.4** |
+|  | upstream 2.12.2 | 58.0 | 53.4 | 46.8 | 39.1 | 24.9 |
+| Ornith-1.5-35B-A3B | this fork | **110.5** | **106.8** | **94.6** | **81.9** | **63.8** |
+|  | upstream 2.12.2 | 63.6 | 61.0 | 86.8 | 29.3 | 16.2 |
+| Qwen3.8-27B | this fork | **32.5** | **30.3** | **30.2** | **27.4** | **22.8** |
+|  | upstream 2.12.2 | 23.2 | 22.7 | 18.6 | 9.1 | 6.1 |
+| Huihui-Qwen3.8-27B-abliterated | this fork | **32.0** | **33.9** | **30.1** | **27.8** | **23.3** |
+|  | upstream 2.12.2 | 24.2 | 22.9 | 19.9 | 10.3 | 6.0 |
+| Swift-1.5-Qwen3.8-27b | this fork | **31.5** | **32.3** | **29.0** | **27.0** | **16.9** |
+|  | upstream 2.12.2 | 24.3 | 23.5 | 19.3 | 10.7 | 5.9 |
 
 ### Peak memory
 
 The largest amount of memory MLX allocated while reading the prompt of each length and answering.
 
-| Model | | 8K | 32K | 64K | 128K | 256K |
-|---|---|---|---|---|---|---|
-| Qwen3.6-35B-A3B | this fork | **32.6 GB** | **32.6 GB** | **32.6 GB** | **32.6 GB** | **34.2 GB** |
-|  | upstream 2.12.2 | 22.6 GB | 24.7 GB | 27.3 GB | 32.2 GB | 45.2 GB |
-| Ornith-1.5-35B-A3B | this fork | **32.6 GB** | **32.6 GB** | **32.6 GB** | **32.6 GB** | — |
-|  | upstream 2.12.2 | 23.9 GB | 26.0 GB | 28.6 GB | 33.5 GB | — |
-| Qwen3.8-27B | this fork | **25.1 GB** | **27.4 GB** | **30.6 GB** | **35.5 GB** | **43.4 GB** |
-|  | upstream 2.12.2 | 25.5 GB | 29.7 GB | 36.1 GB | 45.0 GB | failed (507) |
-| Huihui-Qwen3.8-27B-abliterated | this fork | **20.2 GB** | **22.9 GB** | **26.9 GB** | **35.0 GB** | — |
-|  | upstream 2.12.2 | 21.0 GB | 25.2 GB | 31.6 GB | 41.0 GB | — |
-| Swift-1.5-Qwen3.8-27b | this fork | **20.2 GB** | **22.9 GB** | **26.9 GB** | **35.0 GB** | — |
-|  | upstream 2.12.2 | 21.0 GB | 25.2 GB | 31.6 GB | 41.3 GB | — |
+| Model | | 8K | 32K | 64K | 128K |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B | this fork | **32.6 GB** | **32.6 GB** | **32.6 GB** | **32.6 GB** |
+|  | upstream 2.12.2 | 22.6 GB | 24.7 GB | 27.3 GB | 32.2 GB |
+| Ornith-1.5-35B-A3B | this fork | **32.6 GB** | **32.6 GB** | **32.6 GB** | **32.6 GB** |
+|  | upstream 2.12.2 | 23.9 GB | 26.0 GB | 28.6 GB | 33.5 GB |
+| Qwen3.8-27B | this fork | **25.1 GB** | **27.4 GB** | **30.6 GB** | **35.5 GB** |
+|  | upstream 2.12.2 | 25.5 GB | 29.7 GB | 36.1 GB | 45.0 GB |
+| Huihui-Qwen3.8-27B-abliterated | this fork | **20.2 GB** | **22.9 GB** | **26.9 GB** | **35.0 GB** |
+|  | upstream 2.12.2 | 21.0 GB | 25.2 GB | 31.6 GB | 41.0 GB |
+| Swift-1.5-Qwen3.8-27b | this fork | **20.2 GB** | **22.9 GB** | **26.9 GB** | **35.0 GB** |
+|  | upstream 2.12.2 | 21.0 GB | 25.2 GB | 31.6 GB | 41.3 GB |
+
+### 246K prompt (non-repeating text)
+
+From bench 2 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench): 245,637 tokens of telemetry records, then three turns with thinking on (temperature 1.0, up to 4,096 tokens per turn).
+
+| Model | | Prefill | Decode (turns 1 / 2 / 3) | Peak wired memory |
+|---|---|---|---|---|
+| Qwen3.6-35B-A3B | this fork | **253 tok/s** | **48.5 / 46.2 / 45.9** | **34.6 GB** |
+|  | upstream 2.12.2 | 147 tok/s | 11.5 / 13.2 / 12.6 | 49.6 GB |
+| Qwen3.8-27B | this fork | **80 tok/s** | **20.9 / 21.0 / 18.2** | **44.4 GB** |
+|  | upstream 2.12.2 | stopped out of memory in turn 1 | — | 58.4 GB |
 
 ### Conditions
 
-- Qwen3.6-35B-A3B and Qwen3.8-27B were measured on v2.12.2-m1.10 (2026-10-20), upstream at 256K only; the other rows are from v2.12.2-m1.8.
-- The prompts repeat one 11K-token HTML file (22 times at 256K, about 254K tokens). From the third repeat on, Qwen3.8-27B predicts its own next tokens poorly on this text (upstream MTPLX too), and the draft head, which reads the model's hidden states, then rarely matches: the 27B's 256K decode (10.1 tok/s) reflects the prompt. On non-repeating text this fork's 27B decodes 18–21 tok/s at 246K ([apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench), thinking on).
-- Upstream stopped the Qwen3.8-27B's 256K prompt with HTTP 507 (out of memory) during the prefill.
+- Qwen3.6-35B-A3B and Qwen3.8-27B were measured on v2.12.2-m1.10 (2026-10-20); the other rows are from v2.12.2-m1.8.
+- The 8K–128K prompts repeat one 11K-token HTML file. Read to about 256K (22 repeats), Qwen3.8-27B predicts its own next tokens poorly from the third repeat on (upstream MTPLX too), and the draft head, which reads the model's hidden states, then rarely matches, so 256K is shown with the non-repeating text above instead.
 - MacBook Pro M1 Max 64 GB, macOS 26. Profile `turbo`, 256K context limit, 8-bit KV cache, temperature 0.6 with fixed seeds.
 - Both engines use the MTP depth this fork runs fastest at (listed in [Models](#models)).
 - The server was restarted for each length, so every prompt is read cold. Items measured more than once show the faster run (some runs came out slower, for example with a hot GPU).
 - Upstream's 32K decode on Ornith-1.5-35B-A3B (86.8 tok/s) is higher than its other lengths because the answer quoted the file at length and upstream's context-copy copied it.
-- This fork's peak on the Qwen3.6-35B-A3B family (32.6 GB) is reached while the model loads: the MoE weights are repacked then, which needs memory for a while. While answering it uses 21–24 GB up to 128K (24.4 GB at 128K, against 26.2 GB on upstream); the 256K column is the answer's peak (34.2 GB, upstream 45.2 GB).
+- This fork's peak on the Qwen3.6-35B-A3B family (32.6 GB) is reached while the model loads: the MoE weights are repacked then, which needs memory for a while. While answering it uses 21–24 GB (24.4 GB at 128K, against 26.2 GB on upstream).
 - Swift-1.5-Qwen3.8-27b decodes more slowly at 128K than Huihui-Qwen3.8-27B-abliterated, which has the same layout (16.9 against 23.3 tok/s). Repeated runs agree; the cause is still being investigated.
 
 ## Models
@@ -196,7 +206,7 @@ scripts/m1-depth-sweep.py --model "$HOME/.mtplx/models/<model folder>"
 
 - Prefill: part of the work runs on the Neural Engine alongside the GPU. Attention over the cached history uses flash-attention tuned for M1. Short additions to a long history (tool results and the like) read the 8-bit KV in place.
 - Decode: fewer CPU–GPU round trips per round. On Qwen3.6-35B-A3B family models, the next round is queued on the GPU before the CPU reads the previous one. File rewrites copy the parts that match the prompt (context-copy, exact matches only).
-- Memory: the KV cache is kept in 8-bit pages, and long prompts are prefilled straight into them. Memory estimates follow values measured on this fork. A 256K-token conversation runs at the default settings on a 64 GB Mac.
+- Memory: the KV cache is kept in 8-bit pages, and long prompts are prefilled straight into them (on dense models, prompts over 192K tokens are read with fp16 KV and repacked). Memory estimates follow values measured on this fork. A 256K-token conversation runs at the default settings on a 64 GB Mac.
 - Defaults: Qwen3.5, 3.6 and 3.8 family models launch on `turbo`. A Qwen3.6-35B-A3B family model started from the app also takes the A3B path.
 - Agent sessions (on any Mac): finding the same conversation again across history rewrites, keeping whitespace in tool arguments, retrying a request when macOS stops a long GPU command, resuming from the deepest saved state, and more.
 
