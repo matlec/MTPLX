@@ -290,9 +290,21 @@ def install(model: Any = None) -> dict[str, Any]:
         if rows > ffn.max_rows:
             # The FFN is row-wise: a wide chunk (4096 rows with the pipeline's chunk size, past its
             # context limit) runs as blocks the program holds.
+            # Each block is evaluated before the next one runs: a block's ANE
+            # share is a lazy read of the program's single output buffer, and
+            # the next block's run overwrites it. Unevaluated, the first block
+            # read the last block's rows (2026-10-20: past the pipeline's 32K
+            # limit the 27B prefilled 4,096-row chunks this way; the first
+            # 2,048 rows of every chunk got the wrong FFN share, the target's
+            # top-1 on those rows fell from ~0.9 to ~0.3 and the draft's
+            # acceptance collapsed on cold 250K prompts).
             flat = x.reshape(rows, H)
             step = ffn.max_rows
-            parts = [call(self, flat[a : a + step][None]) for a in range(0, rows, step)]
+            parts = []
+            for a in range(0, rows, step):
+                part = call(self, flat[a : a + step][None])
+                mx.eval(part)
+                parts.append(part)
             return mx.concatenate([p.reshape(-1, H) for p in parts], axis=0).reshape(x.shape)
         cut = inter - channels
         L = _layer(self, cut)

@@ -92,3 +92,12 @@ def test_wide_chunks_run_in_blocks(installed):
     assert out.shape == ref.shape
     err = float(mx.sqrt(mx.mean((out - ref) ** 2)) / mx.sqrt(mx.mean(ref ** 2)))
     assert err < 0.03, err
+    # Every block, not only the whole: the blocks share the program's output
+    # buffer, and the first block read the last block's output (2026-10-20:
+    # past 32K the 27B prefilled 4,096-row chunks this way, and the first
+    # 2,048 rows of every chunk got the wrong FFN share).
+    step = ap._STATE["ffn"].max_rows
+    for a in range(0, 3000, step):
+        o, r = out[:, a : a + step], ref[:, a : a + step]
+        block = float(mx.sqrt(mx.mean((o - r) ** 2)) / mx.sqrt(mx.mean(r ** 2)))
+        assert block < 0.03, (a, block)
