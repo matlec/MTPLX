@@ -2589,12 +2589,23 @@ def _m1_paged_prefill_enabled(context_tokens: int) -> bool:
     ``MTPLX_M1_PAGED_PREFILL_MIN_CONTEXT`` (32,768) keep the contiguous layout,
     where the saving is under a gigabyte. ``MTPLX_M1_PAGED_PREFILL=0`` keeps
     it for every prompt.
+
+    Prompts over ``MTPLX_M1_PAGED_PREFILL_MAX_CONTEXT`` (196,608) keep the
+    contiguous layout too: each paged chunk dequantizes the whole prefix to
+    fp16 for its attention, and at 253K (the README bench's 256K prompt on
+    the 27B) the paged prefill peaked at 51.3 GB (MLX) against 43.4 GB
+    contiguous at the same 79-80 tok/s, and once the ANE wide-chunk fix
+    (d877dd3a) was in, the paged run hit the memory guard's abort floor
+    (HTTP 507) where the contiguous one finished (2026-10-20).
     """
     from .cache_state import _env_flag_default_m1
 
     if not _env_flag_default_m1("MTPLX_M1_PAGED_PREFILL"):
         return False
-    return int(context_tokens) >= _env_int("MTPLX_M1_PAGED_PREFILL_MIN_CONTEXT", 32768)
+    tokens = int(context_tokens)
+    if tokens > _env_int("MTPLX_M1_PAGED_PREFILL_MAX_CONTEXT", 196608):
+        return False
+    return tokens >= _env_int("MTPLX_M1_PAGED_PREFILL_MIN_CONTEXT", 32768)
 
 
 def _m1_moe_deferred_draft_enabled(rt: Any) -> bool:
