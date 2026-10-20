@@ -57,3 +57,9 @@ def test_only_the_a3b_lane_turns_on_context_copy_with_ramp():
     assert int(_M1_A3B_ENV["MTPLX_CCOPY_BANK_MAX_LEN"]) >= 97
     assert "MTPLX_CONTEXT_COPY" not in _M1_MOE_ENV
     assert "MTPLX_CONTEXT_COPY" not in _M1_MOE_GDN_ENV
+
+
+def test_moe_lane_keeps_paged_prefill_past_the_dense_cap():
+    from mtplx.commands.public import _M1_MOE_ENV
+
+    assert int(_M1_MOE_ENV["MTPLX_M1_PAGED_PREFILL_MAX_CONTEXT"]) >= 262144

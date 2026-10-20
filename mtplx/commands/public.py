@@ -1422,6 +1422,12 @@ _M1_MOE_ENV = {
     # display: 4,096 rows ran clean at 77K and were aborted at ~95K
     # (35B-A3B, display awake, 2026-10-15). 77-98K -> 2,048, 128K -> 1,024.
     "MTPLX_PREFILL_CHUNK_KEY_BUDGET": str(4096 * 49152),
+    # Long MoE prompts keep prefilling into the q8 pages: the 192K
+    # contiguous cap (generation._m1_paged_prefill_enabled) answers the
+    # dense 27B's memory at 253K, and the A3B has room there (34 GB wired at
+    # 246K) but read 11% slower contiguous (246K turn 1: 871 -> 967 s; turn 2
+    # decode 46.8 -> 41.8 tok/s, bench 2, 2026-10-20).
+    "MTPLX_M1_PAGED_PREFILL_MAX_CONTEXT": "262144",
 }
 # MoE with qwen3-next Gated DeltaNet layers (backend ``qwen3_next``):
 _M1_MOE_GDN_ENV = {
