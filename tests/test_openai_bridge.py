@@ -2604,6 +2604,43 @@ def test_opencode_session_cache_scope_is_launch_bound():
     assert "cache_scope=opencode_process_cache:v1:launch-a" in scoped
 
 
+def test_policy_fingerprint_ignores_thinking_toggle():
+    args = SimpleNamespace(
+        generation_mode="mtp",
+        depth=3,
+        strip_assistant_reasoning_history=False,
+        adaptive_policy="none",
+        online_correction_cache=False,
+        online_correction_cache_min_depth=1,
+        online_correction_cache_key="local_prefix",
+        prompt_correction_cache=False,
+        prompt_correction_cache_min_depth=2,
+        online_hidden_corrector_alpha=0.0,
+        online_hidden_corrector_decay=0.8,
+        online_hidden_corrector_warmup=1,
+        online_hidden_corrector_max_feed_depth=None,
+        online_hidden_corrector_key="global",
+        tool_prompt_mode="hybrid",
+    )
+    state = SimpleNamespace(args=args, template_hash="template", draft_head_identity="draft")
+
+    on = _policy_fingerprint(state, thinking_enabled=True)
+    off = _policy_fingerprint(state, thinking_enabled=False)
+
+    # A thinking ON -> OFF turn over the same prefix must reach the banked KV.
+    assert on == off
+    assert "thinking=" not in on
+    # What does change the KV or the MTP history still separates entries.
+    assert on != _policy_fingerprint(
+        SimpleNamespace(args=args, template_hash="other", draft_head_identity="draft"),
+        thinking_enabled=True,
+    )
+    assert on != _policy_fingerprint(state, thinking_enabled=True, generation_mode="ar")
+    assert on != _policy_fingerprint(state, thinking_enabled=True, depth=2)
+    assert on != _policy_fingerprint(state, thinking_enabled=True, tools_active=True)
+    assert on != _policy_fingerprint(state, thinking_enabled=True, cache_scope="opencode_process_cache:v1:x")
+
+
 def test_opencode_tool_history_forces_clone_restore_without_default_bypass(monkeypatch):
     monkeypatch.delenv("MTPLX_OPENCODE_TOOL_HISTORY_SESSIONBANK_BYPASS", raising=False)
     monkeypatch.delenv("MTPLX_OPENCODE_TOOL_HISTORY_LIVE_FRONTIER", raising=False)

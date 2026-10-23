@@ -26903,7 +26903,12 @@ def _policy_fingerprint(
     online_hidden = _online_hidden_config(state.args)
     parts = [
         f"template={state.template_hash}",
-        f"thinking={int(bool(thinking_enabled))}",
+        # thinking is the policy of the turn being generated, not of the KV
+        # already banked: an entry is exact for its token ids, and whatever
+        # thinking changes in the rendered prompt shows up as a token
+        # divergence. Keying on it made a thinking ON -> OFF turn on the same
+        # 32K-256K prefix drop every candidate and re-prefill cold (bench 3
+        # R4: A3B 256K 1,039 s vs 44 s on Splash).
         _reasoning_history_fingerprint_component(state),
         f"openai_bridge={_OPENAI_BRIDGE_POLICY_VERSION}",
         f"tool_prompt_mode={effective_tool_prompt_mode}",
