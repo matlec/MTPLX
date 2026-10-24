@@ -47,3 +47,20 @@ def test_declines_what_it_does_not_serve(monkeypatch):
         prefix=8192, scale=1 / 16) is None
     monkeypatch.setenv("MTPLX_MFA_PREFILL", "0")
     assert mfa_prefill.mfa_prefill_attention(queries=q, keys=k, values=v, prefix=8192, scale=1 / 16) is None
+
+
+def test_running_output_does_not_overflow_fp16(monkeypatch):
+    # Equal scores over 8K keys of |v| = 60: the running, unnormalized O is
+    # 8192 x 60 = 491,520, past fp16's 65,504. The kernel used to keep it in
+    # the fp16 output buffer between key blocks (27B, 245K context: NaN
+    # logits); the attention itself is just the value, 60.
+    monkeypatch.setenv("MTPLX_MFA_PREFILL", "1")
+    prefix, q_len = 8192, 256
+    cap = prefix + q_len
+    q = mx.zeros((1, 24, q_len, 256), dtype=mx.float16)
+    k = mx.zeros((1, 4, cap, 256), dtype=mx.float16)
+    v = mx.full((1, 4, cap, 256), 60.0, dtype=mx.float16)
+    got = mfa_prefill.mfa_prefill_attention(queries=q, keys=k, values=v, prefix=prefix, scale=1 / 16)
+    assert got is not None
+    assert mx.all(mx.isfinite(got)).item()
+    assert mx.max(mx.abs(got.astype(mx.float32) - 60.0)).item() < 0.1

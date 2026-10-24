@@ -78,7 +78,9 @@ std::vector<mx::array> mfa_attention_fwd(
   auto vc = mx::contiguous(v, false, stream);
   return mx::array::make_arrays(
       {q.shape(), {q.shape(0), q.shape(1)}},
-      {mx::float16, mx::float32},
+      // O is fp32: the kernel keeps the running (unnormalized) O in the output
+      // buffer between key blocks, and in fp16 that sum overflowed on long prompts.
+      {mx::float32, mx::float32},
       std::make_shared<MfaAttentionFwd>(stream, n_keys),
       {qc, kc, vc});
 }
