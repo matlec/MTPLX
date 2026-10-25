@@ -82,6 +82,7 @@
 ### 計測の条件
 
 - Qwen3.6-35B-A3B と Qwen3.8-27B は v2.12.2-m1.10 で測り直しました（2026-10-20）。ほかの行は v2.12.2-m1.8 の計測です。
+- v2.12.2-m1.11 で、長い履歴への prefill の attention を直しました。途中の和を fp16 で持っていたため、27B では 19.2 万〜25.6 万トークンの cold のプロンプトの多くが NaN で止まり、3.2 万トークン以上では両方のモデルで出力が少し変わっていました。prefill の速さは変わりません。bench 3 では 3.2 万〜12.8 万トークンの decode の差が数 % だったので、上の表は測り直していません。修正後の 19.2 万〜25.6 万トークンの値は [apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench) の bench 3 にあります（27B は prefill 78〜90 tok/s、decode 17〜21 tok/s）。
 - 8K〜128K のプロンプトは、1 万 1 千トークンの HTML ファイルを繰り返したものです。約 256K（22 回の繰り返し）まで読ませると、3 回目の繰り返しから Qwen3.8-27B 自身の次のトークンの予測が当たらなくなり（本家でも同じ）、モデルの hidden state を読む draft ヘッドも当たらなくなります。そのため 256K 前後は、上の繰り返しのない文章の計測で示しています。
 - MacBook Pro M1 Max 64 GB、macOS 26。プロファイルは `turbo`、文脈の上限は 256K、KV キャッシュは 8bit、temperature は 0.6（seed 固定）です。
 - MTP の深さは、このフォークで一番速かった値（「[対象のモデル](#対象のモデル)」の表に記載）を、両方のエンジンで使いました。
@@ -122,7 +123,7 @@
 ## インストール
 
 ```bash
-git clone --branch v2.12.2-m1.10 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.11 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # 1 分ほど。「mfa_attn: ok」と「ane_ffn: ok」が出れば完了
 ```
@@ -162,7 +163,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'content-type: application/
 
 ```bash
 git fetch --tags
-git checkout <新しいタグ>               # 例: v2.12.2-m1.9
+git checkout <新しいタグ>               # 例: v2.12.2-m1.11
 scripts/build-m1-native-extensions.sh   # ネイティブ拡張が変わった版だけ必要です（リリースノートに書きます）
 ```
 
@@ -208,7 +209,7 @@ scripts/m1-depth-sweep.py --model "$HOME/.mtplx/models/<モデルのフォルダ
 - decode: 1 round ごとの CPU と GPU のやり取りを減らしています。Qwen3.6-35B-A3B 系では、前の round の結果を CPU が読む前に、次の round を GPU に投入します。ファイルを書き直すときは、プロンプトと一致する部分をそのまま写します（context-copy、完全一致のときだけ）。
 - メモリ: KV キャッシュを 8bit のページで持ち、長いプロンプトはそのページに直接 prefill します（dense のモデルで 19.2 万トークンを超えるプロンプトは、fp16 で読んでから詰め直します）。メモリの見積もりは、このフォークで測った値に合わせています。64 GB の Mac で、256K トークンの会話が既定の設定のまま動きます。
 - 既定の設定: Qwen3.5・3.6・3.8 系は `turbo` で起動します。アプリから Qwen3.6-35B-A3B 系を起動したときも、A3B 用の経路を使います。
-- エージェントの会話（M1 以外の Mac でも有効）: 履歴の書き換えをまたいで同じ会話を見つけ直す、ツールの引数の空白を保つ、macOS が長い GPU の処理を止めたときに要求をやり直す、保存した状態の一番深いところから再開する、などの修正です。
+- エージェントの会話（M1 以外の Mac でも有効）: 履歴の書き換えをまたいで同じ会話を見つけ直す、thinking の有無を切り替えてもキャッシュを使い続ける、ツールの引数の空白を保つ、macOS が長い GPU の処理を止めたときに要求をやり直す、保存した状態の一番深いところから再開する、などの修正です。
 
 変更の一つ一つと計測の結果は、[CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.md) と[リリースノート](https://github.com/shunya1810/MTPLX/releases)にあります。
 

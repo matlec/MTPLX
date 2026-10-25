@@ -82,6 +82,7 @@ From bench 2 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-si
 ### Conditions
 
 - Qwen3.6-35B-A3B and Qwen3.8-27B were measured on v2.12.2-m1.10 (2026-10-20); the other rows are from v2.12.2-m1.8.
+- v2.12.2-m1.11 fixes the prefill attention over long histories, whose running sum was kept in fp16: on the 27B most cold prompts of 192K–256K ended with NaN, and from 32K on the answers of both models change a little. Prefill speed is unchanged; in bench 3 the decode at 32K–128K moved by a few percent, so the tables above were not re-measured. Bench 3 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-silicon-llm-bench) has 192K–256K after the fix (27B: prefill 78–90 tok/s, decode 17–21 tok/s).
 - The 8K–128K prompts repeat one 11K-token HTML file. Read to about 256K (22 repeats), Qwen3.8-27B predicts its own next tokens poorly from the third repeat on (upstream MTPLX too), and the draft head, which reads the model's hidden states, then rarely matches, so 256K is shown with the non-repeating text above instead.
 - MacBook Pro M1 Max 64 GB, macOS 26. Profile `turbo`, 256K context limit, 8-bit KV cache, temperature 0.6 with fixed seeds.
 - Both engines use the MTP depth this fork runs fastest at (listed in [Models](#models)).
@@ -122,7 +123,7 @@ From bench 2 of [apple-silicon-llm-bench](https://github.com/shunya1810/apple-si
 ## Install
 
 ```bash
-git clone --branch v2.12.2-m1.10 https://github.com/shunya1810/MTPLX.git MTPLX-m1
+git clone --branch v2.12.2-m1.11 https://github.com/shunya1810/MTPLX.git MTPLX-m1
 cd MTPLX-m1
 scripts/build-m1-native-extensions.sh   # about a minute; done when it prints "mfa_attn: ok" and "ane_ffn: ok"
 ```
@@ -162,7 +163,7 @@ More: [docs/m1max-longctx/USAGE.md](docs/m1max-longctx/USAGE.md).
 
 ```bash
 git fetch --tags
-git checkout <new tag>                  # for example v2.12.2-m1.9
+git checkout <new tag>                  # for example v2.12.2-m1.11
 scripts/build-m1-native-extensions.sh   # needed only when the native extensions changed (the release notes say so)
 ```
 
@@ -208,7 +209,7 @@ scripts/m1-depth-sweep.py --model "$HOME/.mtplx/models/<model folder>"
 - Decode: fewer CPU–GPU round trips per round. On Qwen3.6-35B-A3B family models, the next round is queued on the GPU before the CPU reads the previous one. File rewrites copy the parts that match the prompt (context-copy, exact matches only).
 - Memory: the KV cache is kept in 8-bit pages, and long prompts are prefilled straight into them (on dense models, prompts over 192K tokens are read with fp16 KV and repacked). Memory estimates follow values measured on this fork. A 256K-token conversation runs at the default settings on a 64 GB Mac.
 - Defaults: Qwen3.5, 3.6 and 3.8 family models launch on `turbo`. A Qwen3.6-35B-A3B family model started from the app also takes the A3B path.
-- Agent sessions (on any Mac): finding the same conversation again across history rewrites, keeping whitespace in tool arguments, retrying a request when macOS stops a long GPU command, resuming from the deepest saved state, and more.
+- Agent sessions (on any Mac): finding the same conversation again across history rewrites, keeping the cache when thinking is switched on or off, keeping whitespace in tool arguments, retrying a request when macOS stops a long GPU command, resuming from the deepest saved state, and more.
 
 Every change with its measurements: [CHANGES.ja.md](docs/m1max-longctx/CHANGES.ja.md) (Japanese) and the [release notes](https://github.com/shunya1810/MTPLX/releases).
 
