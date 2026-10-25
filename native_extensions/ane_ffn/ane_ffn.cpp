@@ -312,12 +312,18 @@ mx::array AneFfn::stage(const mx::array& xq, const mx::array& tx, const mx::arra
                    {mx::contiguous(xq, false, s), mx::contiguous(tx, false, s), mx::contiguous(wg, false, s),
                     mx::contiguous(wu, false, s), mx::contiguous(wd, false, s)});
 }
+// A quantized weight's (w, scales, biases) as the staging kernels read them: scales and biases as half.
+// A bf16 checkpoint's were read as fp16 bits, so the ANE's weights were garbage and its prefill NaN.
+static mx::array quant_part(const mx::array& a, mx::Stream s) {
+  return mx::contiguous(mx::issubdtype(a.dtype(), mx::floating) ? mx::astype(a, mx::float16, s) : a, false, s);
+}
+
 mx::array AneFfn::stage_weights_q(const std::vector<mx::array>& g, const std::vector<mx::array>& u,
                                   const std::vector<mx::array>& d, int bits, int group,
                                   const std::vector<mx::array>& row_scales) {
   auto s = mx::default_stream(mx::Device::gpu);
   std::vector<mx::array> in;
-  for (auto* v : {&g, &u, &d}) for (auto& a : *v) in.push_back(mx::contiguous(a, false, s));
+  for (auto* v : {&g, &u, &d}) for (auto& a : *v) in.push_back(quant_part(a, s));
   if (w8_) {
     if (row_scales.size() != 3) throw std::runtime_error("ANE FFN int8 weights need gate/up/down row scales");
     // the kernel divides by the scale (in[9..11]); the program multiplies by scale*128 (in[12..14])
@@ -534,7 +540,7 @@ mx::array AneLinear::stage(const mx::array& xq, const mx::array& tx, const std::
   if (slot < 0 || slot >= slots_) throw std::runtime_error("ANE linear: weight slot out of range");
   auto s = mx::default_stream(mx::Device::gpu);
   std::vector<mx::array> in = {mx::contiguous(xq, false, s), mx::contiguous(tx, false, s)};
-  for (auto& a : weights) in.push_back(mx::contiguous(a, false, s));
+  for (auto& a : weights) in.push_back(quant_part(a, s));
   auto prim = std::make_shared<AneLinStage>(s, this, weights.empty() ? std::vector<int>{} : row_offsets, bits, group, slot);
   return mx::array({1}, mx::int32, prim, std::move(in));
 }
