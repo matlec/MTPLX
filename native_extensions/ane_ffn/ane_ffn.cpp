@@ -35,25 +35,48 @@ kernel void ane_stage_h(const device half* src [[buffer(0)]], device half* dst [
   if (c >= p.x || row >= rows) return;
   dst[row * p.w + c] = src[row * p.y + p.z + c];
 }
-// Packed affine weights (bits 4 or 8, per-group fp16 scale/bias) of `rows` rows of `in_dim` inputs, from
-// input `col0`: each threadgroup dequantizes one 512-input block of one row, rotates it with the
+// Quantized weight decoding. The kernels take p.z = bits | mode << 8 (mode as mtplx_ane::QuantMode):
+// 0 affine: code * scale + bias, scales and biases half;
+// 1 mxfp4: e2m1(code) * 2^(scale - 127);  2 nvfp4: e2m1(code) * e4m3(scale);  3 mxfp8: e4m3(code) * 2^(scale - 127).
+// Scales arrive as raw bytes (half for affine, uint8 otherwise); the fp modes read no biases.
+constant float kE2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                            -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+inline float e4m3(uint v) {
+  const uint e = (v >> 3) & 15u, m = v & 7u;
+  const float a = e ? ldexp(1.0f + float(m) * 0.125f, int(e) - 7) : ldexp(float(m) * 0.125f, -6);
+  return (v & 128u) ? -a : a;
+}
+inline float group_scale(const device uchar* sc, uint gi, uint mode) {
+  if (mode == 0) return float(((const device half*)sc)[gi]);
+  if (mode == 2) return e4m3(sc[gi]);
+  return ldexp(1.0f, int(sc[gi]) - 127);
+}
+inline float group_bias(const device half* bi, uint gi, uint mode) { return mode == 0 ? float(bi[gi]) : 0.0f; }
+inline float decode(uint code, float s, float b, uint mode) {
+  if (mode == 0) return float(code) * s + b;
+  if (mode == 3) return e4m3(code) * s;
+  return kE2M1[code & 15u] * s;
+}
+// Packed quantized weights (bits 4 or 8, per-group scale [and bias], see decode) of `rows` rows of `in_dim`
+// inputs, from input `col0`: each threadgroup dequantizes one 512-input block of one row, rotates it with the
 // orthonormal 512-point Walsh-Hadamard transform and writes it to dst[row * ld + dcol0 + j].
-kernel void ane_prep_w(const device uint* w [[buffer(0)]], const device half* sc [[buffer(1)]],
+kernel void ane_prep_w(const device uint* w [[buffer(0)]], const device uchar* sc [[buffer(1)]],
                        const device half* bi [[buffer(2)]], device half* dst [[buffer(3)]],
                        constant uint4& p [[buffer(4)]], constant uint4& q [[buffer(5)]],
                        uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
-  // p: in_dim (packed row length in elements), col0 (first input of block 0), bits, group
+  // p: in_dim (packed row length in elements), col0 (first input of block 0), bits | mode << 8, group
   // q: dst ld (elements), dst column of block 0, rows, dst row offset
   threadgroup float v[512];
   const uint row = tg.y, blk = tg.x;
   if (row >= q.z) return;
-  const uint per = 32 / p.z, words = p.x / per, groups = p.x / p.w;
+  const uint bits = p.z & 255u, mode = p.z >> 8;
+  const uint per = 32 / bits, words = p.x / per, groups = p.x / p.w;
   for (uint i = t; i < 512; i += 256) {
     const uint col = p.y + blk * 512 + i;
     const uint word = w[row * words + col / per];
-    const uint qv = (word >> ((col % per) * p.z)) & ((1u << p.z) - 1u);
+    const uint qv = (word >> ((col % per) * bits)) & ((1u << bits) - 1u);
     const uint gi = row * groups + col / p.w;
-    v[i] = float(qv) * float(sc[gi]) + float(bi[gi]);
+    v[i] = decode(qv, group_scale(sc, gi, mode), group_bias(bi, gi, mode), mode);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint h = 1; h < 512; h <<= 1) {
@@ -66,7 +89,7 @@ kernel void ane_prep_w(const device uint* w [[buffer(0)]], const device half* sc
   const float n = 0.04419417382415922f;  // 1/sqrt(512)
   for (uint i = t; i < 512; i += 256) dst[(q.w + row) * q.x + q.y + blk * 512 + i] = half(v[i] * n);
 }
-kernel void ane_prep_w8(const device uint* w [[buffer(0)]], const device half* sc [[buffer(1)]],
+kernel void ane_prep_w8(const device uint* w [[buffer(0)]], const device uchar* sc [[buffer(1)]],
                         const device half* bi [[buffer(2)]], device char* dst [[buffer(3)]],
                         constant uint4& p [[buffer(4)]], constant uint4& q [[buffer(5)]],
                         const device half* rs [[buffer(6)]],
@@ -75,13 +98,14 @@ kernel void ane_prep_w8(const device uint* w [[buffer(0)]], const device half* s
   threadgroup float v[512];
   const uint row = tg.y, blk = tg.x;
   if (row >= q.z) return;
-  const uint per = 32 / p.z, words = p.x / per, groups = p.x / p.w;
+  const uint bits = p.z & 255u, mode = p.z >> 8;
+  const uint per = 32 / bits, words = p.x / per, groups = p.x / p.w;
   for (uint i = t; i < 512; i += 256) {
     const uint col = p.y + blk * 512 + i;
     const uint word = w[row * words + col / per];
-    const uint qv = (word >> ((col % per) * p.z)) & ((1u << p.z) - 1u);
+    const uint qv = (word >> ((col % per) * bits)) & ((1u << bits) - 1u);
     const uint gi = row * groups + col / p.w;
-    v[i] = float(qv) * float(sc[gi]) + float(bi[gi]);
+    v[i] = decode(qv, group_scale(sc, gi, mode), group_bias(bi, gi, mode), mode);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint h = 1; h < 512; h <<= 1) {
@@ -98,19 +122,25 @@ kernel void ane_prep_w8(const device uint* w [[buffer(0)]], const device half* s
 // Faster weight prep: 64 threads per 512-block, 8 values each. Stages 1,2,4 in registers on 8 consecutive
 // values, then a transpose to stride 8 (stages 8,16,32) and to stride 64 (stages 64,128,256).
 template <typename OUT>
-inline void prep_block(const device uint* w, const device half* sc, const device half* bi, device OUT* dst,
+inline void prep_block(const device uint* w, const device uchar* sc, const device half* bi, device OUT* dst,
                        constant uint4& p, constant uint4& q, float post, uint row, uint blk, uint t,
                        threadgroup float* v, bool to_int8) {
-  const uint per = 32 / p.z, words = p.x / per, groups = p.x / p.w;
+  // The 8 values share one scale: every mode's group (16 to 128) is a multiple of 8.
+  const uint bits = p.z & 255u, mode = p.z >> 8;
+  const uint per = 32 / bits, words = p.x / per, groups = p.x / p.w;
   float r[8];
   const uint col0 = p.y + blk * 512 + t * 8;
-  const float s = float(sc[row * groups + col0 / p.w]), b = float(bi[row * groups + col0 / p.w]);
-  if (p.z == 4) {
+  const uint gi = row * groups + col0 / p.w;
+  const float s = group_scale(sc, gi, mode), b = group_bias(bi, gi, mode);
+  if (bits == 4) {
     const uint word = w[row * words + col0 / 8];
-    for (uint j = 0; j < 8; ++j) r[j] = float((word >> (4 * j)) & 15u) * s + b;
+    for (uint j = 0; j < 8; ++j) r[j] = decode((word >> (4 * j)) & 15u, s, b, mode);
   } else {
     const uint w0 = w[row * words + col0 / 4], w1 = w[row * words + col0 / 4 + 1];
-    for (uint j = 0; j < 4; ++j) { r[j] = float((w0 >> (8 * j)) & 255u) * s + b; r[4 + j] = float((w1 >> (8 * j)) & 255u) * s + b; }
+    for (uint j = 0; j < 4; ++j) {
+      r[j] = decode((w0 >> (8 * j)) & 255u, s, b, mode);
+      r[4 + j] = decode((w1 >> (8 * j)) & 255u, s, b, mode);
+    }
   }
   // stages 1, 2, 4 (within the 8 consecutive values)
   for (uint h = 1; h < 8; h <<= 1)
@@ -136,7 +166,7 @@ inline void prep_block(const device uint* w, const device half* sc, const device
     else o[t + 64 * k] = OUT(val);
   }
 }
-kernel void ane_prep_w2(const device uint* w [[buffer(0)]], const device half* sc [[buffer(1)]],
+kernel void ane_prep_w2(const device uint* w [[buffer(0)]], const device uchar* sc [[buffer(1)]],
                         const device half* bi [[buffer(2)]], device half* dst [[buffer(3)]],
                         constant uint4& p [[buffer(4)]], constant uint4& q [[buffer(5)]],
                         uint2 tg [[threadgroup_position_in_grid]], uint t [[thread_index_in_threadgroup]]) {
@@ -144,7 +174,7 @@ kernel void ane_prep_w2(const device uint* w [[buffer(0)]], const device half* s
   if (tg.y >= q.z) return;
   prep_block<half>(w, sc, bi, dst, p, q, 0.04419417382415922f, tg.y, tg.x, t, v, false);
 }
-kernel void ane_prep_w8b(const device uint* w [[buffer(0)]], const device half* sc [[buffer(1)]],
+kernel void ane_prep_w8b(const device uint* w [[buffer(0)]], const device uchar* sc [[buffer(1)]],
                          const device half* bi [[buffer(2)]], device char* dst [[buffer(3)]],
                          constant uint4& p [[buffer(4)]], constant uint4& q [[buffer(5)]],
                          const device half* rs [[buffer(6)]],
@@ -312,15 +342,32 @@ mx::array AneFfn::stage(const mx::array& xq, const mx::array& tx, const mx::arra
                    {mx::contiguous(xq, false, s), mx::contiguous(tx, false, s), mx::contiguous(wg, false, s),
                     mx::contiguous(wu, false, s), mx::contiguous(wd, false, s)});
 }
-// A quantized weight's (w, scales, biases) as the staging kernels read them: scales and biases as half.
-// A bf16 checkpoint's were read as fp16 bits, so the ANE's weights were garbage and its prefill NaN.
+// A quantized weight's (w, scales, biases) as the staging kernels read them: affine scales and biases as
+// half (a bf16 checkpoint's were read as fp16 bits, so the ANE's weights were garbage and its prefill NaN);
+// the fp modes' uint8 scales as they are.
 static mx::array quant_part(const mx::array& a, mx::Stream s) {
   return mx::contiguous(mx::issubdtype(a.dtype(), mx::floating) ? mx::astype(a, mx::float16, s) : a, false, s);
 }
 
+QuantMode quant_mode(const std::string& name, int bits, int group) {
+  // The staging kernels decode 4- and 8-bit codes, one scale per 8 consecutive values.
+  struct Spec { const char* name; QuantMode mode; int bits, group; };
+  static const Spec fp[] = {{"mxfp4", QuantMode::mxfp4, 4, 32}, {"nvfp4", QuantMode::nvfp4, 4, 16},
+                            {"mxfp8", QuantMode::mxfp8, 8, 32}};
+  if (name == "affine") {
+    if ((bits == 4 || bits == 8) && group >= 8 && group % 8 == 0) return QuantMode::affine;
+  } else {
+    for (const auto& f : fp)
+      if (name == f.name && bits == f.bits && group == f.group) return f.mode;
+  }
+  throw std::invalid_argument("ANE weight staging: unsupported quantization " + name + " bits=" + S(bits) +
+                              " group=" + S(group));
+}
+
 mx::array AneFfn::stage_weights_q(const std::vector<mx::array>& g, const std::vector<mx::array>& u,
                                   const std::vector<mx::array>& d, int bits, int group,
-                                  const std::vector<mx::array>& row_scales) {
+                                  const std::vector<mx::array>& row_scales, const std::string& mode) {
+  const QuantMode qm = quant_mode(mode, bits, group);
   auto s = mx::default_stream(mx::Device::gpu);
   std::vector<mx::array> in;
   for (auto* v : {&g, &u, &d}) for (auto& a : *v) in.push_back(quant_part(a, s));
@@ -331,7 +378,7 @@ mx::array AneFfn::stage_weights_q(const std::vector<mx::array>& g, const std::ve
     for (auto& a : row_scales) in.push_back(mx::contiguous(mx::astype(mx::multiply(a, mx::array(128.0f), s), mx::float16, s), false, s));
   }
   auto prim = std::make_shared<AneStage>(s, this, true);
-  prim->quantized_ = true; prim->bits_ = bits; prim->group_ = group;
+  prim->quantized_ = true; prim->bits_ = bits; prim->group_ = group; prim->mode_ = qm;
   return mx::array({1}, mx::int32, prim, std::move(in));
 }
 
@@ -378,7 +425,7 @@ void AneStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& enc = mx::metal::get_command_encoder(s);
-  auto* lib = d.get_library("mtplx_ane_stage3", [] { return std::string(kStageSource); });
+  auto* lib = d.get_library("mtplx_ane_stage4", [] { return std::string(kStageSource); });
   if (prep_x_) {
     AneFfn& f = *ffn_;
     const uint32_t R = in[0].shape(0);
@@ -401,7 +448,7 @@ void AneStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::array>
     enc.set_compute_pipeline_state(kp);
     const uint32_t H = f.hidden_, C = f.channels_;
     auto prep = [&](int base, uint32_t rows, uint32_t in_dim, uint32_t col0, const AneFfn::Target& dst, uint32_t blocks) {
-      const uint32_t p[4] = {in_dim, col0, uint32_t(bits_), uint32_t(group_)};
+      const uint32_t p[4] = {in_dim, col0, uint32_t(bits_) | uint32_t(mode_) << 8, uint32_t(group_)};
       const uint32_t q[4] = {dst.surface->stride / 2, 0, rows, 0};
       enc.set_input_array(in[base], 0);
       enc.set_input_array(in[base + 1], 1);
@@ -536,12 +583,16 @@ AneLinear::~AneLinear() {
 }
 
 mx::array AneLinear::stage(const mx::array& xq, const mx::array& tx, const std::vector<mx::array>& weights,
-                           const std::vector<int>& row_offsets, int bits, int group, int slot) {
+                           const std::vector<int>& row_offsets, int bits, int group, int slot,
+                           const std::string& mode) {
   if (slot < 0 || slot >= slots_) throw std::runtime_error("ANE linear: weight slot out of range");
+  // Input-only stages pass placeholder bits/group; the mode only matters with weights.
+  const QuantMode qm = weights.empty() ? QuantMode::affine : quant_mode(mode, bits, group);
   auto s = mx::default_stream(mx::Device::gpu);
   std::vector<mx::array> in = {mx::contiguous(xq, false, s), mx::contiguous(tx, false, s)};
   for (auto& a : weights) in.push_back(quant_part(a, s));
-  auto prim = std::make_shared<AneLinStage>(s, this, weights.empty() ? std::vector<int>{} : row_offsets, bits, group, slot);
+  auto prim = std::make_shared<AneLinStage>(s, this, weights.empty() ? std::vector<int>{} : row_offsets, bits, group,
+                                            slot, qm);
   return mx::array({1}, mx::int32, prim, std::move(in));
 }
 
@@ -573,7 +624,7 @@ void AneLinStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::arr
   auto& s = stream();
   auto& d = mx::metal::device(s.device);
   auto& enc = mx::metal::get_command_encoder(s);
-  auto* lib = d.get_library("mtplx_ane_stage3", [] { return std::string(kStageSource); });
+  auto* lib = d.get_library("mtplx_ane_stage4", [] { return std::string(kStageSource); });
   AneLinear& f = *lin_;
   const uint32_t R = in[0].shape(0), H = f.hidden_;
   const uint32_t kSeg = uint32_t(f.seg_);
@@ -603,7 +654,7 @@ void AneLinStage::eval_gpu(const std::vector<mx::array>& in, std::vector<mx::arr
     const uint32_t rows = w.shape(0);
     for (size_t k = 0; k < f.x_.size(); ++k) {
       const AneFfn::Target& wt = f.w_[base + k];
-      const uint32_t p[4] = {H, uint32_t(k * kSeg), uint32_t(bits_), uint32_t(group_)};
+      const uint32_t p[4] = {H, uint32_t(k * kSeg), uint32_t(bits_) | uint32_t(mode_) << 8, uint32_t(group_)};
       const uint32_t q[4] = {wt.surface->stride / 2, 0, rows, uint32_t(offsets_[j])};
       enc.set_input_array(w, 0);
       enc.set_input_array(in[3 + 3 * j], 1);

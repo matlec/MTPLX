@@ -67,8 +67,41 @@ def _had(a: mx.array) -> mx.array:
     return mx.hadamard_transform(a.reshape(*s[:-1], s[-1] // 512, 512), scale=1 / math.sqrt(512)).reshape(s)
 
 
-def _qparams(lin: Any) -> tuple[mx.array, mx.array, mx.array | None, int, int]:
-    return lin.weight, lin.scales, getattr(lin, "biases", None), int(lin.group_size), int(lin.bits)
+def _qparams(lin: Any) -> tuple[mx.array, mx.array, mx.array | None, int, int, str]:
+    """(weight, scales, biases, group_size, bits, mode) of a quantized linear; biases None for the fp modes."""
+
+    return (lin.weight, lin.scales, getattr(lin, "biases", None), int(lin.group_size), int(lin.bits),
+            str(getattr(lin, "mode", "affine")))
+
+
+# (mode, bits, group) the native staging decodes besides 4/8-bit affine (native_extensions/ane_ffn quant_mode).
+_NATIVE_FP_MODES = {("mxfp4", 4, 32), ("nvfp4", 4, 16), ("mxfp8", 8, 32)}
+
+
+def _native_quant(*ps: tuple) -> bool:
+    """Whether the native kernels stage these weights straight from their packed form (all one format)."""
+
+    p = ps[0]
+    if any(q[3:] != p[3:] for q in ps):
+        return False
+    if p[5] == "affine":
+        return all(q[2] is not None for q in ps) and p[4] in (4, 8) and p[3] % 8 == 0
+    return (p[5], p[4], p[3]) in _NATIVE_FP_MODES
+
+
+def _native_layer(mlp: Any) -> bool:
+    """A dense MLP whose projections the native staging takes (and that carry no global scale)."""
+
+    projs = [getattr(mlp, n, None) for n in ("gate_proj", "up_proj", "down_proj")]
+    if not all(hasattr(p, "scales") and getattr(p, "global_scale", None) is None for p in projs):
+        return False
+    return _native_quant(*(_qparams(p) for p in projs))
+
+
+def _staged(p: tuple) -> list[mx.array]:
+    """(w, scales, biases) for the native staging; the fp modes' absent biases get a placeholder it never reads."""
+
+    return [p[0], p[1], p[1] if p[2] is None else p[2]]
 
 
 def _layer(self: Any, cut: int) -> dict[str, Any]:
@@ -79,25 +112,25 @@ def _layer(self: Any, cut: int) -> dict[str, Any]:
     pd = 32 // d[4]
     entry = {
         "cut": cut,
-        "g": (g[0][:cut], g[1][:cut], None if g[2] is None else g[2][:cut], g[3], g[4]),
-        "u": (u[0][:cut], u[1][:cut], None if u[2] is None else u[2][:cut], u[3], u[4]),
-        "d": (d[0][:, : cut // pd], d[1][:, : cut // d[3]], None if d[2] is None else d[2][:, : cut // d[3]], d[3], d[4]),
-        "ga": (g[0][cut:], g[1][cut:], None if g[2] is None else g[2][cut:], g[3], g[4]),
-        "ua": (u[0][cut:], u[1][cut:], None if u[2] is None else u[2][cut:], u[3], u[4]),
-        "da": (d[0][:, cut // pd :], d[1][:, cut // d[3] :], None if d[2] is None else d[2][:, cut // d[3] :], d[3], d[4]),
+        "g": (g[0][:cut], g[1][:cut], None if g[2] is None else g[2][:cut], *g[3:]),
+        "u": (u[0][:cut], u[1][:cut], None if u[2] is None else u[2][:cut], *u[3:]),
+        "d": (d[0][:, : cut // pd], d[1][:, : cut // d[3]], None if d[2] is None else d[2][:, : cut // d[3]], *d[3:]),
+        "ga": (g[0][cut:], g[1][cut:], None if g[2] is None else g[2][cut:], *g[3:]),
+        "ua": (u[0][cut:], u[1][cut:], None if u[2] is None else u[2][cut:], *u[3:]),
+        "da": (d[0][:, cut // pd :], d[1][:, cut // d[3] :], None if d[2] is None else d[2][:, cut // d[3] :], *d[3:]),
     }
     self._mtplx_ane_split = entry
     return entry
 
 
 def _qmm(x: mx.array, p: tuple) -> mx.array:
-    w, s, b, gs, bits = p
-    return mx.quantized_matmul(x, w, s, b, transpose=True, group_size=gs, bits=bits)
+    w, s, b, gs, bits, mode = p
+    return mx.quantized_matmul(x, w, s, b, transpose=True, group_size=gs, bits=bits, mode=mode)
 
 
 def _deq(p: tuple) -> mx.array:
-    w, s, b, gs, bits = p
-    return mx.dequantize(w, s, b, group_size=gs, bits=bits).astype(mx.float16)
+    w, s, b, gs, bits, mode = p
+    return mx.dequantize(w, s, b, group_size=gs, bits=bits, mode=mode).astype(mx.float16)
 
 
 def _prep_x(x2: mx.array) -> tuple[mx.array, mx.array]:
@@ -118,7 +151,7 @@ def _row_scales(self: Any, L: dict[str, Any]) -> list[mx.array]:
     cached = L.get("row_scales")
     if cached is None:
         def rs(p: tuple) -> mx.array:
-            w = _had(mx.dequantize(*p[:3], group_size=p[3], bits=p[4]).astype(mx.float32))
+            w = _had(mx.dequantize(*p[:3], group_size=p[3], bits=p[4], mode=p[5]).astype(mx.float32))
             return mx.maximum(mx.max(mx.abs(w), axis=-1), 1e-8) / 127.0
 
         cached = [rs(L["ga"]), rs(L["ua"]), rs(L["da"])]
@@ -167,7 +200,9 @@ def install_gdn(model: Any) -> dict[str, Any]:
         qkv, z = getattr(gdn, "in_proj_qkv", None), getattr(gdn, "in_proj_z", None)
         if qkv is None or z is None or not hasattr(qkv, "scales") or not hasattr(z, "scales"):
             continue
-        if (qkv.bits, qkv.group_size) != (z.bits, z.group_size) or getattr(qkv, "biases", None) is None:
+        if any(getattr(m, "global_scale", None) is not None for m in (qkv, z)):
+            continue
+        if not _native_quant(_qparams(qkv), _qparams(z)):
             continue
         n_qkv = qkv.weight.shape[0]
         qkv._mtplx_ane_gdn = {"z": z, "cut": n_qkv - tail}
@@ -210,11 +245,12 @@ def install_gdn(model: Any) -> dict[str, Any]:
             t1 = _time.perf_counter()
         x2 = x.reshape(rows, H)
         xq, tx = _prep_x(x2)
-        ws = [self.weight[cut:], self.scales[cut:], self.biases[cut:], z.weight, z.scales, z.biases]
-        st = lin.stage(xq, tx, ws, [0, n_qkv - cut], self.bits, self.group_size)
+        q, zq = _qparams(self), _qparams(z)
+        tail_q = (q[0][cut:], q[1][cut:], None if q[2] is None else q[2][cut:], *q[3:])
+        ws = _staged(tail_q) + _staged(zq)
+        st = lin.stage(xq, tx, ws, [0, n_qkv - cut], q[4], q[3], mode=q[5])
         mx.eval(st)
-        gpu = mx.quantized_matmul(x2, self.weight[:cut], self.scales[:cut], self.biases[:cut], transpose=True,
-                                  group_size=self.group_size, bits=self.bits)
+        gpu = _qmm(x2, (q[0][:cut], q[1][:cut], None if q[2] is None else q[2][:cut], *q[3:]))
         if trace:
             t2 = _time.perf_counter()
         mx.async_eval(gpu)
@@ -274,6 +310,8 @@ def install(model: Any = None) -> dict[str, Any]:
         rows = math.prod(x.shape[:-1])
         if rows < MIN_ROWS or _STATE.get("disabled") or not hasattr(self.gate_proj, "scales"):
             return orig(self, x)
+        if any(getattr(getattr(self, n), "global_scale", None) is not None for n in ("gate_proj", "up_proj", "down_proj")):
+            return orig(self, x)  # a global scale (nvfp4 packs) is not in the split's weight tuples
         H = x.shape[-1]
         inter = self.gate_proj.weight.shape[0]
         ffn = _STATE["ffn"]
@@ -317,12 +355,13 @@ def install(model: Any = None) -> dict[str, Any]:
             t1 = _time.perf_counter()
         x2 = x.reshape(rows, H)
         ga, ua, da = L["ga"], L["ua"], L["da"]
-        if ga[2] is None or ga[4] not in (4, 8) or not (ga[4] == ua[4] == da[4] and ga[3] == ua[3] == da[3]):
+        if not _native_quant(ga, ua, da):
             xq, tx = _prep_x(x2)
             stage = [ffn.stage(xq, tx, _had(_deq(ga)), _had(_deq(ua)), _had(_deq(da)))]
         else:
             scales = _row_scales(self, L) if _w8() else []
-            stage = [_stage_x(ffn, x2), ffn.stage_weights_q(list(ga[:3]), list(ua[:3]), list(da[:3]), ga[4], ga[3], scales)]
+            stage = [_stage_x(ffn, x2),
+                     ffn.stage_weights_q(_staged(ga), _staged(ua), _staged(da), ga[4], ga[3], scales, mode=ga[5])]
         mx.eval(*stage)
         if trace:
             t2 = _time.perf_counter()
@@ -421,7 +460,7 @@ def _ffn_begin(ffn: Any, layer: Any, h2: mx.array, channels: int):
     inter = mlp.gate_proj.weight.shape[0]
     L = _layer(mlp, inter - channels)
     ga, ua, da = L["ga"], L["ua"], L["da"]
-    st = [_stage_x(ffn, x2), ffn.stage_weights_q(list(ga[:3]), list(ua[:3]), list(da[:3]), ga[4], ga[3])]
+    st = [_stage_x(ffn, x2), ffn.stage_weights_q(_staged(ga), _staged(ua), _staged(da), ga[4], ga[3], mode=ga[5])]
     mx.eval(*st)
     h = nn.silu(_qmm(x2, L["g"])) * _qmm(x2, L["u"])
     y_gpu = _qmm(h, L["d"])
@@ -464,8 +503,8 @@ def pipelined_layers(inner: Any, h: mx.array, cache: list[Any], fa_mask: Any, ss
     if not (isinstance(fa_mask, str) or fa_mask is None) or ssm_mask is not None:
         return None
     layers = inner.layers
-    if not all(hasattr(l.mlp, "gate_proj") and hasattr(l.mlp.gate_proj, "scales") for l in layers):
-        return None
+    if not all(hasattr(l.mlp, "gate_proj") and _native_layer(l.mlp) for l in layers):
+        return None  # the pipeline stages packed weights only; other layers take the sequential split
     # Past MAX_CONTEXT keys one half's attention is a ~1 s GPU command at 128K, and with the ANE reading
     # memory beside it macOS can abort it for stalling the display (kIOGPUCommandBufferCallbackError
     # ImpactingInteractivity, seen once at 140K, 2026-10-13). There the gain is small anyway (attention

@@ -761,6 +761,9 @@ def install_nax_qlinear_patch() -> dict[str, object]:
                 nax_qlinear_fallback_counts.get("exact_t0", 0) + 1
             )
             return original(self, x)
+        if getattr(self, "mode", "affine") != "affine":
+            # Every lane below decodes affine codes; mxfp4/nvfp4/mxfp8 run the stock qmm.
+            return original(self, x)
         bits = int(getattr(self, "bits", 0) or 0)
         group_size = int(getattr(self, "group_size", 0) or 0)
         if (
@@ -777,6 +780,10 @@ def install_nax_qlinear_patch() -> dict[str, object]:
             if (
                 _m1_mma8_min_rows() <= m8 <= 8
                 and x.dtype == mx.float16
+                # The kernel reads half scales/biases; a bf16 pack's take the lanes below.
+                and self["scales"].dtype == mx.float16
+                and "biases" in self
+                and self["biases"].dtype == mx.float16
                 and k8 % 128 == 0
                 and n8 % 16 == 0
                 and group_size in (32, 64, 128)

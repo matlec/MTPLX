@@ -74,8 +74,24 @@ def _disable(exc: BaseException) -> None:
     logger.warning("[ane-prefill-moe] disabled after a failure: %s", _STATE["error"])
 
 
-def _qparams(lin: Any) -> tuple[Any, Any, Any, int, int]:
-    return lin.weight, lin.scales, getattr(lin, "biases", None), int(lin.group_size), int(lin.bits)
+def _native_quant(*ps: tuple) -> bool:
+    from .ane_prefill import _native_quant as native
+
+    return native(*ps)
+
+
+def _staged(p: tuple) -> list[Any]:
+    from .ane_prefill import _staged as staged
+
+    return staged(p)
+
+
+def _qparams(lin: Any) -> tuple[Any, Any, Any, int, int, str]:
+    from .ane_prefill import _qparams as qparams
+
+    if getattr(lin, "global_scale", None) is not None:
+        raise RuntimeError("quantized projection with a global scale")
+    return qparams(lin)
 
 
 def _is_moe_layer(layer: Any) -> bool:
@@ -101,8 +117,8 @@ def _program(inner: Any):
         gdn = layer.linear_attn
         qkv, z = gdn.in_proj_qkv, gdn.in_proj_z
         pq, pz = _qparams(qkv), _qparams(z)
-        if pq[2] is None or pz[2] is None or pq[3:] != pz[3:]:
-            raise RuntimeError("GDN projections are not one affine format")
+        if not _native_quant(pq, pz):
+            raise RuntimeError("GDN projections are not one format the ANE staging decodes")
         here = (int(pq[0].shape[0]), int(pz[0].shape[0]), pq[3], pq[4])
         if shape is None:
             shape = here
@@ -157,8 +173,8 @@ def _attn_program(inner: Any):
             continue
         attn = layer.self_attn
         parts = [_qparams(getattr(attn, n)) for n in ("q_proj", "k_proj", "v_proj")]
-        if any(pp[2] is None for pp in parts) or len({pp[3:] for pp in parts}) != 1:
-            raise RuntimeError("attention projections are not one affine format")
+        if not _native_quant(*parts):
+            raise RuntimeError("attention projections are not one format the ANE staging decodes")
         here = tuple(int(pp[0].shape[0]) for pp in parts) + parts[0][3:]
         if shape is None:
             shape = here
@@ -193,11 +209,11 @@ def _attn_project(lin: Any, layer: Any, x: mx.array, slot: int) -> mx.array:
              for n in ("q_proj", "k_proj", "v_proj")]
     ws, offs, off = [], [], 0
     for pp in parts:
-        ws += [pp[0], pp[1], pp[2]]
+        ws += _staged(pp)
         offs.append(off)
         off += int(pp[0].shape[0])
     _STATE["staged"].add(key)
-    return lin.stage(xq, tx, ws, offs, parts[0][4], parts[0][3], slot)
+    return lin.stage(xq, tx, ws, offs, parts[0][4], parts[0][3], slot, mode=parts[0][5])
 
 
 def _attn_give(layer: Any, x: mx.array, out: mx.array) -> None:
@@ -262,7 +278,7 @@ def _project(lin: Any, layer: Any, x: mx.array, slot: int) -> mx.array:
         st = lin.stage(xq, tx, [], [], 4, 64, slot)
     else:
         q, z = _qparams(gdn.in_proj_qkv), _qparams(gdn.in_proj_z)
-        st = lin.stage(xq, tx, [q[0], q[1], q[2], z[0], z[1], z[2]], [0, int(q[0].shape[0])], q[4], q[3], slot)
+        st = lin.stage(xq, tx, _staged(q) + _staged(z), [0, int(q[0].shape[0])], q[4], q[3], slot, mode=q[5])
         _STATE["staged"].add(slot)
     return st
 
