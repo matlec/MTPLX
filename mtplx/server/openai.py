@@ -808,6 +808,11 @@ def _detach_exception_frames(exc: BaseException) -> BaseException:
     caches; queued as raised it kept 4.95 GB active after a refusal, and the
     retry met it (2026-10-01)."""
 
+    # The rendered traceback is text (no frames): kept for the operator's log.
+    try:
+        exc._mtplx_traceback_text = "".join(traceback.format_exception(exc))
+    except Exception:
+        pass
     seen: set[int] = set()
     pending: list[BaseException] = [exc]
     while pending:
@@ -41042,12 +41047,15 @@ def create_app(state: ServerState) -> FastAPI:
                         # The client only gets str(exc); keep the traceback for
                         # the operator (an int(None) after a pi compaction
                         # reached the client and left nothing in the log).
+                        # Queued errors arrive detached from their frames
+                        # (_detach_exception_frames), with the text kept.
                         logging.getLogger("mtplx.server").error(
-                            "stream request %s failed: %s: %s",
+                            "stream request %s failed: %s: %s\n%s",
                             response_id,
                             type(exc).__name__,
                             exc,
-                            exc_info=(type(exc), exc, exc.__traceback__),
+                            getattr(exc, "_mtplx_traceback_text", None)
+                            or "".join(traceback.format_exception(exc)),
                         )
                     payload = {
                         "id": response_id,
