@@ -26868,6 +26868,12 @@ def _bank_history_policy(state: "ServerState") -> str:
     return "committed" if bool(getattr(runtime, "mtp_enabled", True)) else "cycle"
 
 
+def _fp16_body_fingerprint() -> str:
+    from mtplx.fp16_body import fingerprint
+
+    return fingerprint()
+
+
 def _policy_fingerprint(
     state: ServerState,
     *,
@@ -26912,6 +26918,9 @@ def _policy_fingerprint(
         _reasoning_history_fingerprint_component(state),
         f"openai_bridge={_OPENAI_BRIDGE_POLICY_VERSION}",
         f"tool_prompt_mode={effective_tool_prompt_mode}",
+        # A bf16 pack served as fp16 (mtplx/fp16_body.py) banks fp16 state; a
+        # restart with MTPLX_M1_FP16_BODY=0 must not restore it, nor the reverse.
+        _fp16_body_fingerprint(),
         # Per-request steering that rides a TRANSIENT TRAILING user turn --
         # forced tool_choice, the post-tool answer contract, the read-only
         # force-answer contract, the Pi convergence contract -- is excluded

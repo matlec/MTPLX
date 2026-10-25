@@ -831,6 +831,13 @@ def load(
                 "serving autoregressive (no speculative draft head).",
                 path,
             )
+    # After MTP injection (the draft head is cast too), before the kernel lanes
+    # below install: they read the parameters' dtype (mtplx/fp16_body.py).
+    from .fp16_body import cast_bf16_body, enabled as _fp16_body_enabled
+
+    if _fp16_body_enabled(config):
+        # logger.info does not reach the serve console.
+        print(f"[fp16-body] {cast_bf16_body(model)}", file=sys.stderr, flush=True)
     compiled_target_factory = None
     whole_moe_plan = None
     selfcheck_report = None
