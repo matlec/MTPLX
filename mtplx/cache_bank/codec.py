@@ -812,17 +812,22 @@ def _spec_items(spec: Any) -> list[Any]:
 
 
 def _none_tree_like(spec: Any) -> Any:
-    """Return a shape-compatible tree whose leaves are ``None``.
+    """Return the outer positional tuple with ``None`` at every position.
 
     CacheSnapshot's outer state/meta tuples are positional.  Keeping that
     shape lets ``restore_cache`` skip every original full-prefix meta state.
+    Each position is ``None`` itself, not a tree of ``None`` leaves:
+    ``restore_cache`` skips only ``None``, and a layer meta of
+    ``(None, None, None)`` reached the paged KV setter as ``int(None)`` on
+    every sub-prefix restore from the SSD tier (a pi follow-up diverging
+    from a banked conversation).
     """
 
     kind = spec.get("kind") if isinstance(spec, dict) else None
     if kind == "tuple":
-        return tuple(_none_tree_like(item) for item in spec.get("items") or [])
+        return tuple(None for _ in spec.get("items") or [])
     if kind == "list":
-        return [_none_tree_like(item) for item in spec.get("items") or []]
+        return [None for _ in spec.get("items") or []]
     return None
 
 

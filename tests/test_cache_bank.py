@@ -1134,3 +1134,35 @@ def test_parse_size_bytes_auto_falls_back_to_default():
     # to the RAM-tiered default instead of crashing daemon startup.
     assert parse_size_bytes("auto", 16 * 1024**3) == 16 * 1024**3
     assert parse_size_bytes("garbage", 7) == 7
+
+
+def test_cache_bank_codec_prefix_decode_drops_each_layer_meta_whole():
+    """A sub-prefix restore skips every layer's full-prefix meta: each position is
+    None itself. A tuple of None leaves passed restore_cache's `is not None` and
+    reached the paged KV setter as int(None) (pi follow-up after a compaction)."""
+
+    snapshot = CacheSnapshot(
+        states=(mx.zeros((1, 1, 1024, 2), dtype=mx.float16),),
+        meta_states=(("256", "4", "1024"),),
+    )
+    mtp_snapshot = CacheSnapshot(
+        states=(mx.full((1, 1, 1024, 2), 3.0, dtype=mx.float16),),
+        meta_states=(("256", "4", "1024"),),
+    )
+    encoded = encode_payload(
+        cache_snapshot=snapshot,
+        logits=None,
+        hidden=None,
+        mtp_history_snapshot=mtp_snapshot,
+        block_size=256,
+    )
+
+    decoded = decode_payload_prefix(
+        encoded.spec,
+        encoded.tensors.__getitem__,
+        cache_prefix_len=256,
+        mtp_history_prefix_len=255,
+    )
+
+    assert decoded.cache_snapshot.meta_states == (None,)
+    assert decoded.mtp_history_snapshot.meta_states == (None,)
