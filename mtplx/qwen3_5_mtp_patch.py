@@ -49,7 +49,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .artifacts import expected_mtp_file, text_config
+from .artifacts import expected_mtp_file, is_mtp_sidecar_path, sidecar_mtp_key, text_config
 
 logger = logging.getLogger(__name__)
 
@@ -153,8 +153,9 @@ def _load_mtp_weights(paths: list[Path]) -> dict[str, Any]:
     for path in paths:
         if path.suffix != ".safetensors":
             continue
+        sidecar = is_mtp_sidecar_path(path)
         for key, value in mx.load(str(path)).items():
-            local = _strip_mtp_prefix(key)
+            local = _strip_mtp_prefix(sidecar_mtp_key(key) if sidecar else key)
             if local is not None:
                 mapped[local] = value
     # A head taken straight from a raw HF checkpoint carries delta-encoded

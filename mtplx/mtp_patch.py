@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from .artifacts import expected_mtp_file, is_mtp_key, normalize_mtp_key, text_config
+from .artifacts import expected_mtp_file, is_mtp_key, normalize_mtp_key, sidecar_mtp_key, text_config
 from .constants import (
     EXPECTED_ALL_PREQUANTIZED_MTP_KEYS,
     EXPECTED_PREQUANTIZED_MTP_KEYS,
@@ -696,7 +696,7 @@ def _load_mtp_weights(
 ) -> dict[str, Any]:
     import mlx.core as mx
 
-    raw = mx.load(str(mtp_file))
+    raw = {sidecar_mtp_key(k): v for k, v in mx.load(str(mtp_file)).items()}
     raw_mtp = {_strip_mtp_namespace(k): v for k, v in raw.items() if is_mtp_key(k)}
     del raw
     return _finalize_mtp_weights(raw_mtp, config, prequantized=prequantized)
@@ -716,13 +716,13 @@ def _mtp_file_keys(mtp_file: Path) -> tuple[str, ...]:
         from safetensors import safe_open
 
         with safe_open(str(mtp_file), framework=_safetensors_runtime_framework()) as handle:
-            return tuple(sorted(str(key) for key in handle.keys()))
+            return tuple(sorted(sidecar_mtp_key(key) for key in handle.keys()))
     except Exception:
         try:
             import mlx.core as mx
 
             raw = mx.load(str(mtp_file))
-            keys = tuple(sorted(str(key) for key in raw.keys()))
+            keys = tuple(sorted(sidecar_mtp_key(key) for key in raw.keys()))
             del raw
             return keys
         except Exception:

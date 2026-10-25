@@ -37,6 +37,7 @@ MTP_SIDECAR_FALLBACKS = (
     "mtp.safetensors",
     "mtp/weights.safetensors",
     "model-mtp.safetensors",
+    "mtp/model.safetensors",
 )
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 SOURCE_MARKER_FILE = ".mtplx-source.json"

@@ -335,7 +335,7 @@ def _scan_mtp_sidecar_exists(model_dir: Path, config: dict[str, Any]) -> bool:
     extra = config.get("mlx_lm_extra_tensors", {})
     if isinstance(extra, dict) and extra.get("mtp_file"):
         candidates.append(str(extra["mtp_file"]))
-    candidates.extend(("mtp.safetensors", "mtp/weights.safetensors", "model-mtp.safetensors"))
+    candidates.extend(("mtp.safetensors", "mtp/weights.safetensors", "model-mtp.safetensors", "mtp/model.safetensors"))
     for rel in candidates:
         try:
             if (model_dir / rel).is_file():

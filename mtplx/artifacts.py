@@ -165,6 +165,36 @@ def is_mtp_key(key: str) -> bool:
     return any(text.startswith(prefix) for prefix in MTP_KEY_PREFIXES)
 
 
+# Standalone MTP sidecar files, in lookup order. mtp/model.safetensors is the
+# layout of exports that ship the head as its own folder (orcarouter's MLX
+# packs: mtp/config.json, mtp/model.safetensors, tokenizer copies).
+MTP_SIDECAR_RELPATHS = (
+    "mtp.safetensors",
+    "mtp/weights.safetensors",
+    "model-mtp.safetensors",
+    "mtp/model.safetensors",
+)
+
+
+def sidecar_mtp_key(key: str) -> str:
+    """A standalone sidecar's tensor key in the checkpoint's MTP namespace.
+
+    A sidecar holds the MTP head only; some exports store its tensors bare
+    (``fc.weight``, ``layers.0.self_attn.q_proj.weight``) instead of under
+    ``mtp.``. Only for keys read from a sidecar file, never a trunk shard.
+    """
+
+    text = str(key)
+    return text if is_mtp_key(text) else "mtp." + text
+
+
+def is_mtp_sidecar_path(path: Path | str) -> bool:
+    text = Path(path).as_posix()
+    return text.endswith("/model-mtp-head.safetensors") or any(
+        text == rel or text.endswith("/" + rel) for rel in MTP_SIDECAR_RELPATHS
+    )
+
+
 def _num_mtp_layers(config: dict[str, Any]) -> int:
     tcfg = text_config(config)
     return int(
@@ -428,7 +458,7 @@ def expected_mtp_file(model_dir: Path | str, config: dict[str, Any] | None = Non
     extra = config.get("mlx_lm_extra_tensors", {})
     if isinstance(extra, dict) and extra.get("mtp_file"):
         return model_path / str(extra["mtp_file"])
-    for rel in ("mtp.safetensors", "mtp/weights.safetensors", "model-mtp.safetensors"):
+    for rel in MTP_SIDECAR_RELPATHS:
         candidate = model_path / rel
         if candidate.exists():
             return candidate
@@ -685,7 +715,7 @@ def inspect_mtp_tensors(model_dir: Path | str, config: dict[str, Any] | None = N
             extra_keys=(tensor_error,),
         )
 
-    key_set = {normalize_mtp_key(t.key) for t in tensors}
+    key_set = {normalize_mtp_key(sidecar_mtp_key(t.key)) for t in tensors}
     expected_keys, expected_count, sidecar_format = _mtp_expected_key_set(
         config or {},
         keys=tuple(key_set),
@@ -1336,7 +1366,7 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         if sidecar_mtp.exists:
             mtp = sidecar_mtp
             weight_keys = tuple(
-                sorted(set(weight_keys).union(tensor.key for tensor in sidecar_mtp.tensors))
+                sorted(set(weight_keys).union(sidecar_mtp_key(tensor.key) for tensor in sidecar_mtp.tensors))
             )
         else:
             embedded = _embedded_mtp_keys(weight_keys)
