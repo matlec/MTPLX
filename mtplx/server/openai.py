@@ -41039,6 +41039,16 @@ def create_app(state: ServerState) -> FastAPI:
                         message = str(exc)
                         status_code = 500
                         error_code = type(exc).__name__
+                        # The client only gets str(exc); keep the traceback for
+                        # the operator (an int(None) after a pi compaction
+                        # reached the client and left nothing in the log).
+                        logging.getLogger("mtplx.server").error(
+                            "stream request %s failed: %s: %s",
+                            response_id,
+                            type(exc).__name__,
+                            exc,
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
                     payload = {
                         "id": response_id,
                         "object": "chat.completion.chunk",
