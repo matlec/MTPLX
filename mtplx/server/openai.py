@@ -21441,6 +21441,59 @@ def _footprint_floor(
     return int(allocator_bytes) + int(charged), fields
 
 
+# Memory MLX hands back (arrays freed, then clear_cache) leaves the process
+# footprint, and reaches the Mac's free pages, asynchronously: ~0.2 s for
+# 2 GiB on an M1 Max (2026-10-27), mx.synchronize() or not. Measured straight
+# after reclamation, the freed bytes read as host memory outside MLX and the
+# Mac as no freer: an 81,862-token Pi prompt gave back 4.9 GiB, the
+# footprint had dropped 0.5 GiB, and it was refused 0.3 GiB short.
+_FOOTPRINT_RELEASE_TIMEOUT_S = 2.0
+_FOOTPRINT_RELEASE_POLL_S = 0.02
+_FOOTPRINT_RELEASE_SLACK_BYTES = 64 << 20
+
+
+def _footprint_release_timeout_s() -> float:
+    raw = os.environ.get("MTPLX_FOOTPRINT_RELEASE_WAIT_S", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return _FOOTPRINT_RELEASE_TIMEOUT_S
+
+
+def _await_footprint_release(host_overhang_bytes: int | None) -> float | None:
+    """Wait, bounded, until this process's footprint is back within
+    ``host_overhang_bytes`` (the overhang read before memory was given back)
+    of MLX's account. Returns the seconds waited, or None when nothing was
+    pending or the footprint cannot be read."""
+
+    if host_overhang_bytes is None:
+        return None
+    timeout = _footprint_release_timeout_s()
+    if timeout <= 0:
+        return None
+    try:
+        import mlx.core as _mx
+    except Exception:
+        return None
+    target = int(host_overhang_bytes) + _FOOTPRINT_RELEASE_SLACK_BYTES
+    start = time.monotonic()
+    waited = False
+    while True:
+        footprint = phys_footprint_bytes()
+        if not footprint:
+            return None
+        allocator = int(_mx.get_active_memory()) + int(_mx.get_cache_memory())
+        elapsed = time.monotonic() - start
+        if int(footprint) - allocator <= target:
+            return elapsed if waited else None
+        if elapsed >= timeout:
+            return elapsed
+        waited = True
+        time.sleep(_FOOTPRINT_RELEASE_POLL_S)
+
+
 def _prefill_admission_shed_enabled() -> bool:
     return os.environ.get(
         "MTPLX_PREFILL_ADMISSION_SHED", "1"
@@ -23286,6 +23339,11 @@ def _run_prefill_admission(
     if limit <= 0:
         return None
     allow_swap = bool(getattr(state, "allow_swap", False))
+    # The overhang read before anything is given back: what reclamation
+    # frees is waited out of the footprint (_await_footprint_release) before
+    # the next reading.
+    release_baseline: dict[str, Any] = {}
+    release_waits: list[float] = []
 
     def measure() -> dict[str, Any]:
         # #456 / two kernel panics: active + cache is MLX's own account and
@@ -23296,6 +23354,10 @@ def _run_prefill_admission(
         # growth reuses them, so counting the pool as a need only cleared a
         # warm allocator for nothing. The Mac is read again as well: what
         # the engine gives back lands in the free pages.
+        if "overhang" in release_baseline:
+            waited = _await_footprint_release(release_baseline["overhang"])
+            if waited is not None:
+                release_waits.append(waited)
         stats = _mlx_memory_stats_live()
         failure = _allocator_reading_failure(stats)
         if failure is not None:
@@ -23320,6 +23382,7 @@ def _run_prefill_admission(
     now = measure()
     if now["active"] <= 0:
         return None
+    release_baseline["overhang"] = now["fields"].get("host_overhang_bytes")
     geometry = _admission_geometry(state)
     threshold = int(limit * _PREFILL_ADMISSION_PRESSURE_FRACTION)
     runtime = getattr(state, "runtime", None)
@@ -24228,6 +24291,8 @@ def _run_prefill_admission(
     receipt["prefill_chunk_tokens"] = chosen
     receipt["growth"] = dict(current)
     receipt["reclamation_steps"] = steps
+    if release_waits:
+        receipt["footprint_release_wait_s"] = round(sum(release_waits), 3)
     if session_bank is not None:
         try:
             receipt["bank_bytes_after"] = int(session_bank.total_nbytes)
