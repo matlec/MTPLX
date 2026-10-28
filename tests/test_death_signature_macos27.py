@@ -699,6 +699,76 @@ def test_starved_free_pages_that_recover_after_the_shed_let_the_request_go_on(
     assert guard.shed["released_bytes"] >= 3 * GIB
 
 
+def _lagging_release_guard(monkeypatch, *, lag_reads=3):
+    """The same check where the kernel takes what the shed freed back only
+    ``lag_reads`` footprint readings later: until then it stays in this
+    process's footprint and out of the Mac's free pages (2026-10-28, M1 Max:
+    a 16-token Pi turn on a 78K conversation aborted with 5.3 GiB just
+    released and free pages at 0.6 GiB)."""
+
+    import mlx.core as mx
+
+    lag = {"reads": 0, "returned": False}
+    holder = {}
+
+    def read(bank_bytes, pool_bytes, t):
+        back = (12 * GIB - bank_bytes) if lag["returned"] else 0
+        compressor = int(6.0 * GB) + (int(0.6 * GB) if t >= 2.0 else 0)
+        return _supply_reading(
+            20 * GIB + back, free=16 * MIB + back, compressor=compressor, t=t
+        )
+
+    guard, manager, generating = _shed_guard(monkeypatch, read)
+    holder["bank"] = manager.bank
+
+    def active():
+        return 68 * GIB + int(manager.bank.total_nbytes)
+
+    def footprint(*args, **kwargs):
+        pending = 12 * GIB - int(manager.bank.total_nbytes)
+        if pending and not lag["returned"]:
+            lag["reads"] += 1
+            if lag["reads"] > lag_reads:
+                lag["returned"] = True
+        return active() + 2 * GIB + (0 if lag["returned"] else pending)
+
+    monkeypatch.setattr(
+        srv,
+        "_mlx_memory_stats_live",
+        lambda: {"ok": True, "active_memory_bytes": active(), "cache_memory_bytes": 0},
+    )
+    monkeypatch.setattr(mx, "get_active_memory", active)
+    monkeypatch.setattr(mx, "get_cache_memory", lambda: 0)
+    monkeypatch.setattr(srv, "phys_footprint_bytes", footprint)
+    monkeypatch.setattr(srv, "_FOOTPRINT_RELEASE_POLL_S", 0.0)
+    return guard, generating
+
+
+def test_what_the_shed_frees_is_waited_into_the_free_pages(monkeypatch):
+    monkeypatch.delenv("MTPLX_FOOTPRINT_RELEASE_WAIT_S", raising=False)
+    guard, generating = _lagging_release_guard(monkeypatch)
+    try:
+        assert guard() is False
+        assert guard() is False
+    finally:
+        generating.end_generation()
+    assert guard.shed["reason_before"] == "death_signature"
+    assert guard.shed["request_continued"] is True
+    assert guard.shed["footprint_release_wait_s"] >= 0.0
+
+
+def test_read_at_once_the_same_shed_aborts(monkeypatch):
+    monkeypatch.setenv("MTPLX_FOOTPRINT_RELEASE_WAIT_S", "0")
+    guard, generating = _lagging_release_guard(monkeypatch)
+    try:
+        assert guard() is False
+        assert guard() is True
+    finally:
+        generating.end_generation()
+    assert guard.tripped["reason"] == "death_signature"
+    assert "footprint_release_wait_s" not in guard.tripped["shed_before_abort"]
+
+
 # ---------------------------------------------------------------------------
 # The 2026-09-29 review of 4c9da1ba: the relaxed signature must still catch a
 # dangerous Mac. Runaway compression is measured across a run of requests,

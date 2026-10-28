@@ -20691,8 +20691,19 @@ class _PrefillSystemGuard:
             # same prompt: 2.26 GB released against a 1.29 GB target, the
             # floor still missed with 9.1 GB banked), so the same check
             # sheds again while rounds still free memory.
+            overhang_before = verdict["fields"].get("host_overhang_bytes")
+            if overhang_before is None:
+                overhang_before = _host_overhang_bytes_now()
             receipt = self._shed_reusable_memory(verdict)
             if receipt.get("released_bytes") or receipt.get("pool_bytes"):
+                # What the shed gave back reaches the Mac's free pages only
+                # once the kernel takes it (_await_footprint_release): read at
+                # once, a 16-token Pi turn on a 78K conversation was aborted
+                # with 5.3 GiB just released and free pages still at 0.6 GiB
+                # (2026-10-28).
+                waited = _await_footprint_release(overhang_before)
+                if waited is not None:
+                    receipt["footprint_release_wait_s"] = round(waited, 3)
                 verdict = self._evaluate()
             receipt["request_continued"] = verdict["reason"] is None
             receipt["reason_before"] = receipt.pop("_reason_before", None)
@@ -21460,6 +21471,23 @@ def _footprint_release_timeout_s() -> float:
         except ValueError:
             pass
     return _FOOTPRINT_RELEASE_TIMEOUT_S
+
+
+def _host_overhang_bytes_now() -> int | None:
+    """This process's footprint past MLX's account (active + cache) now, or
+    None when the footprint cannot be read."""
+
+    try:
+        import mlx.core as _mx
+
+        footprint = phys_footprint_bytes()
+        if not footprint:
+            return None
+        return max(
+            0, int(footprint) - int(_mx.get_active_memory()) - int(_mx.get_cache_memory())
+        )
+    except Exception:
+        return None
 
 
 def _await_footprint_release(host_overhang_bytes: int | None) -> float | None:
