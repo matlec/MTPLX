@@ -2538,6 +2538,44 @@ def _iter_prefill_chunk_spans(
     )
 
 
+def _capped_prefill_spans(
+    spans: Sequence[tuple[int, int]],
+    abort_check: Callable[[], bool] | None,
+):
+    """The prefill's spans, cut to the width the per-chunk memory check
+    narrowed the prefill to.
+
+    The server's check can narrow the remaining forwards instead of stopping
+    the request (``abort_check.prefill_chunk_cap``, the guard's
+    ``chunk_cap``): a 58K pi turn on 2026-10-28 was stopped with 3.5 GiB free
+    because the next 2,048-row chunk was priced at 2.4 GiB, where a 512-row
+    chunk fit. The check runs here before each piece is cut, so the piece
+    after a narrowing is already narrow; the loop's own check right after it
+    falls inside the check's interval. Chunked prefill is split-invariant,
+    and boundary captures at the extra chunk ends are trimmed to their byte
+    budget. A check without a cap, or the PLE lookahead (which plans its
+    gathers on the spans as given), leaves the spans unchanged.
+    """
+
+    cap_of = getattr(abort_check, "prefill_chunk_cap", None)
+    if not callable(cap_of):
+        yield from spans
+        return
+    from mtplx.ple_prefill_lookahead import enabled as _lookahead_enabled
+
+    if _lookahead_enabled():
+        yield from spans
+        return
+    for start, end in spans:
+        position = int(start)
+        while position < int(end):
+            _check_postcommit_abort(abort_check)
+            cap = cap_of()
+            stop = int(end) if not cap else min(int(end), position + max(1, int(cap)))
+            yield position, stop
+            position = stop
+
+
 def _release_restored_entry_applies(restored: Any, session_id: str | None) -> bool:
     """Whether a turn drops the bank entry it restored by copy (M1 default).
 
@@ -4996,7 +5034,7 @@ def _prefill_restored_prompt_suffix(
     with _ple_prefill_lookahead_scope(
         rt, *_lookahead_plan(spans or [(0, len(suffix))])
     ):
-        for start, end in spans:
+        for start, end in _capped_prefill_spans(spans, abort_check):
             _check_postcommit_abort(abort_check)
             chunk_array = body_array[:, start:end]
             chunk_embeddings = _suffix_chunk_embeddings(chunk_array)
@@ -8731,7 +8769,7 @@ def _prefill(
             tail_interval=_gdn_boundary_tail_interval(),
             mandatory_edges=_cold_edges,
         )
-        for start, end in spans:
+        for start, end in _capped_prefill_spans(spans, abort_check):
             _check_postcommit_abort(abort_check)
             chunk_array = body_array[:, start:end]
             chunk_embeddings = None
@@ -8898,7 +8936,7 @@ def _prefill_committed_mtp_history_streaming(
     # stalls totalling 2,313 ms with the GPU fully idle.
     with _ple_prefill_lookahead_scope(rt, body, mtp_streaming_spans):
         _chunk_trace = _prefill_chunk_trace_enabled()
-        for start, end in mtp_streaming_spans:
+        for start, end in _capped_prefill_spans(mtp_streaming_spans, abort_check):
             _iter_started = time.perf_counter()
             _check_postcommit_abort(abort_check)
             chunk_array = body_array[:, start:end]

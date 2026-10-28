@@ -172,6 +172,7 @@ def make_prefill_system_guard(
     from mtplx.server import openai as srv
 
     after_forward: dict[str, Any] = {}
+    narrower: list[tuple[int, int]] = []
     try:
         if prompt_scoring and priced is None:
             priced = prompt_scoring_growth(
@@ -186,6 +187,18 @@ def make_prefill_system_guard(
         if prompt_scoring:
             # Only completed scoring progress proves the head is finished.
             after_forward = {"after_prefill_reserve_bytes": 0, "forward_rows_bytes": None}
+        else:
+            try:
+                narrower = srv._prefill_narrower_chunk_reserves(
+                    state,
+                    prompt_tokens=prompt_tokens,
+                    chunk_tokens=chunk_tokens,
+                    priced=priced,
+                )
+            except Exception:  # noqa: BLE001
+                # Narrowing is a fallback; without it the check stops the
+                # request as before.
+                narrower = []
     except Exception as exc:  # noqa: BLE001
         # Keep generation's conservative reservation and visible degraded
         # health if pricing fails. The live guard still checks every chunk.
@@ -209,6 +222,7 @@ def make_prefill_system_guard(
         state,
         chunk_reserve_bytes=reserve,
         own_session_shed=own_session_shed,
+        narrower_chunk_reserves=narrower,
         **after_forward,
     )
 
