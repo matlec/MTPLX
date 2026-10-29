@@ -1704,8 +1704,19 @@ class SessionBankColdTier:
                     exc,
                 )
             finally:
-                self._release_pending(pending.pinned_nbytes)
-                self._queue.task_done()
+                try:
+                    self._release_pending(pending.pinned_nbytes)
+                    # Let the encoded buffers go now: the loop variable
+                    # otherwise keeps the finished write, its whole payload
+                    # in host bytes, alive while the thread waits for the
+                    # next one (2026-10-29, M1 Max: 2.3 GB held outside MLX
+                    # after a 58K-token write, and watchdog restarts every
+                    # hour or two under pi). The dataclass is frozen; its
+                    # dict is not.
+                    pending.tensors.clear()
+                finally:
+                    pending = None
+                    self._queue.task_done()
 
     def _admit_write(self, estimated_nbytes: int) -> bool:
         """Backlog + hourly-budget admission for a new SSD write."""
@@ -2478,6 +2489,12 @@ class SessionBankColdTier:
             with self._base_lock:
                 if generation != self._generation_now():
                     continue
+                # Parents are pruned once per batch, not once per blob: each
+                # prune resolves two paths and fails an rmdir on a directory
+                # that still holds other blobs, which made evicting one entry
+                # (tens of thousands of blobs) take minutes while the write
+                # waiting on it held its payload in RAM.
+                parents: set[Path] = set()
                 for digest in candidates[index : index + 64]:
                     if digest in still_referenced or digest in self._inflight_blob_hashes:
                         continue
@@ -2490,7 +2507,9 @@ class SessionBankColdTier:
                             digest[:12], type(exc).__name__, exc,
                         )
                         continue
-                    self._prune_empty_parents(path.parent, stop_at=self.base_dir / "blobs")
+                    parents.add(path.parent)
+                for parent in sorted(parents, key=lambda p: len(p.parts), reverse=True):
+                    self._prune_empty_parents(parent, stop_at=self.base_dir / "blobs")
                 index += 64
         self._invalidate_disk_usage_cache()
 
