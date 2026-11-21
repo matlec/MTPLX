@@ -40,7 +40,34 @@ class DraftState:
     last_row: mx.array | None = None  # newest raw context row [1, 1, T*H]
 
 
+def markov_latent(markov, prev_tokens: mx.array, step: int) -> mx.array:
+    """One RNN step of the Markov head: advances its state and returns the
+    [1, rank] latent (``Inkling2MarkovHead.apply_step_logits`` without the
+    full-vocabulary projection)."""
+    state = markov._state
+    dtype = state.dtype
+    inputs = mx.concatenate(
+        [
+            state,
+            markov.markov_w1(prev_tokens.reshape(-1)).astype(dtype),
+            markov._hidden[:, step].astype(dtype),
+            markov._rows_f.astype(dtype),
+        ],
+        axis=-1,
+    )
+    proj = markov.rnn_proj(inputs).astype(mx.float32)
+    r = markov.rank
+    gate = mx.sigmoid(proj[:, :r]).astype(dtype)
+    kept = (gate * state).astype(dtype)
+    blend = ((1.0 - gate) * mx.tanh(proj[:, r : 2 * r]).astype(dtype)).astype(dtype)
+    markov._state = kept + blend
+    return mx.tanh(proj[:, 2 * r :]).astype(dtype)
+
+
 class DSparkDrafter:
+    # Candidates the Markov head re-ranks per position (0: whole vocabulary).
+    candidates = 0
+
     def __init__(self, model: Inkling2DSparkModel):
         self.model = model
         cfg = model.config
@@ -117,8 +144,10 @@ class DSparkDrafter:
             h = residual + attn.o_proj(out)
             h = h + layer.mlp(layer.post_attention_layernorm(h))
         hidden = model.norm(h)[:, 1:]
-        logits = model._logits(hidden)
+        logits = model._logits(hidden).astype(mx.float32)
         markov = model.markov_head
+        if markov._vocab_bias is not None:
+            logits = logits + markov._vocab_bias
         if state.last_row is not None:
             markov._rows_f = mix_rmsnorm(
                 state.last_row, markov._alpha, markov.dflare_norm.weight, markov._eps
@@ -130,9 +159,25 @@ class DSparkDrafter:
         markov._step = 0
         prev = mx.array([anchor], dtype=mx.int32)
         tokens = []
+        if self.candidates:
+            # The Markov bias only re-ranks: score the base logits' top
+            # candidates instead of the whole vocabulary (the fold matrix is
+            # V x rank, ~100 MB per step otherwise). Proposals only steer the
+            # verify; acceptance stays exact.
+            kc = self.candidates
+            cand = mx.argpartition(-logits[0, :count], kc - 1, axis=-1)[:, :kc]
+            base = mx.take_along_axis(logits[0, :count], cand, axis=-1)
+            fold_w = markov._fold_weight[cand]  # [count, kc, rank]
+            fold_b = markov._fold_bias[cand].astype(mx.float32)
         for step in range(count):
-            step_logits = markov.apply_step_logits(logits[:, step], prev)
-            prev = mx.argmax(step_logits, axis=-1)
+            if not self.candidates:
+                step_logits = markov.apply_step_logits(logits[:, step], prev)
+                prev = mx.argmax(step_logits, axis=-1)
+            else:
+                latent = markov_latent(markov, prev, step)
+                bias = (fold_w[step] @ latent[0]).astype(mx.float32) + fold_b[step]
+                pick = mx.argmax(base[step] + bias)
+                prev = cand[step, pick].reshape(1)
             tokens.append(prev)
         out = mx.concatenate(tokens) if tokens else mx.zeros((0,), dtype=mx.int32)
         return [int(t) for t in np.array(out).tolist()]
@@ -185,6 +230,142 @@ class SpecStats:
     decode_s: float = 0.0
     draft_s: float = 0.0
     verify_s: float = 0.0
+
+
+def generate_engine(
+    target,
+    drafter: DSparkDrafter | None,
+    prompt_ids: list[int],
+    *,
+    max_tokens: int,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    top_k: int = 0,
+    seed: int = 0,
+    stop_ids: set[int] | None = None,
+    draft_tokens: int | None = None,
+    prefill_chunk: int = 2048,
+    on_token: Callable[[int], None] | None = None,
+    stats: SpecStats | None = None,
+    engine=None,
+) -> list[int]:
+    """``generate`` on the step engine: reference prefill, engine decode
+    and (with ``drafter``) engine verify."""
+    import time
+
+    from .decode import StepCache, StepEngine
+
+    engine = engine or StepEngine(target)
+    stats = stats if stats is not None else SpecStats()
+    rng = np.random.default_rng(seed)
+    stop_ids = stop_ids or set()
+    ref_cache = target.make_cache()
+    capture_ids = drafter.target_layer_ids if drafter is not None else None
+    dstate = drafter.new_state() if drafter is not None else None
+    t0 = time.perf_counter()
+    logits = None
+    for start in range(0, len(prompt_ids), prefill_chunk):
+        chunk = prompt_ids[start : start + prefill_chunk]
+        if drafter is not None and len(prompt_ids) - start - len(chunk) < drafter.slots:
+            lg, caps = target_forward(target, chunk, ref_cache, capture_ids)
+            drafter.feed(dstate, caps)
+            logits = lg[-1]
+        else:
+            if drafter is not None:
+                dstate.fed += len(chunk)
+            logits = target(mx.array([chunk], dtype=mx.int32), cache=ref_cache)[0, -1]
+        mx.eval(logits)
+    cache = StepCache.from_reference(target, ref_cache)
+    del ref_cache
+    stats.prefill_s += time.perf_counter() - t0
+
+    out: list[int] = []
+
+    def emit(token: int) -> bool:
+        out.append(token)
+        if on_token is not None:
+            on_token(token)
+        return token in stop_ids or len(out) >= max_tokens
+
+    t0 = time.perf_counter()
+    anchor, _ = _sample(logits, temperature, top_p, top_k, rng)
+    if emit(anchor):
+        stats.decode_s += time.perf_counter() - t0
+        return out
+    if drafter is None:
+        if temperature <= 0:
+            # Greedy: chain on-device so the next step is built while the
+            # GPU runs this one.
+            tok = mx.array([anchor], dtype=mx.int32)
+            pending = []
+            while True:
+                lg, _ = engine.step(cache, tok)
+                tok = mx.argmax(lg[-1:], axis=-1).astype(mx.int32)
+                mx.async_eval(tok)
+                pending.append(tok)
+                if len(pending) >= 2 or len(out) + len(pending) >= max_tokens:
+                    t = int(pending.pop(0).item())
+                    if emit(t):
+                        break
+            stats.decode_s += time.perf_counter() - t0
+            return out
+        while True:
+            lg, _ = engine.step(cache, [anchor])
+            anchor, _ = _sample(lg[-1], temperature, top_p, top_k, rng)
+            if emit(anchor):
+                break
+        stats.decode_s += time.perf_counter() - t0
+        return out
+    while True:
+        budget = max_tokens - len(out)
+        td = time.perf_counter()
+        drafts = drafter.draft(dstate, anchor, min(draft_tokens or drafter.block_size - 1, budget))
+        stats.draft_s += time.perf_counter() - td
+        tv = time.perf_counter()
+        logits, caps = engine.step(cache, [anchor] + drafts, capture_ids)
+        mx.eval(logits, *caps)
+        stats.verify_s += time.perf_counter() - tv
+        stats.cycles += 1
+        stats.drafted += len(drafts)
+        accepted, next_token, done = _accept(logits, drafts, temperature, top_p, top_k, rng, emit)
+        stats.accepted += accepted
+        if not done and next_token is None:
+            next_token, _ = _sample(logits[len(drafts)], temperature, top_p, top_k, rng)
+        cache.rollback(len(drafts) - accepted)
+        drafter.feed(dstate, [c[:, : accepted + 1] for c in caps])
+        if done:
+            break
+        anchor = next_token
+        if emit(anchor):
+            break
+    stats.decode_s += time.perf_counter() - t0
+    return out
+
+
+def _accept(logits, drafts, temperature, top_p, top_k, rng, emit):
+    """Longest accepted prefix. Returns (accepted, correction or None, done)."""
+    if temperature <= 0:
+        targets = np.array(mx.argmax(logits, axis=-1)).tolist()
+    accepted = 0
+    for i, d in enumerate(drafts):
+        if temperature <= 0:
+            if targets[i] == d:
+                accepted += 1
+                if emit(d):
+                    return accepted, None, True
+                continue
+            return accepted, targets[i], False
+        _, probs = _sample(logits[i], temperature, top_p, top_k, rng)
+        if rng.random() < probs[d]:
+            accepted += 1
+            if emit(d):
+                return accepted, None, True
+            continue
+        probs = probs.copy()
+        probs[d] = 0.0
+        probs /= probs.sum()
+        return accepted, int(rng.choice(probs.shape[-1], p=probs)), False
+    return accepted, None, False
 
 
 def generate(

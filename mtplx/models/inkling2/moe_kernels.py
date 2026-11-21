@@ -290,7 +290,9 @@ def grouped_matvec(x, segs, proj, tokens: int, top_k: int, *, pair_input=False, 
         seg_inputs = [zero, zero, zero, inds.reshape(-1)]
     else:
         seg_inputs = list(segs)
-    maxt = 1 if decode else (8 if tokens <= 8 else _MAX_TOKENS)
+    # One expert serves at most ``tokens`` pairs of a step (routing picks
+    # distinct experts per token); size the per-thread accumulators to it.
+    maxt = 1 if decode else min(tokens, _MAX_TOKENS)
     v2 = fmt == 0 and kin % 32 == 0 and nout % (_V2_RPS * _V2_SGS) == 0
     k = _kernel(
         f"mtplx_inkling2_moe_gemv_{fmt}_{int(v2)}",
