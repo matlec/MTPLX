@@ -49,19 +49,27 @@ _SOURCE = """
     const uint sg = simdgroup_index_in_threadgroup;
     const uint seg = threadgroup_position_in_grid.y;
     const uint n = threadgroup_position_in_grid.x * ROWS + sg;
-    const int len = seg_len[seg];
+    // DECODE: one token, its K pairs are the segments (seg == pair).
+    const int len = DECODE ? 1 : seg_len[seg];
     if (len <= 0 || n >= NOUT) return;
-    const int start = seg_start[seg];
-    const uint e = seg_expert[seg];
+    const int start = DECODE ? int(seg) : seg_start[seg];
+    const uint e = DECODE ? uint(seg_expert[seg]) : uint(seg_expert[seg]);
 
+    // A segment longer than MAXT (an expert picked twice by one token) runs
+    // in chunks; routing picks distinct experts, so this is a guard.
+    for (int base = 0; base < len; base += MAXT) {
+    const int clen = min(MAXT, len - base);
     int prow[MAXT];
-    const device bfloat* xr[MAXT];
+    size_t xoff[MAXT];
     float acc[MAXT];
     for (int j = 0; j < MAXT; ++j) {
         acc[j] = 0.0f;
-        if (j < len) {
-            prow[j] = order[start + j];
-            xr[j] = x + (size_t)x_row[prow[j]] * KIN;
+        if (j < clen) {
+            prow[j] = DECODE ? int(seg) : order[start + base + j];
+            // PAIRIN: each pair has its own input row (the down projection
+            // reads its activation); otherwise the pair's token row.
+            xoff[j] = PAIRIN ? (size_t)prow[j] * KIN
+                             : (size_t)(DECODE ? 0 : (prow[j] / TOPK)) * KIN;
         }
     }
     // One uint32 word = 32 / BITS values.
@@ -79,8 +87,8 @@ _SOURCE = """
             v[i] = (FMT == 0 ? FP4_LUT[code] : e4m3_to_float(code)) * s;
         }
         for (int j = 0; j < MAXT; ++j) {
-            if (j >= len) break;
-            const device bfloat* xp = xr[j] + k0;
+            if (j >= clen) break;
+            const device bfloat* xp = x + xoff[j] + k0;
             float t = 0.0f;
             for (uint i = 0; i < VPW; ++i) t += v[i] * float(xp[i]);
             acc[j] += t;
@@ -91,12 +99,13 @@ _SOURCE = """
     // caller (the down projection folds it into the routing weights).
     const float post = (FMT == 0 && POST) ? float(bfloat(gscale[e] * (1.0f / 2688.0f))) : 1.0f;
     for (int j = 0; j < MAXT; ++j) {
-        if (j >= len) break;
+        if (j >= clen) break;
         float r = simd_sum(acc[j]);
         if (lane == 0) {
             // Rounded like the reference: BF16 matmul output, then the scale.
             y[(size_t)prow[j] * NOUT + n] = float(bfloat(float(bfloat(r)) * post));
         }
+    }
     }
 """
 
@@ -172,28 +181,49 @@ def segments(inds: mx.array):
     return order, start, length, expert
 
 
-def grouped_matvec(x, x_row, segs, proj, max_tokens: int, post: bool = True):
-    """``y[p] = scale_e * (W_e @ x[x_row[p]])`` for every pair ``p``.
+_const_cache: dict = {}
 
-    ``x`` [rows, KIN] BF16; ``proj`` an ``ExpertProj`` (NVFP4 or MXFP8).
-    Returns [P, NOUT] FP32 holding BF16-rounded values.
+
+def _const(key, make):
+    out = _const_cache.get(key)
+    if out is None:
+        out = make()
+        mx.eval(out)
+        _const_cache[key] = out
+    return out
+
+
+def grouped_matvec(x, segs, proj, tokens: int, top_k: int, *, pair_input=False, post=True):
+    """``y[p] = scale_e * (W_e @ in_p)`` for every (token, expert) pair ``p``.
+
+    ``in_p`` is the token's row of ``x`` [T, KIN] (BF16), or with
+    ``pair_input`` the pair's own row of ``x`` [P, KIN]. ``segs`` from
+    ``segments`` (or the
+    routing indices themselves for one token). Returns [P, NOUT] FP32 holding
+    BF16-rounded values.
     """
-    order, start, length, expert = segs
     experts, nout, _ = proj.weight.shape
     kin = proj.weight.shape[-1] * 32 // proj.bits
     fmt = {"nvfp4": 0, "mxfp8": 1}[proj.mode]
-    p = order.shape[0]
-    maxt = 1 if max_tokens <= 1 else (8 if max_tokens <= 8 else _MAX_TOKENS)
+    decode = tokens == 1
+    p = tokens * top_k
+    if decode:
+        inds = segs
+        zero = _const(("zi", 1), lambda: mx.zeros((1,), mx.int32))
+        seg_inputs = [zero, zero, zero, inds.reshape(-1)]
+    else:
+        seg_inputs = list(segs)
+    maxt = 1 if decode else (8 if tokens <= 8 else _MAX_TOKENS)
     k = _kernel(
         f"mtplx_inkling2_moe_gemv_{fmt}",
-        ["x", "x_row", "order", "seg_start", "seg_len", "seg_expert", "w", "scales", "gscale"],
+        ["x", "order", "seg_start", "seg_len", "seg_expert", "w", "scales", "gscale"],
         ["y"],
         _SOURCE,
         _HEADER,
     )
-    gscale = proj.global_scale if fmt == 0 else mx.zeros((1,), mx.float32)
+    gscale = proj.global_scale if fmt == 0 else _const(("zf", 1), lambda: mx.zeros((1,), mx.float32))
     return k(
-        inputs=[x, x_row, order, start, length, expert, proj.weight, proj.scales, gscale],
+        inputs=[x, *seg_inputs, proj.weight, proj.scales, gscale],
         template=[
             ("KIN", kin),
             ("NOUT", nout),
@@ -203,12 +233,14 @@ def grouped_matvec(x, x_row, segs, proj, max_tokens: int, post: bool = True):
             ("ROWS", _ROWS),
             ("MAXT", maxt),
             ("POST", int(post)),
+            ("DECODE", int(decode)),
+            ("PAIRIN", int(pair_input)),
+            ("TOPK", top_k),
         ],
         grid=(((nout + _ROWS - 1) // _ROWS) * _ROWS * 32, p, 1),
         threadgroup=(_ROWS * 32, 1, 1),
         output_shapes=[(p, nout)],
         output_dtypes=[mx.float32],
-        init_value=0.0,
     )[0]
 
 
@@ -216,25 +248,136 @@ def supports(proj) -> bool:
     return getattr(proj, "mode", None) in ("nvfp4", "mxfp8")
 
 
+_ACT_SOURCE = """
+    // Softcapped SwiGLU of the interleaved [gate, up] w13 rows -> BF16.
+    const uint i = thread_position_in_grid.x;
+    const uint p = thread_position_in_grid.y;
+    if (i >= I) return;
+    const float g = y13[(size_t)p * 2 * I + 2 * i];
+    const float u = y13[(size_t)p * 2 * I + 2 * i + 1];
+    const float a = metal::precise::tanh(g / caps[0]) * caps[0]
+        * (1.0f / (1.0f + metal::precise::exp(-g)))
+        * (metal::precise::tanh(u / caps[1]) * caps[1]);
+    act[(size_t)p * I + i] = bfloat(a);
+"""
+
+
+def softcapped_swiglu(y13: mx.array, gate_cap: float, up_cap: float) -> mx.array:
+    """[P, 2I] FP32 interleaved w13 output -> [P, I] BF16 activation."""
+    p, width = y13.shape
+    inter = width // 2
+    k = _kernel("mtplx_inkling2_moe_act", ["y13", "caps"], ["act"], _ACT_SOURCE)
+    caps = _const(("caps", gate_cap, up_cap), lambda: mx.array([gate_cap, up_cap], mx.float32))
+    return k(
+        inputs=[y13, caps],
+        template=[("I", inter)],
+        grid=(inter, p, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(p, inter)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+
+
+_COMBINE_SOURCE = """
+    // One thread per channel: weighted expert sum -> BF16, then the MLP short
+    // conv over the block's tokens (with carried state) and the residual.
+    const uint c = thread_position_in_grid.x;
+    if (c >= H) return;
+    constexpr int KC = KCONV;
+    float mt[MAXT];
+    for (int t = 0; t < T; ++t) {
+        float acc = 0.0f;
+        for (int k = 0; k < TOPK; ++k) {
+            const int p = t * TOPK + k;
+            float wk = weights[p];
+            if (NVFP4) wk *= gscale[inds[p]] * (1.0f / 2688.0f);
+            acc += z[(size_t)p * H + c] * wk;
+        }
+        mt[t] = float(bfloat(acc));
+    }
+    for (int t = 0; t < T; ++t) {
+        float acc = 0.0f;
+        for (int j = 0; j < KC; ++j) {
+            const int q = t + j;  // xp index
+            const float val = q < KC - 1 ? state[q * H + c] : mt[q - (KC - 1)];
+            acc += float(conv_w[c * KC + j]) * val;
+        }
+        const float m = float(bfloat((float(bfloat(acc)) + mt[t]) * scale[0]));
+        h[(size_t)t * H + c] = bfloat(residual[(size_t)t * H + c] + m);
+        xp[(size_t)(KC - 1 + t) * H + c] = mt[t];
+    }
+    for (int j = 0; j < KC - 1; ++j) {
+        xp[(size_t)j * H + c] = state[j * H + c];
+        const int q = T + j;
+        new_state[j * H + c] = q < KC - 1 ? state[q * H + c] : mt[q - (KC - 1)];
+    }
+"""
+
+
+def moe_block(experts, x, inds, weights, residual, conv_w, state, conv_scale: float):
+    """Routed experts + MLP short conv + residual for ``T`` <= 16 tokens of
+    one row (``B == 1``).
+
+    ``x`` [T, H] (normalized MLP input), ``inds``/``weights`` [T, K] routing,
+    ``residual`` [T, H] FP32, ``conv_w`` [H, Kc], ``state`` [1, Kc-1, H].
+    Returns ``(h [T, H] BF16, window [1, Kc-1+T, H], next_state)``.
+    """
+    from . import kernels
+
+    t, kk = inds.shape
+    hidden = x.shape[-1]
+    segs = inds if t == 1 else segments(inds)
+    y13 = grouped_matvec(x.astype(mx.bfloat16), segs, experts.w13, t, kk)
+    act = softcapped_swiglu(y13, *experts.caps)
+    z = grouped_matvec(act, segs, experts.w2, t, kk, pair_input=True, post=False)
+    z = z.reshape(t * kk, -1)
+    nvfp4 = experts.w2.mode == "nvfp4"
+    k = _kernel(
+        "mtplx_inkling2_moe_combine",
+        ["z", "weights", "inds", "gscale", "residual", "conv_w", "state", "scale"],
+        ["h", "xp", "new_state"],
+        _COMBINE_SOURCE,
+    )
+    gscale = experts.w2.global_scale if nvfp4 else _const(("zf", 1), lambda: mx.zeros((1,), mx.float32))
+    kc = conv_w.shape[-1]
+    return tuple(
+        k(
+            inputs=[
+                z,
+                weights.astype(mx.float32),
+                inds.astype(mx.uint32),
+                gscale,
+                residual.astype(mx.float32),
+                conv_w,
+                state.astype(mx.float32),
+                kernels._scalar(float(conv_scale)),
+            ],
+            template=[
+                ("H", hidden),
+                ("T", t),
+                ("TOPK", kk),
+                ("KCONV", kc),
+                ("MAXT", max(1, t)),
+                ("NVFP4", int(nvfp4)),
+            ],
+            grid=(hidden, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(t, hidden), (1, kc - 1 + t, hidden), (1, kc - 1, hidden)],
+            output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+        )
+    )
+
+
 def experts_forward(experts, x: mx.array, inds: mx.array, weights: mx.array):
-    """Drop-in for ``Inkling2Experts.__call__`` on few-token inputs.
+    """Drop-in for ``Inkling2Experts.__call__`` on few-token inputs (tests).
 
     ``x`` [T, H], ``inds`` [T, K], ``weights`` [T, K] FP32 -> [T, H].
     """
-    from .model import _softcapped_swiglu
-
     t, kk = inds.shape
-    segs = segments(inds)
-    tok_rows = (mx.arange(t * kk, dtype=mx.int32) // kk)
-    y13 = grouped_matvec(x.astype(mx.bfloat16), tok_rows, segs, experts.w13, t)
-    act = _softcapped_swiglu(
-        y13[:, 0::2].astype(mx.bfloat16),
-        y13[:, 1::2].astype(mx.bfloat16),
-        experts._gcap,
-        experts._ucap,
-    )
-    pair_rows = mx.arange(t * kk, dtype=mx.int32)
-    z = grouped_matvec(act, pair_rows, segs, experts.w2, t, post=False)
+    segs = inds if t == 1 else segments(inds)
+    y13 = grouped_matvec(x.astype(mx.bfloat16), segs, experts.w13, t, kk)
+    act = softcapped_swiglu(y13, *experts.caps)
+    z = grouped_matvec(act, segs, experts.w2, t, kk, pair_input=True, post=False)
     z = z.reshape(t, kk, -1)
     s2 = experts.w2.post_scale(inds)
     if s2 is not None:

@@ -31,7 +31,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
-from . import fused, kernels
+from . import fused, kernels, moe_kernels
 from .loader import sanitize_weights
 
 _NVFP4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
@@ -280,6 +280,7 @@ class Inkling2Experts(nn.Module):
         self.w2 = ExpertProj(e, h, i, w2_spec)
         self._gcap = mx.array(args.mlp_gate_softcap, dtype=mx.float32)
         self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
+        self.caps = (float(args.mlp_gate_softcap), float(args.mlp_up_softcap))
 
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
         xe = mx.expand_dims(x, (-2, -3))
@@ -404,6 +405,21 @@ def _dynamic_conv(x, dyn, static_w, state, heads, scale):
     return out.astype(x.dtype), xp
 
 
+def _conv_static(x, w, state, scale):
+    """(out, window, next_state); one fused launch on the GPU."""
+    if mx.default_device() == mx.gpu:
+        return fused.static_conv(x, w, state, scale)
+    out, xp = _static_conv(x, w, state, scale)
+    return out, xp, xp[:, -(w.shape[-1] - 1) :]
+
+
+def _conv_dynamic(x, dyn, static_w, state, heads, scale):
+    if mx.default_device() == mx.gpu:
+        return fused.dynamic_conv(x, dyn, static_w, state, heads, scale)
+    out, xp = _dynamic_conv(x, dyn, static_w, state, heads, scale)
+    return out, xp, xp[:, -(static_w.shape[0] - 1) :]
+
+
 class Inkling2Attention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
@@ -490,13 +506,13 @@ class Inkling2Attention(nn.Module):
                 q, _, _, r, gate, sink = mx.split(pq, self._cuts, axis=-1)
                 k = pk[..., self._cuts[0] : self._cuts[1]]
                 v = pv[..., self._cuts[1] : self._cuts[2]]
-            k, ks = _static_conv(k, self.k_conv, ks, self._sconv_scale)
-            v, vs = _static_conv(v, self.v_conv, vs, self._sconv_scale)
+            k, ks, ks_next = _conv_static(k, self.k_conv, ks, self._sconv_scale)
+            v, vs, vs_next = _conv_static(v, self.v_conv, vs, self._sconv_scale)
         else:
             q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
             kp = self.k_proj(xk)
             vp = self.v_proj(xv)
-            k, ks = _dynamic_conv(
+            k, ks, ks_next = _conv_dynamic(
                 kp[..., :dkv],
                 kp[..., dkv:],
                 self.k_static,
@@ -504,7 +520,7 @@ class Inkling2Attention(nn.Module):
                 self.n_kv,
                 self._dconv_scale,
             )
-            v, vs = _dynamic_conv(
+            v, vs, vs_next = _conv_dynamic(
                 vp[..., :dkv],
                 vp[..., dkv:],
                 self.v_static,
@@ -539,6 +555,8 @@ class Inkling2Attention(nn.Module):
             ks,
             vs,
             r,
+            ks_next,
+            vs_next,
         )
 
     def attend(self, q, k, v, rel, sink, kv):
@@ -637,6 +655,15 @@ class Inkling2Layer(nn.Module):
         self._pre_compiled = mx.compile(lambda *a: Inkling2Layer._pre(layer, *a))
         self._post_compiled = mx.compile(lambda *a: Inkling2Layer._post(layer, *a))
 
+    @property
+    def _fused_moe(self) -> bool:
+        experts = self.mlp.experts
+        return (
+            mx.default_device() == mx.gpu
+            and experts.w13.mode == "nvfp4"
+            and experts.w2.mode == "nvfp4"
+        )
+
     def pack_fused(self) -> None:
         """Kernel layouts of the loop controllers (``fused.mix_messages``)."""
         if hasattr(self, "loop_down"):
@@ -684,7 +711,7 @@ class Inkling2Layer(nn.Module):
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
         a = self.attn.output(out, gate)
-        a, s2 = _static_conv(a, self.attn_conv, s2, self._conv_scale)
+        a, s2, s2_next = _conv_static(a, self.attn_conv, s2, self._conv_scale)
         if self.is_boundary:
             residual = a.astype(mx.float32)
         else:
@@ -692,9 +719,26 @@ class Inkling2Layer(nn.Module):
         y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
         if messages is not None:
             y = self._mix(y[None], messages[None, :, :, 3], slice(3, 4))[0]
-        m = self.mlp(self.mlp_norm(y).astype(h.dtype))
-        m, s3 = _static_conv(m, self.mlp_conv, s3, self._conv_scale)
-        return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3
+        x = self.mlp_norm(y).astype(h.dtype)
+        if self._fused_moe and x.shape[0] * x.shape[1] == 1:
+            # Routed experts, MLP conv and residual in four launches.
+            hidden = x.shape[-1]
+            flat = x.reshape(-1, hidden)
+            inds, weights = self.mlp.route(flat)
+            out, s3, s3_next = moe_kernels.moe_block(
+                self.mlp.experts,
+                flat,
+                inds,
+                weights,
+                residual.reshape(-1, hidden),
+                self.mlp_conv,
+                s3,
+                self._conv_scale,
+            )
+            return out.reshape(h.shape), s2, s3, s2_next, s3_next
+        m = self.mlp(x)
+        m, s3, s3_next = _conv_static(m, self.mlp_conv, s3, self._conv_scale)
+        return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3, s2_next, s3_next
 
     def __call__(self, h, blocks, cache=None, bank=None):
         """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS
@@ -715,7 +759,7 @@ class Inkling2Layer(nn.Module):
         pre = self._pre_compiled if compiled else self._pre
         post = self._post_compiled if compiled else self._post
         messages = self.loop_message(*bank) if bank is not None else None
-        q, k, v, rel, gate, sink, ks, vs, r, h_n = pre(
+        q, k, v, rel, gate, sink, ks, vs, r, ks_next, vs_next, h_n = pre(
             h, blocks, states[0], states[1], tau, messages
         )
         if b == 1 and length == 1 and self.attn.fused_decode_ok:
@@ -725,16 +769,18 @@ class Inkling2Layer(nn.Module):
             out = self.attn.attend(q, k, v, rel, sink, kv)
         if self.is_boundary:
             blocks.append(h_n)
-        h, s2, s3 = post(out, gate, h, blocks, states[2], states[3], messages)
+        h, s2, s3, s2_next, s3_next = post(
+            out, gate, h, blocks, states[2], states[3], messages
+        )
         if conv is not None:
             windows = (ks, vs, s2, s3)
             if 1 < length <= _COMPILED_MAX_TOKENS:
                 # Speculative verify rollback re-cuts the states from these.
                 conv._omlx_verify_xp = dict(enumerate(windows))
-            keep = self._conv_k - 1
-            for slot, window in enumerate(windows):
-                # A small copy, so the state does not pin the chunk's window.
-                conv[slot] = window[:, -keep:] * 1.0
+            # The kernels' own next-state outputs: small arrays that do not
+            # pin the chunk's window.
+            for slot, state in enumerate((ks_next, vs_next, s2_next, s3_next)):
+                conv[slot] = state
         return h
 
 

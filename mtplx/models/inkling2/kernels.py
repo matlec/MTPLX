@@ -18,6 +18,18 @@ _MASK_BUDGET = 1 << 29
 
 _ATTN_RES_TG = 256
 _attn_res_kernels: dict = {}
+_scalars: dict = {}
+
+
+def _scalar(value: float) -> mx.array:
+    """A cached FP32 [1] constant: a fresh ``mx.array`` per call is one more
+    graph node (and upload) per kernel launch, ~50 per layer visit."""
+    out = _scalars.get(value)
+    if out is None:
+        out = mx.array([value], dtype=mx.float32)
+        mx.eval(out)
+        _scalars[value] = out
+    return out
 
 
 def _attn_res_kernel(blocks: int, queries: int):
@@ -114,7 +126,7 @@ def attn_res_mix(blocks: list, partial_n: mx.array, query: mx.array, scale: floa
             *[x.astype(mx.float32) for x in blocks],
             partial_n.astype(mx.float32),
             query.astype(mx.float32),
-            mx.array([scale], dtype=mx.float32),
+            _scalar(scale),
         ],
         template=[("H", hidden), ("Q", nq), ("TG", _ATTN_RES_TG)],
         grid=(rows * _ATTN_RES_TG, 1, 1),
@@ -539,7 +551,7 @@ def route_topk(logits: mx.array, bias: mx.array, top_k: int, route_scale: float)
         inputs=[
             logits.astype(mx.float32),
             bias.astype(mx.float32),
-            mx.array([route_scale], dtype=mx.float32),
+            _scalar(float(route_scale)),
         ],
         template=[("E", experts), ("K", top_k)],
         grid=(rows * 32, 1, 1),

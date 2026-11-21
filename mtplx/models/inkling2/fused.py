@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from . import kernels
+
 # --------------------------------------------------------------------------
 # Loop controllers: (1 - tanh(forget)) * x + tanh(gain) * message
 # --------------------------------------------------------------------------
@@ -154,7 +156,7 @@ _DECODE_ATTN_SOURCE = """
     const int h = threadgroup_position_in_grid.x;
     const int split = threadgroup_position_in_grid.y;
     const int hk = h / (HQ / HKV);
-    const int S = dims[0];
+    const int S = k_shape[2];
     const int lo = WINDOW > 0 ? max(0, S - WINDOW) : 0;
     const int span = S - lo;
     const int per_split = (span + NSPLIT - 1) / NSPLIT;
@@ -289,7 +291,7 @@ def decode_attention(q, k, v, r, rel_proj, sink, gate, *, scale: float, window: 
     if kernel is None:
         kernel = mx.fast.metal_kernel(
             name=f"mtplx_inkling2_decode_attn_{int(nsplit > 1)}",
-            input_names=["q", "k", "v", "r", "rel_proj", "sink", "gate", "dims", "scale"],
+            input_names=["q", "k", "v", "r", "rel_proj", "sink", "gate", "scale"],
             output_names=outputs,
             source=_variant(
                 _DECODE_ATTN_SOURCE,
@@ -318,8 +320,7 @@ def decode_attention(q, k, v, r, rel_proj, sink, gate, *, scale: float, window: 
         rel_proj,
         mx.contiguous(sink.reshape(hq)),
         mx.contiguous(gate.reshape(hq * d)),
-        mx.array([s], dtype=mx.int32),
-        mx.array([scale], dtype=mx.float32),
+        kernels._scalar(float(scale)),
     ]
     if nsplit == 1:
         out = kernel(
@@ -357,3 +358,140 @@ def decode_attention(q, k, v, r, rel_proj, sink, gate, *, scale: float, window: 
         output_dtypes=[dtype],
     )[0]
     return out.reshape(1, 1, hq * d)
+
+
+# --------------------------------------------------------------------------
+# Short causal convolutions with carried state
+# --------------------------------------------------------------------------
+
+_STATIC_CONV_SOURCE = """
+    // One thread per (row, token, channel). xp = [state (K-1 rows), x].
+    const uint c = thread_position_in_grid.x;
+    const uint t = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    if (c >= C) return;
+    const int L = x_shape[1];
+    const size_t xrow = ((size_t)b * L + t) * C + c;
+    // Window rows for this token: xp[t .. t + K - 1].
+    float acc = 0.0f;
+    for (int j = 0; j < K; ++j) {
+        const int p = int(t) + j;  // index into xp
+        const float val = p < K - 1
+            ? state[((size_t)b * (K - 1) + p) * C + c]
+            : float(x[((size_t)b * L + (p - (K - 1))) * C + c]);
+        acc += float(w[c * K + j]) * val;
+    }
+    const float xf = float(x[xrow]);
+    out[xrow] = T((float(WT(acc)) + xf) * scale[0]);
+    // xp row K - 1 + t is this token's input; the first K - 1 rows are the state.
+    xp[((size_t)b * (K - 1 + L) + (K - 1 + t)) * C + c] = xf;
+    for (int j = int(t); j < K - 1; j += L) {
+        xp[((size_t)b * (K - 1 + L) + j) * C + c] = state[((size_t)b * (K - 1) + j) * C + c];
+    }
+    // Next state: the last K - 1 rows of xp.
+    const int first = L;  // xp row of the next state's first entry
+    for (int j = 0; j < K - 1; ++j) {
+        if (int(t) == L - 1) {
+            const int p = first + j;
+            const float val = p < K - 1
+                ? state[((size_t)b * (K - 1) + p) * C + c]
+                : float(x[((size_t)b * L + (p - (K - 1))) * C + c]);
+            new_state[((size_t)b * (K - 1) + j) * C + c] = val;
+        }
+    }
+"""
+
+_DYNAMIC_CONV_SOURCE = """
+    // Per-token taps static_w[lag] + dyn[head, lag]; lag 0 is the current token.
+    const uint c = thread_position_in_grid.x;
+    const uint t = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    if (c >= C) return;
+    const int L = x_shape[1];
+    const uint head = c / (C / HEADS);
+    const size_t xrow = ((size_t)b * L + t) * C + c;
+    const size_t drow = ((size_t)b * L + t) * (HEADS * K) + head * K;
+    float acc = 0.0f;
+    for (int lag = 0; lag < K; ++lag) {
+        const int p = int(t) + (K - 1 - lag);  // xp index
+        const float val = p < K - 1
+            ? state[((size_t)b * (K - 1) + p) * C + c]
+            : float(x[((size_t)b * L + (p - (K - 1))) * C + c]);
+        const float tap = float(static_w[lag * C + c]) + float(dyn[drow + lag]);
+        acc += val * tap;
+    }
+    const float xf = float(x[xrow]);
+    out[xrow] = T((acc + xf) * scale[0]);
+    xp[((size_t)b * (K - 1 + L) + (K - 1 + t)) * C + c] = xf;
+    for (int j = int(t); j < K - 1; j += L) {
+        xp[((size_t)b * (K - 1 + L) + j) * C + c] = state[((size_t)b * (K - 1) + j) * C + c];
+    }
+    for (int j = 0; j < K - 1; ++j) {
+        if (int(t) == L - 1) {
+            const int p = L + j;
+            const float val = p < K - 1
+                ? state[((size_t)b * (K - 1) + p) * C + c]
+                : float(x[((size_t)b * L + (p - (K - 1))) * C + c]);
+            new_state[((size_t)b * (K - 1) + j) * C + c] = val;
+        }
+    }
+"""
+
+_conv_kernels: dict = {}
+
+
+def _conv_kernel(kind: str):
+    kernel = _conv_kernels.get(kind)
+    if kernel is None:
+        if kind == "static":
+            names, source = ["x", "w", "state", "scale"], _STATIC_CONV_SOURCE
+        else:
+            names, source = ["x", "dyn", "static_w", "state", "scale"], _DYNAMIC_CONV_SOURCE
+        kernel = mx.fast.metal_kernel(
+            name=f"mtplx_inkling2_{kind}_conv",
+            input_names=names,
+            output_names=["out", "xp", "new_state"],
+            source=source,
+        )
+        _conv_kernels[kind] = kernel
+    return kernel
+
+
+def static_conv(x: mx.array, w: mx.array, state: mx.array, scale: float):
+    """``model._static_conv`` in one launch. Returns (out, xp, next_state):
+    ``xp`` is the padded window ``[state, x]`` (verify rollback re-cuts the
+    state from it) and ``next_state`` its last ``K - 1`` rows."""
+    b, length, c = x.shape
+    k = w.shape[-1]
+    return tuple(
+        _conv_kernel("static")(
+            inputs=[x, w, state.astype(mx.float32), kernels._scalar(float(scale))],
+            template=[("T", x.dtype), ("WT", w.dtype), ("C", c), ("K", k)],
+            grid=(c, length, b),
+            threadgroup=(min(256, c), 1, 1),
+            output_shapes=[x.shape, (b, k - 1 + length, c), (b, k - 1, c)],
+            output_dtypes=[x.dtype, mx.float32, mx.float32],
+        )
+    )
+
+
+def dynamic_conv(x, dyn, static_w, state, heads: int, scale: float):
+    """``model._dynamic_conv`` in one launch; same returns as ``static_conv``."""
+    b, length, c = x.shape
+    k = static_w.shape[0]
+    return tuple(
+        _conv_kernel("dynamic")(
+            inputs=[
+                x,
+                dyn,
+                static_w,
+                state.astype(mx.float32),
+                kernels._scalar(float(scale)),
+            ],
+            template=[("T", x.dtype), ("C", c), ("K", k), ("HEADS", heads)],
+            grid=(c, length, b),
+            threadgroup=(min(256, c), 1, 1),
+            output_shapes=[x.shape, (b, k - 1 + length, c), (b, k - 1, c)],
+            output_dtypes=[x.dtype, mx.float32, mx.float32],
+        )
+    )
