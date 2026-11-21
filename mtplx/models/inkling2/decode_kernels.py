@@ -88,7 +88,7 @@ def _resmix_source(mode: int, ns: int, q: int, nb: int, norm: bool, first: bool,
     """Sources stream from memory in each pass; only the normalized partial
     row lives in threadgroup memory, so register use stays small."""
     srcs = [f"b{i}" for i in range(ns)]
-    bank = [f"m{i}" for i in range(nb)]
+    bank = [f"m{i}" for i in range(max(nb, 0))]
     L = []
     a = L.append
     a("""
@@ -223,7 +223,7 @@ def _resmix_source(mode: int, ns: int, q: int, nb: int, norm: bool, first: bool,
         a("    }\n")
 
     mix_block(srcs, "pnt[e]", q, "query", "norm" if norm else "raw", "outraw")
-    if nb:
+    if nb >= 0:
         a("    threadgroup_barrier(mem_flags::mem_threadgroup);\n")
         mix_block(bank, "mp[row + e]", 4, "mquery", "raw", "msg")
     return "".join(L)
@@ -252,7 +252,8 @@ def resmix(
     """See the mode table above. Returns a dict of the named outputs."""
     ns = len(blocks)
     nq = int(query.shape[0]) if query is not None else 0
-    nb = len(bank[0]) if bank is not None else 0
+    # -1: no loop bank; 0: a bank of just the previous pass's partial.
+    nb = len(bank[0]) if bank is not None else -1
     do_norm = norm_w is not None
     key = ("resmix", mode, ns, nq, nb, do_norm, first, boundary)
     names, arrays = [], []
@@ -268,7 +269,7 @@ def resmix(
         arrays += [query, rscale]
     if do_norm:
         names.append("nw"); arrays.append(norm_w)
-    if nb:
+    if nb >= 0:
         for i, b in enumerate(bank[0]):
             names.append(f"m{i}"); arrays.append(b)
         names += ["mp", "mquery"]
@@ -288,9 +289,9 @@ def resmix(
             outputs.append(f"out{qi}"); shapes.append((tokens, hidden)); dtypes.append(mx.bfloat16)
     else:
         outputs.append("outraw"); shapes.append((nq, tokens, hidden)); dtypes.append(mx.float32)
-    if nb:
+    if nb >= 0:
         outputs.append("msg"); shapes.append((4, tokens, hidden)); dtypes.append(mx.float32)
-    name = "mtplx_inkling2_resmix_" + "_".join(str(int(x)) for x in key[1:])
+    name = "mtplx_inkling2_resmix_" + "_".join(str(int(x)) for x in key[1:]).replace("-", "n")
     k = _kernels.get(name)
     if k is None:
         source = _resmix_source(mode, ns, nq, nb, do_norm, first, boundary).replace(
