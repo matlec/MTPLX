@@ -19,6 +19,9 @@ import mlx.core as mx
 _ROWS = 8
 # Most tokens one expert can serve in one call (verify blocks are <= 16).
 _MAX_TOKENS = 16
+# v2 (NVFP4): rows per simdgroup, simdgroups per threadgroup.
+_V2_RPS = 4
+_V2_SGS = 2
 
 _HEADER = """
 inline float e4m3_to_float(uint v) {
@@ -106,6 +109,80 @@ _SOURCE = """
             y[(size_t)prow[j] * NOUT + n] = float(bfloat(float(bfloat(r)) * post));
         }
     }
+    }
+"""
+
+_SOURCE_V2 = """
+    // NVFP4 grouped matvec, v2: each simdgroup owns RPS output rows; a lane
+    // reads one 16-value scale group (8 bytes + 1 scale) per row per step,
+    // so one input chunk serves RPS rows.
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint tid = thread_position_in_threadgroup.x;
+    threadgroup float lut[16];
+    if (tid < 16) lut[tid] = FP4_LUT[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint seg = threadgroup_position_in_grid.y;
+    const uint n0 = (threadgroup_position_in_grid.x * SGS + sg) * RPS;
+    const int len = DECODE ? 1 : seg_len[seg];
+    if (len <= 0 || n0 >= NOUT) return;
+    const int start = DECODE ? int(seg) : seg_start[seg];
+    const uint e = uint(seg_expert[seg]);
+    constexpr uint GROUPS = KIN / 16;
+    constexpr uint WPR = KIN / 8;  // uint32 words per row
+    const device uint32_t* wbase = w + ((size_t)e * NOUT + n0) * WPR;
+    const device uint8_t* sbase = scales + ((size_t)e * NOUT + n0) * GROUPS;
+    for (int base = 0; base < len; base += MAXT) {
+        const int clen = min(MAXT, len - base);
+        int prow[MAXT];
+        size_t xoff[MAXT];
+        float acc[RPS][MAXT];
+        for (int j = 0; j < MAXT; ++j) {
+            for (int r = 0; r < RPS; ++r) acc[r][j] = 0.0f;
+            if (j < clen) {
+                prow[j] = DECODE ? int(seg) : order[start + base + j];
+                xoff[j] = PAIRIN ? (size_t)prow[j] * KIN
+                                 : (size_t)(DECODE ? 0 : (prow[j] / TOPK)) * KIN;
+            }
+        }
+        for (uint g = lane; g < GROUPS; g += 32) {
+            uint2 wv[RPS];
+            float sc[RPS];
+            for (int r = 0; r < RPS; ++r) {
+                wv[r] = *(const device uint2*)(wbase + (size_t)r * WPR + g * 2);
+                sc[r] = e4m3_to_float(sbase[(size_t)r * GROUPS + g]);
+            }
+            for (int j = 0; j < MAXT; ++j) {
+                if (j >= clen) break;
+                const device uint4* xp = (const device uint4*)(x + xoff[j] + g * 16);
+                const uint4 xa = xp[0];
+                const uint4 xb = xp[1];
+                float xv[16];
+                for (int q = 0; q < 4; ++q) {
+                    xv[2 * q] = as_type<float>(xa[q] << 16);
+                    xv[2 * q + 1] = as_type<float>(xa[q] & 0xFFFF0000u);
+                    xv[8 + 2 * q] = as_type<float>(xb[q] << 16);
+                    xv[8 + 2 * q + 1] = as_type<float>(xb[q] & 0xFFFF0000u);
+                }
+                for (int r = 0; r < RPS; ++r) {
+                    float t = 0.0f;
+                    for (int i = 0; i < 8; ++i) {
+                        t += lut[(wv[r].x >> (4 * i)) & 0xF] * xv[i];
+                        t += lut[(wv[r].y >> (4 * i)) & 0xF] * xv[8 + i];
+                    }
+                    acc[r][j] += t * sc[r];
+                }
+            }
+        }
+        for (int r = 0; r < RPS; ++r) {
+            const uint n = n0 + r;
+            const float post = POST ? float(bfloat(gscale[e] * (1.0f / 2688.0f))) : 1.0f;
+            for (int j = 0; j < MAXT; ++j) {
+                if (j >= clen) break;
+                const float v = simd_sum(acc[r][j]);
+                if (lane == 0) y[(size_t)prow[j] * NOUT + n] = float(bfloat(float(bfloat(v)) * post));
+            }
+        }
     }
 """
 
@@ -214,11 +291,12 @@ def grouped_matvec(x, segs, proj, tokens: int, top_k: int, *, pair_input=False, 
     else:
         seg_inputs = list(segs)
     maxt = 1 if decode else (8 if tokens <= 8 else _MAX_TOKENS)
+    v2 = fmt == 0 and kin % 32 == 0 and nout % (_V2_RPS * _V2_SGS) == 0
     k = _kernel(
-        f"mtplx_inkling2_moe_gemv_{fmt}",
+        f"mtplx_inkling2_moe_gemv_{fmt}_{int(v2)}",
         ["x", "order", "seg_start", "seg_len", "seg_expert", "w", "scales", "gscale"],
         ["y"],
-        _SOURCE,
+        _SOURCE_V2 if v2 else _SOURCE,
         _HEADER,
     )
     gscale = proj.global_scale if fmt == 0 else _const(("zf", 1), lambda: mx.zeros((1,), mx.float32))
@@ -236,9 +314,15 @@ def grouped_matvec(x, segs, proj, tokens: int, top_k: int, *, pair_input=False, 
             ("DECODE", int(decode)),
             ("PAIRIN", int(pair_input)),
             ("TOPK", top_k),
+            ("RPS", _V2_RPS),
+            ("SGS", _V2_SGS),
         ],
-        grid=(((nout + _ROWS - 1) // _ROWS) * _ROWS * 32, p, 1),
-        threadgroup=(_ROWS * 32, 1, 1),
+        grid=(
+            (nout // (_V2_RPS * _V2_SGS)) * _V2_SGS * 32 if v2 else ((nout + _ROWS - 1) // _ROWS) * _ROWS * 32,
+            p,
+            1,
+        ),
+        threadgroup=((_V2_SGS if v2 else _ROWS) * 32, 1, 1),
         output_shapes=[(p, nout)],
         output_dtypes=[mx.float32],
     )[0]

@@ -27,8 +27,11 @@ _MIX_DOWN_SOURCE = """
     const uint k = threadgroup_position_in_grid.x;
     const uint row = threadgroup_position_in_grid.y;
     const uint input = row / ROWS;
-    const device float* xr = x + (size_t)row * H;
-    const device float* mr = m + (size_t)row * H;
+    // XB: one x row per token shared by every input; MOFF / WOFF: first
+    // message row / controller of this call.
+    const uint xrow = XB ? row % ROWS : row;
+    const device float* xr = x + (size_t)xrow * H;
+    const device float* mr = m + ((size_t)(input + MOFF) * ROWS + row % ROWS) * H;
     threadgroup float red[2][8];
 
     float sx = 0.0f, sm = 0.0f;
@@ -47,7 +50,7 @@ _MIX_DOWN_SOURCE = """
     const float im = metal::precise::rsqrt(tm / H + 1e-6f);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const device bfloat* w = down + ((size_t)input * R + k) * (2 * H);
+    const device bfloat* w = down + ((size_t)(input + WOFF) * R + k) * (2 * H);
     float acc = 0.0f;
     for (uint h = tid; h < H; h += 256) {
         acc += float(bfloat(xr[h] * ix)) * float(w[h]);
@@ -71,7 +74,7 @@ _MIX_UP_SOURCE = """
     const uint row = thread_position_in_grid.y;
     const uint input = row / ROWS;
     const device float* lr = low + (size_t)row * R;
-    const device bfloat* gw = gf + ((size_t)input * 2 * H + h) * R;
+    const device bfloat* gw = gf + ((size_t)(input + WOFF) * 2 * H + h) * R;
     const device bfloat* fw = gw + (size_t)H * R;
     float g = 0.0f, f = 0.0f;
     for (uint k = lane; k < R; k += 32) {
@@ -82,8 +85,9 @@ _MIX_UP_SOURCE = """
     g = simd_sum(g);
     f = simd_sum(f);
     if (lane == 0) {
-        const size_t at = (size_t)row * H + h;
-        out[at] = (1.0f - metal::precise::tanh(f)) * x[at] + metal::precise::tanh(g) * m[at];
+        const size_t xat = (size_t)(XB ? row % ROWS : row) * H + h;
+        const size_t mat = ((size_t)(input + MOFF) * ROWS + row % ROWS) * H + h;
+        out[(size_t)row * H + h] = (1.0f - metal::precise::tanh(f)) * x[xat] + metal::precise::tanh(g) * m[mat];
     }
 """
 
@@ -121,7 +125,7 @@ def mix_messages(x: mx.array, message: mx.array, down_t: mx.array, gf_t: mx.arra
         )
     xf = x.astype(mx.float32).reshape(n * rows, hidden)
     mf = message.astype(mx.float32).reshape(n * rows, hidden)
-    tmpl = [("H", hidden), ("R", rank), ("ROWS", rows)]
+    tmpl = [("H", hidden), ("R", rank), ("ROWS", rows), ("XB", 0), ("MOFF", 0), ("WOFF", 0)]
     low = _mix_down_kernel(
         inputs=[xf, mf, down_t],
         template=tmpl,
@@ -495,3 +499,41 @@ def dynamic_conv(x, dyn, static_w, state, heads: int, scale: float):
             output_dtypes=[x.dtype, mx.float32, mx.float32],
         )
     )
+
+
+def mix_rows(x, message, down_t, gf_t, *, n: int, x_shared: bool, msg_offset: int, w_offset: int):
+    """``mix_messages`` on step-engine layouts, without slicing nodes.
+
+    ``x`` [nx, T, H] FP32 (``x_shared``: one row block used by all ``n``
+    inputs), ``message`` [4, T, H] FP32 (inputs read rows ``msg_offset +
+    i``), packed controllers (inputs use ``w_offset + i``). Returns
+    [n, T, H] FP32.
+    """
+    global _mix_down_kernel, _mix_up_kernel
+    if _mix_down_kernel is None:
+        mix_messages(  # builds the kernels
+            mx.zeros((1, 1, 1, x.shape[-1])), mx.zeros((1, 1, 1, x.shape[-1])),
+            down_t[:1], gf_t[:1],
+        )
+    tokens, hidden = x.shape[1], x.shape[2]
+    rank = down_t.shape[1]
+    tmpl = [
+        ("H", hidden), ("R", rank), ("ROWS", tokens),
+        ("XB", int(x_shared)), ("MOFF", msg_offset), ("WOFF", w_offset),
+    ]
+    low = _mix_down_kernel(
+        inputs=[x, message, down_t],
+        template=tmpl,
+        grid=(rank * 256, n * tokens, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(n * tokens, rank)],
+        output_dtypes=[mx.float32],
+    )[0]
+    return _mix_up_kernel(
+        inputs=[low, gf_t, x, message],
+        template=tmpl,
+        grid=(hidden * 32, n * tokens, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(n, tokens, hidden)],
+        output_dtypes=[mx.float32],
+    )[0]
