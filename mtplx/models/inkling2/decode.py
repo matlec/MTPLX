@@ -244,8 +244,9 @@ class StepEngine:
         # Projections.
         if attn.sliding:
             if loop_pass:
-                pqkv = DK.qmm_small(attn.in_proj, xqkv)
-                pq, pk, pv = pqkv[0], pqkv[1], pqkv[2]
+                # [3, T, NP]: the epilogue reads the k / v rows at offsets,
+                # and q / gate / sink are the first T rows.
+                pq = pk = pv = DK.qmm_small(attn.in_proj, xqkv)
             else:
                 pq = pk = pv = DK.qmm_small(attn.in_proj, xq)
             dq, dkv, dr = attn.n_heads * attn.head_dim, attn.dkv, attn.n_heads * attn.d_rel
@@ -260,7 +261,8 @@ class StepEngine:
             gate_col = dq + dr
         sink_col = gate_col + attn.n_heads * attn.head_dim
         q, kvn, rr, kwin, vwin, knext, vnext = DK.qkv_epilogue(
-            attn, pq, pk, pv, conv[0], conv[1], info, tokens=tokens, layout=layout
+            attn, pq, pk, pv, conv[0], conv[1], info, tokens=tokens, layout=layout,
+            stacked=bool(attn.sliding and loop_pass),
         )
         # Cache write: slots from the step's position, so the traced step is
         # the same at every offset (ring visits wrap inside the scatter).

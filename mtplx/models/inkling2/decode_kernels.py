@@ -414,7 +414,9 @@ _QKV_SOURCE = """
     const bool is_v = g >= HQ + HKV;
     const uint hk = is_v ? g - HQ - HKV : g - HQ;
     const uint c = hk * D + d;
-    const device bfloat* src = is_v ? pv : pk;
+    // STACKED: pk / pv are the second / third [T, NP] blocks of one array.
+    const device bfloat* src = is_v ? pv + (STACKED ? 2 * T * NPV : 0)
+                                    : pk + (STACKED ? T * NPK : 0);
     const int np = is_v ? NPV : NPK;
     const int col = is_v ? V0 : K0;
     const device float* st = is_v ? vstate : kstate;
@@ -463,7 +465,7 @@ _QKV_SOURCE = """
 """
 
 
-def qkv_epilogue(attn, pq, pk, pv, kstate, vstate, info, *, tokens: int, layout: dict):
+def qkv_epilogue(attn, pq, pk, pv, kstate, vstate, info, *, tokens: int, layout: dict, stacked: bool = False):
     """From the projection outputs to cache-ready q / k / v.
 
     Returns ``q`` [T, Hq, D], ``kv`` [2, Hkv, T, D], ``r`` [T, Hq, DR] (all
@@ -492,6 +494,7 @@ def qkv_epilogue(attn, pq, pk, pv, kstate, vstate, info, *, tokens: int, layout:
         ("NPQ", int(pq.shape[-1])), ("NPK", int(pk.shape[-1])), ("NPV", int(pv.shape[-1])),
         ("Q0", layout["q"]), ("R0", layout["r"]), ("K0", layout["k"]), ("V0", layout["v"]),
         ("DYN0", layout.get("dyn", 0)),
+        ("STACKED", int(stacked)),
     ]
     source = _QKV_SOURCE.replace("LOG_ALPHA", f"{float(attn.log_alpha)!r}f").replace(
         "LOG_FLOOR", f"{float(attn.log_floor or 1)!r}f"
