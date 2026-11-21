@@ -135,7 +135,9 @@ def _decode_attention(q, k, v, rel, sink, scale, window):
     r = rel.shape[-1]
     n = min(r, sv)
     hq = q.shape[1]
-    tail = rel[0, 0, :, :n][:, ::-1]
+    # A reversed view reaches SDPA's mask with a negative stride, which MLX
+    # 0.32 reads wrongly (contexts shorter than the bias band); copy it.
+    tail = mx.contiguous(rel[0, 0, :, :n][:, ::-1])
     if n < sv:
         tail = mx.concatenate([mx.zeros((hq, sv - n), dtype=tail.dtype), tail], -1)
     mask = tail.reshape(1, hq, 1, sv).astype(q.dtype)

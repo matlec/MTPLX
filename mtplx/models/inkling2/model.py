@@ -451,6 +451,14 @@ class Inkling2Attention(nn.Module):
         self._one = mx.array(1.0, dtype=mx.float32)
         self._sconv_scale = 1.0 / math.sqrt(self.conv_k + 1)
         self._dconv_scale = 1.0 / math.sqrt(2 * self.conv_k + 1)
+        # The fused decode kernel puts D / 32 head values and one relative
+        # term on each lane.
+        self.fused_decode_ok = (
+            _FUSED_DECODE_ATTENTION
+            and self.head_dim % 32 == 0
+            and self.d_rel <= 32
+            and mx.default_device() == mx.gpu
+        )
 
     def log_tau(self, kv, length: int):
         """Query/relative-state log scaling for long positions (full layers)."""
@@ -530,6 +538,7 @@ class Inkling2Attention(nn.Module):
             sink,
             ks,
             vs,
+            r,
         )
 
     def attend(self, q, k, v, rel, sink, kv):
@@ -547,7 +556,27 @@ class Inkling2Attention(nn.Module):
             left_padding=left_padding,
         )
 
+    def attend_decode(self, q, k, v, r, sink, gate, kv):
+        """Single-token attention with the bias band, sink and output gate
+        fused (``fused.decode_attention``); returns the gated [B, 1, Hq*D]."""
+        if kv is not None:
+            k, v = kv.update_and_fetch(k, v)
+        return fused.decode_attention(
+            q,
+            k,
+            v,
+            r,
+            self.rel_proj.astype(r.dtype),
+            sink,
+            gate,
+            scale=self.scale,
+            window=self.window,
+        )
+
     def output(self, out, gate):
+        if gate is None:
+            # Already gated [B, L, Hq*D] (``attend_decode``).
+            return self.o_proj(out)
         b, _, length, _ = out.shape
         out = out.transpose(0, 2, 1, 3).reshape(b, length, -1)
         out = (out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(
@@ -567,6 +596,8 @@ def _cumsum(xs):
 # the layer through compiled stages; longer prefill chunks stay eager, since
 # every new chunk length would otherwise retrace all layers.
 _COMPILED_MAX_TOKENS = 16
+# Single-token steps run attention through ``fused.decode_attention``.
+_FUSED_DECODE_ATTENTION = True
 
 
 class Inkling2Layer(nn.Module):
@@ -684,10 +715,14 @@ class Inkling2Layer(nn.Module):
         pre = self._pre_compiled if compiled else self._pre
         post = self._post_compiled if compiled else self._post
         messages = self.loop_message(*bank) if bank is not None else None
-        q, k, v, rel, gate, sink, ks, vs, h_n = pre(
+        q, k, v, rel, gate, sink, ks, vs, r, h_n = pre(
             h, blocks, states[0], states[1], tau, messages
         )
-        out = self.attn.attend(q, k, v, rel, sink, kv)
+        if b == 1 and length == 1 and self.attn.fused_decode_ok:
+            out = self.attn.attend_decode(q, k, v, r, sink, gate, kv)
+            gate = None
+        else:
+            out = self.attn.attend(q, k, v, rel, sink, kv)
         if self.is_boundary:
             blocks.append(h_n)
         h, s2, s3 = post(out, gate, h, blocks, states[2], states[3], messages)

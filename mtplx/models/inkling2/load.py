@@ -55,8 +55,41 @@ def _quantize_from_config(model: nn.Module, config: dict[str, Any]) -> None:
     nn.quantize(model, class_predicate=predicate)
 
 
-def load_model(path: str | Path, *, lazy: bool = False):
-    """Returns ``(model, config)``."""
+def quantize_in_memory(model: nn.Module, *, attn: str | None = None, head: str | None = None) -> None:
+    """Re-quantize the BF16 attention projections and/or the LM head at load
+    (``"8"``, ``"6:64"``, ``"nvfp4"``, ...; see ``convert._spec``)."""
+    from .convert import _spec
+
+    for target, value in (("attn", attn), ("head", head)):
+        spec = _spec(value) if value else None
+        if spec is None:
+            continue
+
+        def predicate(path: str, module: nn.Module, target=target):
+            if not isinstance(module, nn.Linear):
+                return False
+            if target == "head":
+                return path == "lm_head"
+            return path.startswith("model.layers.") and ".attn." in path
+
+        nn.quantize(
+            model,
+            group_size=spec["group_size"],
+            bits=spec["bits"],
+            mode=spec["mode"],
+            class_predicate=predicate,
+        )
+
+
+def load_model(
+    path: str | Path,
+    *,
+    lazy: bool = False,
+    attn: str | None = None,
+    head: str | None = None,
+):
+    """Returns ``(model, config)``. ``attn``/``head`` re-quantize the BF16
+    attention projections / LM head in memory (``quantize_in_memory``)."""
     from .model import Model
 
     path = Path(path)
@@ -74,6 +107,8 @@ def load_model(path: str | Path, *, lazy: bool = False):
         for k, v in weights.items()
     }
     model.load_weights(list(weights.items()), strict=True)
+    if attn or head:
+        quantize_in_memory(model, attn=attn, head=head)
     if not lazy:
         mx.eval(model.parameters())
         model.pack_fused()

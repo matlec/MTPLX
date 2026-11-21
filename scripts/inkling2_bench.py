@@ -139,10 +139,12 @@ def main() -> None:
     p.add_argument("--ref")
     p.add_argument("--no-speed", action="store_true")
     p.add_argument("--quality", action="store_true")
+    p.add_argument("--attn", help="re-quantize attention projections at load (8, 6:64, 4, nvfp4, ...)")
+    p.add_argument("--head", help="re-quantize the LM head at load")
     args = p.parse_args()
     path = Path(args.model)
     t0 = time.perf_counter()
-    model, config = load_model(path)
+    model, config = load_model(path, attn=args.attn, head=args.head)
     print(f"loaded in {time.perf_counter() - t0:.1f}s, active mem {mx.get_active_memory() / 2**30:.2f} GiB")
     tok = _tokenizer(path)
     if args.quality or args.save_ref or args.ref:

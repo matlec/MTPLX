@@ -137,3 +137,223 @@ def mix_messages(x: mx.array, message: mx.array, down_t: mx.array, gf_t: mx.arra
         output_dtypes=[mx.float32],
     )[0]
     return out.reshape(n, b, length, hidden)
+
+
+# --------------------------------------------------------------------------
+# Decode attention: relative bias band + sink + output gate in one launch
+# --------------------------------------------------------------------------
+
+_DECODE_ATTN_SOURCE = """
+    // One threadgroup per (query head, key split); 32 simdgroups, each
+    // walking keys with lanes over D (4 values per lane at D = 128).
+    constexpr int TG = 1024;
+    constexpr int NSG = TG / 32;
+    constexpr int PER = D / 32;
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const int h = threadgroup_position_in_grid.x;
+    const int split = threadgroup_position_in_grid.y;
+    const int hk = h / (HQ / HKV);
+    const int S = dims[0];
+    const int lo = WINDOW > 0 ? max(0, S - WINDOW) : 0;
+    const int span = S - lo;
+    const int per_split = (span + NSPLIT - 1) / NSPLIT;
+    const int k_begin = lo + split * per_split;
+    const int k_end = min(S, k_begin + per_split);
+
+    float qv[PER];
+    for (int i = 0; i < PER; ++i) {
+        qv[i] = float(q[h * D + lane * PER + i]) * scale[0];
+    }
+    // Lanes < DREL carry one relative-state term each.
+    const float rj = lane < DREL ? float(r[h * DREL + lane]) : 0.0f;
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float o[PER];
+    for (int i = 0; i < PER; ++i) o[i] = 0.0f;
+    const device T* kb = k + hk * k_strides[1];
+    const device T* vb = v + hk * v_strides[1];
+    for (int key = k_begin + int(sg); key < k_end; key += NSG) {
+        const device T* kp = kb + key * k_strides[2] + lane * PER;
+        float s = 0.0f;
+        for (int i = 0; i < PER; ++i) s += qv[i] * float(kp[i]);
+        const int d = S - 1 - key;
+        if (d < R && lane < DREL) {
+            s += rj * float(rel_proj[lane * R + d]);
+        }
+        s = simd_sum(s);
+        const float m_new = max(m, s);
+        const float f = metal::fast::exp(m - m_new);
+        const float p = metal::fast::exp(s - m_new);
+        l = l * f + p;
+        const device T* vp = vb + key * v_strides[2] + lane * PER;
+        for (int i = 0; i < PER; ++i) o[i] = o[i] * f + p * float(vp[i]);
+        m = m_new;
+    }
+    threadgroup float tm[NSG];
+    threadgroup float tl[NSG];
+    threadgroup float to[NSG * D];
+    if (lane == 0) { tm[sg] = m; tl[sg] = l; }
+    for (int i = 0; i < PER; ++i) to[sg * D + lane * PER + i] = o[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float mm = -INFINITY;
+        for (int j = 0; j < NSG; ++j) mm = max(mm, tm[j]);
+        float ll = 0.0f;
+        float acc[PER];
+        for (int i = 0; i < PER; ++i) acc[i] = 0.0f;
+        for (int j = 0; j < NSG; ++j) {
+            const float f = tm[j] == -INFINITY ? 0.0f : metal::fast::exp(tm[j] - mm);
+            ll += tl[j] * f;
+            for (int i = 0; i < PER; ++i) acc[i] += to[j * D + lane * PER + i] * f;
+        }
+        //@@SINGLE_BEGIN
+        {
+            // Zero-value sink: adds exp(sink) to the denominator only.
+            const float sk = float(sink[h]);
+            const float top = max(mm, sk);
+            const float a = mm == -INFINITY ? 0.0f : metal::fast::exp(mm - top);
+            const float denom = ll * a + metal::fast::exp(sk - top);
+            for (int i = 0; i < PER; ++i) {
+                const int c = h * D + lane * PER + i;
+                const float val = float(T(acc[i] * a / denom));
+                const float g = float(gate[c]);
+                out[c] = T(val * (1.0f / (1.0f + metal::fast::exp(-g))));
+            }
+        }
+        //@@SINGLE_END
+        //@@SPLIT_BEGIN
+        {
+            const int base = (h * NSPLIT + split);
+            if (lane == 0) { part_m[base] = mm; part_l[base] = ll; }
+            for (int i = 0; i < PER; ++i) part_o[base * D + lane * PER + i] = acc[i];
+        }
+        //@@SPLIT_END
+    }
+"""
+
+
+def _variant(source: str, keep: str, drop: str) -> str:
+    """Drop the ``//@@{drop}_BEGIN .. END`` region (Metal sees no undeclared
+    outputs)."""
+    start = source.index(f"//@@{drop}_BEGIN")
+    end = source.index(f"//@@{drop}_END") + len(f"//@@{drop}_END")
+    return source[:start] + source[end:]
+
+_DECODE_COMBINE_SOURCE = """
+    // One simdgroup per head: merge the key splits, add the sink, gate.
+    constexpr int PER = D / 32;
+    const uint lane = thread_index_in_simdgroup;
+    const int h = threadgroup_position_in_grid.x;
+    float mm = float(sink[h]);
+    for (int j = 0; j < NSPLIT; ++j) mm = max(mm, part_m[h * NSPLIT + j]);
+    float ll = metal::fast::exp(float(sink[h]) - mm);
+    float acc[PER];
+    for (int i = 0; i < PER; ++i) acc[i] = 0.0f;
+    for (int j = 0; j < NSPLIT; ++j) {
+        const float pm = part_m[h * NSPLIT + j];
+        const float f = pm == -INFINITY ? 0.0f : metal::fast::exp(pm - mm);
+        ll += part_l[h * NSPLIT + j] * f;
+        for (int i = 0; i < PER; ++i) acc[i] += part_o[(h * NSPLIT + j) * D + lane * PER + i] * f;
+    }
+    for (int i = 0; i < PER; ++i) {
+        const int c = h * D + lane * PER + i;
+        const float val = float(T(acc[i] / ll));
+        const float g = float(gate[c]);
+        out[c] = T(val * (1.0f / (1.0f + metal::fast::exp(-g))));
+    }
+"""
+
+_decode_attn_kernels: dict = {}
+# Keys per split before a global (full) layer splits its keys over more
+# threadgroups.
+_KEYS_PER_SPLIT = 2048
+
+
+def decode_attention(q, k, v, r, rel_proj, sink, gate, *, scale: float, window: int):
+    """Gated single-token attention for ``B == 1, L == 1``.
+
+    ``q`` [1, Hq, 1, D] (clipped, log-scaled), ``k``/``v`` [1, Hkv, S, D]
+    cache views, ``r`` [1, 1, Hq, d_rel], ``rel_proj`` [d_rel, R], ``sink``
+    [1, 1, Hq], ``gate`` [1, 1, Hq * D]. Returns ``attention * sigmoid(gate)``
+    as [1, 1, Hq * D].
+    """
+    _, hq, _, d = q.shape
+    hkv, s = k.shape[1], k.shape[2]
+    span = min(s, window) if window else s
+    nsplit = 1 if window else max(1, (span + _KEYS_PER_SPLIT - 1) // _KEYS_PER_SPLIT)
+    key = ("attn", nsplit > 1)
+    kernel = _decode_attn_kernels.get(key)
+    outputs = ["out"] if nsplit == 1 else ["part_m", "part_l", "part_o"]
+    if kernel is None:
+        kernel = mx.fast.metal_kernel(
+            name=f"mtplx_inkling2_decode_attn_{int(nsplit > 1)}",
+            input_names=["q", "k", "v", "r", "rel_proj", "sink", "gate", "dims", "scale"],
+            output_names=outputs,
+            source=_variant(
+                _DECODE_ATTN_SOURCE,
+                "SPLIT" if nsplit > 1 else "SINGLE",
+                "SINGLE" if nsplit > 1 else "SPLIT",
+            ),
+            ensure_row_contiguous=False,
+        )
+        _decode_attn_kernels[key] = kernel
+    dtype = q.dtype
+    tmpl = [
+        ("T", dtype),
+        ("D", d),
+        ("HQ", hq),
+        ("HKV", hkv),
+        ("R", rel_proj.shape[-1]),
+        ("DREL", rel_proj.shape[0]),
+        ("WINDOW", int(window)),
+        ("NSPLIT", nsplit),
+    ]
+    inputs = [
+        mx.contiguous(q.reshape(hq, d)),
+        k,
+        v,
+        mx.contiguous(r.reshape(hq, -1)),
+        rel_proj,
+        mx.contiguous(sink.reshape(hq)),
+        mx.contiguous(gate.reshape(hq * d)),
+        mx.array([s], dtype=mx.int32),
+        mx.array([scale], dtype=mx.float32),
+    ]
+    if nsplit == 1:
+        out = kernel(
+            inputs=inputs,
+            template=tmpl,
+            grid=(hq * 1024, 1, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(hq * d,)],
+            output_dtypes=[dtype],
+        )[0]
+        return out.reshape(1, 1, hq * d)
+    part_m, part_l, part_o = kernel(
+        inputs=inputs,
+        template=tmpl,
+        grid=(hq * 1024, nsplit, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(hq * nsplit,), (hq * nsplit,), (hq * nsplit * d,)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    combine = _decode_attn_kernels.get("combine")
+    if combine is None:
+        combine = mx.fast.metal_kernel(
+            name="mtplx_inkling2_decode_attn_combine",
+            input_names=["part_m", "part_l", "part_o", "sink", "gate"],
+            output_names=["out"],
+            source=_DECODE_COMBINE_SOURCE,
+        )
+        _decode_attn_kernels["combine"] = combine
+    out = combine(
+        inputs=[part_m, part_l, part_o, inputs[5], inputs[6]],
+        template=[("T", dtype), ("D", d), ("NSPLIT", nsplit)],
+        grid=(hq * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(hq * d,)],
+        output_dtypes=[dtype],
+    )[0]
+    return out.reshape(1, 1, hq * d)
