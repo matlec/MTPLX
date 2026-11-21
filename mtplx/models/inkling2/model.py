@@ -31,7 +31,7 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
-from . import fused, kernels, moe_kernels
+from . import fused, kernels, moe_kernels, prefill_moe
 from .loader import sanitize_weights
 
 _NVFP4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
@@ -289,12 +289,20 @@ class Inkling2Experts(nn.Module):
         inv = None
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
-        y = self.w13(xe, idx, do_sort)
+        y = None
+        if do_sort and prefill_moe.applies(self.w13, idx.size):
+            y = prefill_moe.gather_qmm(xe, self.w13, idx)
+        if y is None:
+            y = self.w13(xe, idx, do_sort)
         s13 = self.w13.post_scale(idx)
         if s13 is not None:
             y = y * s13[..., None, None].astype(y.dtype)
         act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
-        z = self.w2(act, idx, do_sort)
+        z = None
+        if do_sort and prefill_moe.applies(self.w2, idx.size):
+            z = prefill_moe.gather_qmm(act, self.w2, idx)
+        if z is None:
+            z = self.w2(act, idx, do_sort)
         if do_sort:
             z = _scatter_unsort(z, inv, inds.shape)
         z = z.squeeze(-2)
@@ -927,6 +935,7 @@ class Model(nn.Module):
         drafter=None,
         return_hidden: bool = False,
         capture_layer_ids=None,
+        last_logits_only: bool = False,
         **kwargs,
     ):
         """Text forward; ``drafter`` is the block drafter attached to whichever
@@ -945,10 +954,13 @@ class Model(nn.Module):
         if observe:
             capture_layer_ids = list(drafter.target_layer_ids)
         if not capture_layer_ids and not return_hidden:
-            return self.logits_from_hidden(self.model(inputs, cache, input_embeddings))
+            h = self.model(inputs, cache, input_embeddings)
+            # Prefill only needs the last row: the 201K-wide head over a
+            # whole chunk is a sizeable matmul plus a [L, V] FP32 array.
+            return self.logits_from_hidden(h[:, -1:] if last_logits_only else h)
         capture = {int(i): None for i in capture_layer_ids or ()}
         h = self.model(inputs, cache, input_embeddings, capture=capture)
-        logits = self.logits_from_hidden(h)
+        logits = self.logits_from_hidden(h[:, -1:] if last_logits_only else h)
         captures = [capture[int(i)] for i in capture_layer_ids or ()]
         if observe:
             drafter.observe(scope, captures)

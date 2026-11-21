@@ -245,7 +245,7 @@ class PromptCache:
 _ENGINE_SUFFIX_TOKENS = 32
 
 
-def _prefill(runtime, prompt_ids, prefill_callback, abort_check, chunk: int = 2048):
+def _prefill(runtime, prompt_ids, prefill_callback, abort_check, chunk: int = 4096):
     import mlx.core as mx
 
     from mtplx.models.inkling2.decode import MAX_STEP_TOKENS, StepCache
@@ -280,13 +280,13 @@ def _prefill(runtime, prompt_ids, prefill_callback, abort_check, chunk: int = 20
         piece = prompt_ids[start : start + chunk]
         ids = mx.array([piece], dtype=mx.int32)
         if drafter is not None and total - start - len(piece) < drafter.slots:
-            out = model.forward(ids, cache, capture_layer_ids=capture_ids)
+            out = model.forward(ids, cache, capture_layer_ids=capture_ids, last_logits_only=True)
             drafter.feed(dstate, out.hidden_states)
             logits = out.logits[0, -1:]
         else:
             if drafter is not None:
                 dstate.fed += len(piece)
-            logits = model(ids, cache=cache)[0, -1:]
+            logits = model(ids, cache=cache, last_logits_only=True)[0, -1:]
         mx.eval(logits)
         if prefill_callback is not None:
             try:
