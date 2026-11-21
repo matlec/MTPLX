@@ -83,6 +83,9 @@ def load_inkling2_runtime(path: Path, config: dict[str, Any]) -> Inkling2ARRunti
         tokenizer.chat_template = template.read_text()
     runtime = Inkling2ARRuntime(model, tokenizer, path, False, MTPContract())
     runtime.engine = StepEngine(model)
+    runtime.prompt_cache = PromptCache(
+        max_bytes=int(float(os.environ.get("MTPLX_INKLING2_PROMPT_CACHE_GB", "8")) * (1 << 30))
+    )
     runtime.drafter = None
     if os.environ.get("MTPLX_INKLING2_DSPARK", "0") not in {"", "0", "false"}:
         from mtplx.models.inkling2.spec import DSparkDrafter
@@ -198,27 +201,82 @@ def _sample_lazy(mx, logits, sampler, counts):
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class _Timing:
-    prefill_s: float = 0.0
-    decode_s: float = 0.0
-    steps: int = 0
+class PromptCache:
+    """Step-cache snapshots keyed by the tokens they hold (LRU).
+
+    Snapshots are taken at the prompt boundary and after generation. A new
+    prompt restores the longest snapshot that is a prefix of it: the
+    previous prompt always is, and the previous reply is too when the client
+    sends it back as generated.
+    """
+
+    def __init__(self, max_entries: int = 6, max_bytes: int = 8 << 30):
+        self.max_entries = max_entries
+        self.max_bytes = max_bytes
+        self.entries: list[tuple[tuple[int, ...], Any]] = []
+
+    def lookup(self, prompt_ids: list[int]):
+        best = None
+        for entry in self.entries:
+            tokens = entry[0]
+            n = len(tokens)
+            # At least one prompt token must run to produce the next logits.
+            if n >= len(prompt_ids) or (best is not None and n <= len(best[0])):
+                continue
+            if tuple(prompt_ids[:n]) == tokens:
+                best = entry
+        if best is not None:
+            self.entries.remove(best)
+            self.entries.append(best)
+        return best
+
+    def store(self, tokens: list[int], cache) -> None:
+        key = tuple(int(t) for t in tokens)
+        self.entries = [e for e in self.entries if e[0] != key]
+        self.entries.append((key, cache.snapshot()))
+        while len(self.entries) > self.max_entries or (
+            len(self.entries) > 1 and sum(e[1].nbytes() for e in self.entries) > self.max_bytes
+        ):
+            self.entries.pop(0)
+
+
+# Suffixes up to this many tokens run as engine steps; longer ones convert to
+# the reference cache and prefill in chunks.
+_ENGINE_SUFFIX_TOKENS = 32
 
 
 def _prefill(runtime, prompt_ids, prefill_callback, abort_check, chunk: int = 2048):
     import mlx.core as mx
 
-    from mtplx.models.inkling2.decode import StepCache
+    from mtplx.models.inkling2.decode import MAX_STEP_TOKENS, StepCache
 
     model = runtime.model
     drafter = getattr(runtime, "drafter", None)
     capture_ids = drafter.target_layer_ids if drafter is not None else None
     dstate = drafter.new_state() if drafter is not None else None
-    cache = model.make_cache()
     started = time.perf_counter()
-    logits = None
     total = len(prompt_ids)
-    for start in range(0, total, chunk):
+    prompt_cache = getattr(runtime, "prompt_cache", None)
+    hit = prompt_cache.lookup(prompt_ids) if prompt_cache is not None and drafter is None else None
+    cached = 0
+    if hit is not None:
+        cached = len(hit[0])
+        step_cache = hit[1].snapshot()
+        suffix = prompt_ids[cached:]
+        if len(suffix) <= _ENGINE_SUFFIX_TOKENS:
+            logits = None
+            for i in range(0, len(suffix), MAX_STEP_TOKENS):
+                logits, _ = runtime.engine.step(step_cache, suffix[i : i + MAX_STEP_TOKENS])
+            logits = logits[-1:]
+            mx.eval(logits)
+            return step_cache, logits, dstate, time.perf_counter() - started, cached
+        cache = step_cache.to_reference(model)
+        start0 = cached
+    else:
+        cache = model.make_cache()
+        start0 = 0
+    logits = None
+    for start in range(start0, total, chunk):
         piece = prompt_ids[start : start + chunk]
         ids = mx.array([piece], dtype=mx.int32)
         if drafter is not None and total - start - len(piece) < drafter.slots:
@@ -247,8 +305,8 @@ def _prefill(runtime, prompt_ids, prefill_callback, abort_check, chunk: int = 20
                 pass
         if abort_check is not None and abort_check():
             break
-    step_cache = StepCache.from_reference(model, cache)
-    return step_cache, logits, dstate, time.perf_counter() - started
+    step_cache = StepCache.from_reference(model, cache, position=total)
+    return step_cache, logits, dstate, time.perf_counter() - started, cached
 
 
 def generate_inkling2_ar(
@@ -304,7 +362,12 @@ def generate_inkling2_ar(
             )
         except Exception:
             pass
-    cache, logits, dstate, prefill_s = _prefill(runtime, prompt_ids, prefill_callback, abort_check)
+    cache, logits, dstate, prefill_s, cached = _prefill(
+        runtime, prompt_ids, prefill_callback, abort_check
+    )
+    prompt_cache = getattr(runtime, "prompt_cache", None)
+    if prompt_cache is not None and dstate is None:
+        prompt_cache.store(prompt_ids, cache)
     if prefill_callback is not None:
         try:
             prefill_callback(
@@ -312,13 +375,13 @@ def generate_inkling2_ar(
                     "phase": "completed",
                     "tokens_total": len(prompt_ids),
                     "tokens_done": len(prompt_ids),
-                    "cached_tokens": 0,
-                    "new_prefill_tokens": len(prompt_ids),
+                    "cached_tokens": cached,
+                    "new_prefill_tokens": len(prompt_ids) - cached,
                     "elapsed_s": prefill_s,
                     "prompt_eval_time_s": prefill_s,
-                    "prefill_tok_s": len(prompt_ids) / prefill_s if prefill_s > 0 else None,
-                    "cache_hit": False,
-                    "cache_miss_reason": "inkling2_no_session_bank",
+                    "prefill_tok_s": (len(prompt_ids) - cached) / prefill_s if prefill_s > 0 else None,
+                    "cache_hit": cached > 0,
+                    "cache_miss_reason": None if cached else "no_prefix_snapshot",
                 }
             )
         except Exception:
@@ -382,6 +445,19 @@ def generate_inkling2_ar(
             break
         pending = nxt
     decode_s = time.perf_counter() - decode_started
+    if os.environ.get("MTPLX_INKLING2_TRACE"):
+        import sys
+
+        print(
+            f"[inkling2] prompt={len(prompt_ids)} cached={cached} prefill={prefill_s:.2f}s "
+            f"({(len(prompt_ids) - cached) / max(prefill_s, 1e-9):.0f} tok/s) "
+            f"decode={len(generated)} tok in {decode_s:.2f}s "
+            f"({len(generated) / max(decode_s, 1e-9):.1f} tok/s) offset={cache.offset}",
+            file=sys.stderr,
+            flush=True,
+        )
+    if prompt_cache is not None and dstate is None and cache.offset == len(prompt_ids) + len(generated):
+        prompt_cache.store(list(prompt_ids) + generated, cache)
     elapsed = time.perf_counter() - started_all
     text_tokens = list(wire)
     stats = GenerationStats(
@@ -395,10 +471,10 @@ def generate_inkling2_ar(
         ),
         runtime_mtp_enabled=False,
         prompt_eval_time_s=prefill_s,
-        cached_tokens=0,
-        new_prefill_tokens=len(prompt_ids),
-        session_cache_hit=False,
-        cache_miss_reason="inkling2_no_session_bank",
+        cached_tokens=cached,
+        new_prefill_tokens=len(prompt_ids) - cached,
+        session_cache_hit=cached > 0,
+        cache_miss_reason=None if cached else "no_prefix_snapshot",
         target_forward_time_s=prefill_s + decode_s,
         verify_time_s=decode_s,
         verify_calls=steps,

@@ -43,17 +43,30 @@ class StepCache:
     last_tokens: int = 0  # tokens of the last step (rollback bound)
 
     @classmethod
-    def from_reference(cls, model, ref_cache) -> "StepCache":
+    def from_reference(cls, model, ref_cache, position: int | None = None) -> "StepCache":
         """Adopt a reference (prefill) cache: one CacheList(KVCache,
-        ArraysCache(4)) per visit."""
+        ArraysCache(4)) per visit.
+
+        ``position``: tokens the sequence holds. A sliding visit's reference
+        cache may keep only its newest keys (``to_reference``); they are the
+        positions just before ``position``. Defaults to the full-attention
+        visits' length.
+        """
         text = model.model
         cache = cls()
-        offsets = set()
+        if position is None:
+            lengths = {
+                int(entry[0].offset)
+                for (idx, _p), entry in zip(text._schedule, ref_cache)
+                if not text.layers[idx].attn.window
+            }
+            if len(lengths) != 1:
+                raise ValueError(f"reference cache visits disagree on length: {lengths}")
+            position = lengths.pop()
         for (idx, _p), entry in zip(text._schedule, ref_cache):
             attn = text.layers[idx].attn
             kvc, conv = entry[0], entry[1]
             n = int(kvc.offset)
-            offsets.add(n)
             hkv, d = attn.n_kv, attn.head_dim
             k = kvc.keys[..., :n, :][0] if kvc.keys is not None else mx.zeros((hkv, 0, d), mx.bfloat16)
             v = kvc.values[..., :n, :][0] if kvc.values is not None else mx.zeros((hkv, 0, d), mx.bfloat16)
@@ -64,7 +77,7 @@ class StepCache:
                 if keep:
                     # Position p lives in slot p % cap: the kept positions
                     # fill a run of slots modulo cap, written in <= 2 pieces.
-                    start = int((n - keep) % cap)
+                    start = int((position - keep) % cap)
                     first = min(keep, cap - start)
                     kk = k[:, n - keep :]
                     vv = v[:, n - keep :]
@@ -75,6 +88,8 @@ class StepCache:
                         buf[1, :, : keep - first] = vv[:, first:]
                 vc = VisitCache(buf, cap, True, [])
             else:
+                if n != position:
+                    raise ValueError(f"full-attention visit holds {n} of {position} tokens")
                 cap = max(_GROW, ((n + _GROW) // _GROW) * _GROW)
                 buf = mx.zeros((2, hkv, cap, d), dtype=mx.bfloat16)
                 if n:
@@ -89,11 +104,47 @@ class StepCache:
                     s = mx.zeros((kc - 1, width), dtype=mx.float32)
                 vc.conv.append(s.reshape(kc - 1, width).astype(mx.float32))
             cache.visits.append(vc)
-        if len(offsets) > 1:
-            raise ValueError(f"reference cache visits disagree on length: {offsets}")
-        cache.offset = offsets.pop() if offsets else 0
+        cache.offset = int(position)
         mx.eval([v.kv for v in cache.visits] + [s for v in cache.visits for s in v.conv])
         return cache
+
+    def to_reference(self, model) -> list:
+        """A reference cache holding this state, to continue with the
+        reference graph (long prefill chunks). Sliding visits get their ring
+        in position order; their attention only reads the newest window."""
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+
+        out = []
+        for vc in self.visits:
+            if vc.ring:
+                m = min(self.offset, vc.cap)
+                slots = mx.arange(self.offset - m, self.offset) % vc.cap
+                kv = mx.take(vc.kv, slots, axis=2)
+            else:
+                m = self.offset
+                kv = vc.kv[:, :, :m]
+            kvc = KVCache()
+            if m:
+                kvc.keys = mx.contiguous(kv[0][None])
+                kvc.values = mx.contiguous(kv[1][None])
+            kvc.offset = m
+            conv = ArraysCache(4)
+            for slot, state in enumerate(vc.conv):
+                conv[slot] = state.reshape(1, *state.shape[-2:])
+            out.append(CacheList(kvc, conv))
+        return out
+
+    def snapshot(self) -> "StepCache":
+        """A copy that shares the buffers: a later in-place step on either
+        copy makes MLX copy the shared buffer first, so both stay valid."""
+        return StepCache(
+            [VisitCache(v.kv, v.cap, v.ring, list(v.conv)) for v in self.visits],
+            self.offset,
+            0,
+        )
+
+    def nbytes(self) -> int:
+        return sum(int(v.kv.nbytes) + sum(int(c.nbytes) for c in v.conv) for v in self.visits)
 
     def rollback(self, rejected: int) -> None:
         """Drop the last ``rejected`` tokens of the last step."""

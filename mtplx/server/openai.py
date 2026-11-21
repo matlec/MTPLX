@@ -29130,6 +29130,14 @@ def _schedule_idle_postcommit_snapshot(
     rechecks that no newer foreground is queued and that the session did not
     advance before it builds a new cache.
     """
+    if getattr(getattr(state, "runtime", None), "backend_id", None) == "inkling2_ar":
+        # The Inkling backend keeps its own prompt snapshots; a retokenized
+        # re-prefill here would only burn GPU time and store nothing.
+        return {
+            "stored": False,
+            "mode": "disabled",
+            "reason": "backend_owns_prompt_cache",
+        }
     if assistant_tool_calls and str(
         os.environ.get("MTPLX_IDLE_POSTCOMMIT_TOOL_REWRITE", "1")
     ).strip().lower() in {"0", "false", "off", "no"}:
