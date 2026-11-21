@@ -787,3 +787,105 @@ def route(moe, x: mx.array):
         output_dtypes=[mx.float32],
     )[0]
     return K.route_topk(logits, moe.router_bias, moe.top_k, moe.route_scale)
+
+
+# --------------------------------------------------------------------------
+# Small-batch affine quantized matvec (verify widths)
+# --------------------------------------------------------------------------
+#
+# MLX's quantized matmul re-reads the weights per row at these widths (an
+# 8-bit [8600, 2304] projection: 62 us for one row, 309 us for eight on an
+# M1 Max). Here a simdgroup owns RPS output rows, decodes each weight chunk
+# once and applies it to all M input rows.
+
+_QMM_SOURCE = """
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint n0 = (threadgroup_position_in_grid.x * SGS + sg) * RPS;
+    if (n0 >= N) return;
+    constexpr uint VPW = 32 / BITS;          // values per uint32
+    constexpr uint CHUNK = 8;                // values per lane step
+    constexpr uint CHUNKS = K / CHUNK;
+    constexpr uint WPC = CHUNK / VPW;        // words per chunk
+    constexpr uint GROUPS = K / GS;
+    float acc[RPS][M];
+    for (int r = 0; r < RPS; ++r)
+        for (int m = 0; m < M; ++m) acc[r][m] = 0.0f;
+    for (uint c = lane; c < CHUNKS; c += 32) {
+        // Decode this chunk of every owned row once ...
+        float wv[RPS][CHUNK];
+        const uint gidx = (c * CHUNK) / GS;
+        for (int r = 0; r < RPS; ++r) {
+            const size_t n = n0 + r;
+            const float s = float(scales[n * GROUPS + gidx]);
+            const float b = float(biases[n * GROUPS + gidx]);
+            const device uint32_t* wp = w + n * (K / VPW) + c * WPC;
+            for (uint i = 0; i < WPC; ++i) {
+                const uint32_t word = wp[i];
+                for (uint j = 0; j < VPW; ++j) {
+                    wv[r][i * VPW + j] = float((word >> (j * BITS)) & ((1u << BITS) - 1u)) * s + b;
+                }
+            }
+        }
+        // ... then stream the input rows through it.
+        for (int m = 0; m < M; ++m) {
+            const uint4 xw = *(const device uint4*)(x + (size_t)m * K + c * CHUNK);
+            float xv[CHUNK];
+            for (int q = 0; q < 4; ++q) {
+                xv[2 * q] = as_type<float>(xw[q] << 16);
+                xv[2 * q + 1] = as_type<float>(xw[q] & 0xFFFF0000u);
+            }
+            for (int r = 0; r < RPS; ++r) {
+                float t = 0.0f;
+                for (uint i = 0; i < CHUNK; ++i) t += wv[r][i] * xv[i];
+                acc[r][m] += t;
+            }
+        }
+    }
+    for (int r = 0; r < RPS; ++r) {
+        for (int m = 0; m < M; ++m) {
+            const float v = simd_sum(acc[r][m]);
+            if (lane == 0) y[(size_t)m * N + n0 + r] = bfloat(v);
+        }
+    }
+"""
+
+_QMM_RPS = 4
+_QMM_SGS = 2
+
+
+def qmm_small(layer, x: mx.array) -> mx.array:
+    """``layer(x)`` for an affine ``nn.QuantizedLinear`` and 2..16 rows of
+    BF16 ``x`` [..., K]; other cases call the layer."""
+    shape = x.shape
+    k = int(shape[-1])
+    rows = int(x.size // k)
+    mode = getattr(layer, "mode", "affine")
+    if (
+        rows < 2
+        or rows > 8
+        or mode != "affine"
+        or getattr(layer, "bits", None) not in (4, 8)
+        or "biases" not in layer
+        or layer.get("bias") is not None
+        or x.dtype != mx.bfloat16
+        or k % (8 * 32) != 0
+    ):
+        return layer(x)
+    n = int(layer.weight.shape[0])
+    rps = _QMM_RPS if rows <= 4 else 2
+    if n % (rps * _QMM_SGS):
+        return layer(x)
+    kern = _kernel("mtplx_inkling2_qmm_small", ["x", "w", "scales", "biases"], ["y"], _QMM_SOURCE)
+    (y,) = kern(
+        inputs=[x.reshape(rows, k), layer.weight, layer.scales, layer.biases],
+        template=[
+            ("K", k), ("N", n), ("M", rows), ("BITS", int(layer.bits)), ("GS", int(layer.group_size)),
+            ("RPS", rps), ("SGS", _QMM_SGS),
+        ],
+        grid=((n // (rps * _QMM_SGS)) * _QMM_SGS * 32, 1, 1),
+        threadgroup=(_QMM_SGS * 32, 1, 1),
+        output_shapes=[(rows, n)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return y.reshape(*shape[:-1], n)

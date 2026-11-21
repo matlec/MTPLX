@@ -147,11 +147,17 @@ _SOURCE_V2 = """
             }
         }
         for (uint g = lane; g < GROUPS; g += 32) {
-            uint2 wv[RPS];
+            // Decode this scale group of every owned row once; tokens that
+            // share the expert reuse it.
+            half2 wd[RPS][8];
             float sc[RPS];
             for (int r = 0; r < RPS; ++r) {
-                wv[r] = *(const device uint2*)(wbase + (size_t)r * WPR + g * 2);
+                const uint2 wv = *(const device uint2*)(wbase + (size_t)r * WPR + g * 2);
                 sc[r] = e4m3_to_float(sbase[(size_t)r * GROUPS + g]);
+                for (int i = 0; i < 4; ++i) {
+                    wd[r][i] = lut2[(wv.x >> (8 * i)) & 0xFF];
+                    wd[r][4 + i] = lut2[(wv.y >> (8 * i)) & 0xFF];
+                }
             }
             for (int j = 0; j < MAXT; ++j) {
                 if (j >= clen) break;
@@ -165,10 +171,7 @@ _SOURCE_V2 = """
                 }
                 for (int r = 0; r < RPS; ++r) {
                     half2 t2 = half2(0.0h);
-                    for (int i = 0; i < 4; ++i) {
-                        t2 = fma(lut2[(wv[r].x >> (8 * i)) & 0xFF], xh[i], t2);
-                        t2 = fma(lut2[(wv[r].y >> (8 * i)) & 0xFF], xh[4 + i], t2);
-                    }
+                    for (int i = 0; i < 8; ++i) t2 = fma(wd[r][i], xh[i], t2);
                     acc[r][j] += (float(t2.x) + float(t2.y)) * sc[r];
                 }
             }
@@ -425,6 +428,74 @@ _COMBINE_SOURCE = """
 """
 
 
+_W2_COMBINE_SOURCE = """
+    // Decode (one token): down projection of all K pairs for RPS output
+    // channels per simdgroup, the weighted expert sum, the MLP short conv
+    // with its state and the residual, in one launch.
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint tid = thread_position_in_threadgroup.x;
+    threadgroup half2 lut2[256];
+    for (uint i = tid; i < 256; i += SGS * 32) lut2[i] = half2(half(FP4_LUT[i & 15]), half(FP4_LUT[i >> 4]));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint n0 = (threadgroup_position_in_grid.x * SGS + sg) * RPS;
+    if (n0 >= H) return;
+    constexpr uint GROUPS = KIN / 16;
+    constexpr uint WPR = KIN / 8;
+    float m[RPS];
+    for (int r = 0; r < RPS; ++r) m[r] = 0.0f;
+    for (int k = 0; k < TOPK; ++k) {
+        const uint e = inds[k];
+        const device uint32_t* wbase = w + ((size_t)e * H + n0) * WPR;
+        const device uint8_t* sbase = scales + ((size_t)e * H + n0) * GROUPS;
+        const device bfloat* xr = act + (size_t)k * KIN;
+        float acc[RPS];
+        for (int r = 0; r < RPS; ++r) acc[r] = 0.0f;
+        for (uint g = lane; g < GROUPS; g += 32) {
+            const device uint4* xp = (const device uint4*)(xr + g * 16);
+            const uint4 xa = xp[0];
+            const uint4 xb = xp[1];
+            half2 xh[8];
+            for (int q = 0; q < 4; ++q) {
+                xh[q] = half2(as_type<float>(xa[q] << 16), as_type<float>(xa[q] & 0xFFFF0000u));
+                xh[4 + q] = half2(as_type<float>(xb[q] << 16), as_type<float>(xb[q] & 0xFFFF0000u));
+            }
+            for (int r = 0; r < RPS; ++r) {
+                const uint2 wv = *(const device uint2*)(wbase + (size_t)r * WPR + g * 2);
+                half2 t2 = half2(0.0h);
+                for (int i = 0; i < 4; ++i) {
+                    t2 = fma(lut2[(wv.x >> (8 * i)) & 0xFF], xh[i], t2);
+                    t2 = fma(lut2[(wv.y >> (8 * i)) & 0xFF], xh[4 + i], t2);
+                }
+                acc[r] += (float(t2.x) + float(t2.y)) * e4m3_to_float(sbase[(size_t)r * GROUPS + g]);
+            }
+        }
+        // Routing weight times the NVFP4 tensor scale (as in the combine).
+        const float wk = weights[k] * (NVFP4 ? gscale[e] * (1.0f / 2688.0f) : 1.0f);
+        for (int r = 0; r < RPS; ++r) m[r] += float(bfloat(simd_sum(acc[r]))) * wk;
+    }
+    if (lane != 0) return;
+    for (int r = 0; r < RPS; ++r) {
+        const uint c = n0 + r;
+        const float mt = float(bfloat(m[r]));
+        float acc = 0.0f;
+        for (int j = 0; j < KCONV - 1; ++j) acc += float(conv_w[c * KCONV + j]) * state[j * H + c];
+        acc += float(conv_w[c * KCONV + KCONV - 1]) * mt;
+        const float mc = float(bfloat((float(bfloat(acc)) + mt) * scale[0]));
+        h[c] = bfloat(residual[c] + mc);
+        for (int j = 0; j < KCONV - 1; ++j) xp[(size_t)j * H + c] = state[j * H + c];
+        xp[(size_t)(KCONV - 1) * H + c] = mt;
+        for (int j = 0; j < KCONV - 1; ++j) {
+            const int q = 1 + j;
+            new_state[j * H + c] = q < KCONV - 1 ? state[q * H + c] : mt;
+        }
+    }
+"""
+
+_W2C_RPS = 4
+_W2C_SGS = 2
+
+
 def moe_block(experts, x, inds, weights, residual, conv_w, state, conv_scale: float):
     """Routed experts + MLP short conv + residual for ``T`` <= 16 tokens of
     one row (``B == 1``).
@@ -441,9 +512,37 @@ def moe_block(experts, x, inds, weights, residual, conv_w, state, conv_scale: fl
     act = grouped_matvec(x.astype(mx.bfloat16), segs, experts.w13, t, kk, act_caps=experts.caps)
     if act.dtype != mx.bfloat16:
         act = softcapped_swiglu(act, *experts.caps)
+    nvfp4 = experts.w2.mode == "nvfp4"
+    kc = conv_w.shape[-1]
+    if t == 1 and nvfp4 and hidden % (_W2C_RPS * _W2C_SGS) == 0:
+        k2 = _kernel(
+            "mtplx_inkling2_moe_w2_combine",
+            ["act", "inds", "weights", "w", "scales", "gscale", "residual", "conv_w", "state", "scale"],
+            ["h", "xp", "new_state"],
+            _W2_COMBINE_SOURCE,
+            _HEADER,
+        )
+        kin = experts.w2.weight.shape[-1] * 8
+        return tuple(
+            k2(
+                inputs=[
+                    act, inds.reshape(-1).astype(mx.uint32), weights.reshape(-1).astype(mx.float32),
+                    experts.w2.weight, experts.w2.scales, experts.w2.global_scale,
+                    residual.astype(mx.float32), conv_w, state.astype(mx.float32),
+                    kernels._scalar(float(conv_scale)),
+                ],
+                template=[
+                    ("H", hidden), ("KIN", kin), ("TOPK", kk), ("KCONV", kc), ("NVFP4", 1),
+                    ("RPS", _W2C_RPS), ("SGS", _W2C_SGS),
+                ],
+                grid=((hidden // (_W2C_RPS * _W2C_SGS)) * _W2C_SGS * 32, 1, 1),
+                threadgroup=(_W2C_SGS * 32, 1, 1),
+                output_shapes=[(1, hidden), (1, kc, hidden), (1, kc - 1, hidden)],
+                output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
+            )
+        )
     z = grouped_matvec(act, segs, experts.w2, t, kk, pair_input=True, post=False)
     z = z.reshape(t * kk, -1)
-    nvfp4 = experts.w2.mode == "nvfp4"
     k = _kernel(
         "mtplx_inkling2_moe_combine",
         ["z", "weights", "inds", "gscale", "residual", "conv_w", "state", "scale"],
@@ -451,7 +550,6 @@ def moe_block(experts, x, inds, weights, residual, conv_w, state, conv_scale: fl
         _COMBINE_SOURCE,
     )
     gscale = experts.w2.global_scale if nvfp4 else _const(("zf", 1), lambda: mx.zeros((1,), mx.float32))
-    kc = conv_w.shape[-1]
     return tuple(
         k(
             inputs=[

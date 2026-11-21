@@ -240,17 +240,17 @@ class StepEngine:
         # Projections.
         if attn.sliding:
             if loop_pass:
-                pqkv = attn.in_proj(xqkv)
+                pqkv = DK.qmm_small(attn.in_proj, xqkv)
                 pq, pk, pv = pqkv[0], pqkv[1], pqkv[2]
             else:
-                pq = pk = pv = attn.in_proj(xq)
+                pq = pk = pv = DK.qmm_small(attn.in_proj, xq)
             dq, dkv, dr = attn.n_heads * attn.head_dim, attn.dkv, attn.n_heads * attn.d_rel
             layout = {"q": 0, "k": dq, "v": dq + dkv, "r": dq + 2 * dkv}
             gate_col = dq + 2 * dkv + dr
         else:
-            pq = attn.q_proj(xq)
-            pk = attn.k_proj(xk)
-            pv = attn.v_proj(xv)
+            pq = DK.qmm_small(attn.q_proj, xq)
+            pk = DK.qmm_small(attn.k_proj, xk)
+            pv = DK.qmm_small(attn.v_proj, xv)
             dq, dr = attn.n_heads * attn.head_dim, attn.n_heads * attn.d_rel
             layout = {"q": 0, "r": dq, "k": 0, "v": 0, "dyn": attn.dkv}
             gate_col = dq + dr
@@ -269,7 +269,7 @@ class StepEngine:
             keys=attn.window if ring else cap,
             cap=cap, ring=ring, gate_col=gate_col, sink_col=sink_col,
         )
-        a = attn.o_proj(out)
+        a = DK.qmm_small(attn.o_proj, out)
         if layer.is_boundary:
             blocks.append(hn)
         mlp_w = _packed(("mlpnorm", lid), lambda: layer.mlp_norm.weight[None])
@@ -344,7 +344,11 @@ class StepEngine:
             out = r["out0"]
             if text.num_visits in capture:
                 capture[text.num_visits] = out
-            logits = self.model.logits_from_hidden(out)
+            # Same as model.logits_from_hidden, with the small-batch head.
+            logits = DK.qmm_small(self.model.lm_head, out).astype(mx.float32)
+            logits = mx.tanh(logits / self.model._softcap) * self.model._softcap
+            if self.model._vocab_bias is not None:
+                logits = logits + self.model._vocab_bias
             caps_out = [capture[int(i)][None] for i in capture_ids]
             return logits, new_kvs, new_convs, windows, caps_out
 
