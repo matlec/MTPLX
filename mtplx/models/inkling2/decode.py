@@ -169,6 +169,10 @@ def _packed(key, make):
     return DK.const(key, make)
 
 
+def _zeros3() -> mx.array:
+    return DK.const(("zeros3",), lambda: mx.zeros((3,), dtype=mx.int32))
+
+
 def _arange(n: int) -> mx.array:
     return DK.const(("arange", n), lambda: mx.arange(n, dtype=mx.int32))
 
@@ -187,7 +191,7 @@ class StepEngine:
         self.compile = True
 
     # -- one layer visit -----------------------------------------------------
-    def _visit(self, layer, h, blocks, bank, kv, conv, cap: int, ring: bool, loop_pass: bool, tokens: int, info):
+    def _visit(self, layer, h, blocks, bank, kv, conv, cap: int, ring: bool, loop_pass: bool, tokens: int, info, starts=None):
         """One layer visit; returns (h, kv, conv states, conv windows)."""
         attn = layer.attn
         lid = id(layer)
@@ -260,10 +264,15 @@ class StepEngine:
         )
         # Cache write: slots from the step's position, so the traced step is
         # the same at every offset (ring visits wrap inside the scatter).
-        slots = info + _arange(tokens)
-        if ring:
-            slots = slots % cap
-        kv[:, :, slots] = kvn
+        if tokens == 1 and starts is not None:
+            # One position never wraps: a single dynamic-offset update (an
+            # indexed scatter costs ~6 graph nodes per visit).
+            kv = mx.slice_update(kv, kvn, starts[cap if ring else 0], (0, 1, 2, 3))
+        else:
+            slots = info + _arange(tokens)
+            if ring:
+                slots = slots % cap
+            kv[:, :, slots] = kvn
         out = DK.attention(
             attn, q, kv, rr, pq, info, tokens=tokens,
             keys=attn.window if ring else cap,
@@ -313,6 +322,15 @@ class StepEngine:
 
         def fn(ids, info, kvs, convs):
             h = text.embed_norm(text.embed(ids))
+            # Cache-write offsets [0, 0, slot, 0], shared by every visit:
+            # key 0 for full-attention visits, the ring size for ring visits.
+            starts = None
+            if tokens == 1:
+                zero = _zeros3()
+                starts = {0: mx.concatenate([zero[:2], info, zero[2:]])}
+                for c, r in zip(caps, rings):
+                    if r and c not in starts:
+                        starts[c] = mx.concatenate([zero[:2], info % c, zero[2:]])
             blocks: list = []
             prelude = bank = None
             capture = {int(i): None for i in capture_ids}
@@ -332,7 +350,7 @@ class StepEngine:
                 h, kv, conv, win = self._visit(
                     text.layers[idx], h, blocks, bank if loop_pass else None,
                     kvs[visit], convs[visit], caps[visit], rings[visit],
-                    bool(loop_pass), tokens, info,
+                    bool(loop_pass), tokens, info, starts,
                 )
                 new_kvs.append(kv)
                 new_convs.append(conv)
