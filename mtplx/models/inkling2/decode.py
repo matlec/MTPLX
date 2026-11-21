@@ -232,13 +232,18 @@ class StepEngine:
                     msg_offset=0, w_offset=0,
                 )
                 if attn.sliding:
+                    # One stacked [3, T, H] input: a single in_proj call.
                     norm_w = _packed(("attnnorm", lid), lambda: layer.attn_norm.weight[None])
-                xq, xk, xv = DK.norm_rows(mixed, norm_w, shared=attn.sliding)
+                    (xqkv,) = DK.norm_rows(mixed, norm_w, shared=True, stacked=True)
+                else:
+                    xq, xk, xv = DK.norm_rows(mixed, norm_w, shared=False)
         # Projections.
         if attn.sliding:
-            pq = attn.in_proj(xq)
-            pk = attn.in_proj(xk) if loop_pass else pq
-            pv = attn.in_proj(xv) if loop_pass else pq
+            if loop_pass:
+                pqkv = attn.in_proj(xqkv)
+                pq, pk, pv = pqkv[0], pqkv[1], pqkv[2]
+            else:
+                pq = pk = pv = attn.in_proj(xq)
             dq, dkv, dr = attn.n_heads * attn.head_dim, attn.dkv, attn.n_heads * attn.d_rel
             layout = {"q": 0, "k": dq, "v": dq + dkv, "r": dq + 2 * dkv}
             gate_col = dq + 2 * dkv + dr

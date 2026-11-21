@@ -115,12 +115,13 @@ _SOURCE = """
 _SOURCE_V2 = """
     // NVFP4 grouped matvec, v2: each simdgroup owns RPS output rows; a lane
     // reads one 16-value scale group (8 bytes + 1 scale) per row per step,
-    // so one input chunk serves RPS rows.
+    // so one input chunk serves RPS rows. A 256-entry table decodes both
+    // nibbles of a byte in one lookup.
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint tid = thread_position_in_threadgroup.x;
-    threadgroup float lut[16];
-    if (tid < 16) lut[tid] = FP4_LUT[tid];
+    threadgroup half2 lut2[256];
+    for (uint i = tid; i < 256; i += SGS * 32) lut2[i] = half2(half(FP4_LUT[i & 15]), half(FP4_LUT[i >> 4]));
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint seg = threadgroup_position_in_grid.y;
     const uint n0 = (threadgroup_position_in_grid.x * SGS + sg) * RPS;
@@ -157,30 +158,49 @@ _SOURCE_V2 = """
                 const device uint4* xp = (const device uint4*)(x + xoff[j] + g * 16);
                 const uint4 xa = xp[0];
                 const uint4 xb = xp[1];
-                float xv[16];
+                half2 xh[8];
                 for (int q = 0; q < 4; ++q) {
-                    xv[2 * q] = as_type<float>(xa[q] << 16);
-                    xv[2 * q + 1] = as_type<float>(xa[q] & 0xFFFF0000u);
-                    xv[8 + 2 * q] = as_type<float>(xb[q] << 16);
-                    xv[8 + 2 * q + 1] = as_type<float>(xb[q] & 0xFFFF0000u);
+                    xh[q] = half2(as_type<float>(xa[q] << 16), as_type<float>(xa[q] & 0xFFFF0000u));
+                    xh[4 + q] = half2(as_type<float>(xb[q] << 16), as_type<float>(xb[q] & 0xFFFF0000u));
                 }
                 for (int r = 0; r < RPS; ++r) {
-                    float t = 0.0f;
-                    for (int i = 0; i < 8; ++i) {
-                        t += lut[(wv[r].x >> (4 * i)) & 0xF] * xv[i];
-                        t += lut[(wv[r].y >> (4 * i)) & 0xF] * xv[8 + i];
+                    half2 t2 = half2(0.0h);
+                    for (int i = 0; i < 4; ++i) {
+                        t2 = fma(lut2[(wv[r].x >> (8 * i)) & 0xFF], xh[i], t2);
+                        t2 = fma(lut2[(wv[r].y >> (8 * i)) & 0xFF], xh[4 + i], t2);
                     }
-                    acc[r][j] += t * sc[r];
+                    acc[r][j] += (float(t2.x) + float(t2.y)) * sc[r];
                 }
             }
         }
-        for (int r = 0; r < RPS; ++r) {
-            const uint n = n0 + r;
-            const float post = POST ? float(bfloat(gscale[e] * (1.0f / 2688.0f))) : 1.0f;
-            for (int j = 0; j < MAXT; ++j) {
-                if (j >= clen) break;
-                const float v = simd_sum(acc[r][j]);
-                if (lane == 0) y[(size_t)prow[j] * NOUT + n] = float(bfloat(float(bfloat(v)) * post));
+        const float post = POST ? float(bfloat(gscale[e] * (1.0f / 2688.0f))) : 1.0f;
+        if (ACTOUT) {
+            // Rows alternate gate / up: write the softcapped SwiGLU of each
+            // pair (BF16, like the reference activation) instead of y.
+            for (int r = 0; r < RPS; r += 2) {
+                for (int j = 0; j < MAXT; ++j) {
+                    if (j >= clen) break;
+                    const float vg = simd_sum(acc[r][j]);
+                    const float vu = simd_sum(acc[r + 1][j]);
+                    if (lane == 0) {
+                        const float g = float(bfloat(float(bfloat(vg)) * post));
+                        const float u = float(bfloat(float(bfloat(vu)) * post));
+                        const float a = metal::precise::tanh(g / caps[0]) * caps[0]
+                            * (1.0f / (1.0f + metal::precise::exp(-g)))
+                            * (metal::precise::tanh(u / caps[1]) * caps[1]);
+                        y[(size_t)prow[j] * (NOUT / 2) + (n0 + r) / 2] = bfloat(a);
+                    }
+                }
+            }
+        } else {
+            for (int r = 0; r < RPS; ++r) {
+                const uint n = n0 + r;
+                for (int j = 0; j < MAXT; ++j) {
+                    if (j >= clen) break;
+                    const float v = simd_sum(acc[r][j]);
+                    // BF16-valued either way (y is FP32 or BF16 by instantiation).
+                    if (lane == 0) y[(size_t)prow[j] * NOUT + n] = bfloat(float(bfloat(v)) * post);
+                }
             }
         }
     }
@@ -270,7 +290,7 @@ def _const(key, make):
     return out
 
 
-def grouped_matvec(x, segs, proj, tokens: int, top_k: int, *, pair_input=False, post=True):
+def grouped_matvec(x, segs, proj, tokens: int, top_k: int, *, pair_input=False, post=True, act_caps=None):
     """``y[p] = scale_e * (W_e @ in_p)`` for every (token, expert) pair ``p``.
 
     ``in_p`` is the token's row of ``x`` [T, KIN] (BF16), or with
@@ -294,16 +314,20 @@ def grouped_matvec(x, segs, proj, tokens: int, top_k: int, *, pair_input=False, 
     # distinct experts per token); size the per-thread accumulators to it.
     maxt = 1 if decode else min(tokens, _MAX_TOKENS)
     v2 = fmt == 0 and kin % 32 == 0 and nout % (_V2_RPS * _V2_SGS) == 0
+    # act_caps: write the softcapped SwiGLU of gate/up row pairs (BF16) instead
+    # of y; v2 only (its simdgroups own whole row pairs).
+    act_out = act_caps is not None and v2
     k = _kernel(
         f"mtplx_inkling2_moe_gemv_{fmt}_{int(v2)}",
-        ["x", "order", "seg_start", "seg_len", "seg_expert", "w", "scales", "gscale"],
+        ["x", "order", "seg_start", "seg_len", "seg_expert", "w", "scales", "gscale", "caps"],
         ["y"],
         _SOURCE_V2 if v2 else _SOURCE,
         _HEADER,
     )
     gscale = proj.global_scale if fmt == 0 else _const(("zf", 1), lambda: mx.zeros((1,), mx.float32))
+    caps = _const(("caps",) + tuple(act_caps or (1.0, 1.0)), lambda: mx.array(list(act_caps or (1.0, 1.0)), mx.float32))
     return k(
-        inputs=[x, *seg_inputs, proj.weight, proj.scales, gscale],
+        inputs=[x, *seg_inputs, proj.weight, proj.scales, gscale, caps],
         template=[
             ("KIN", kin),
             ("NOUT", nout),
@@ -318,6 +342,7 @@ def grouped_matvec(x, segs, proj, tokens: int, top_k: int, *, pair_input=False, 
             ("TOPK", top_k),
             ("RPS", _V2_RPS),
             ("SGS", _V2_SGS),
+            ("ACTOUT", int(act_out)),
         ],
         grid=(
             (nout // (_V2_RPS * _V2_SGS)) * _V2_SGS * 32 if v2 else ((nout + _ROWS - 1) // _ROWS) * _ROWS * 32,
@@ -325,8 +350,8 @@ def grouped_matvec(x, segs, proj, tokens: int, top_k: int, *, pair_input=False, 
             1,
         ),
         threadgroup=((_V2_SGS if v2 else _ROWS) * 32, 1, 1),
-        output_shapes=[(p, nout)],
-        output_dtypes=[mx.float32],
+        output_shapes=[(p, nout // 2) if act_out else (p, nout)],
+        output_dtypes=[mx.bfloat16 if act_out else mx.float32],
     )[0]
 
 
@@ -413,8 +438,9 @@ def moe_block(experts, x, inds, weights, residual, conv_w, state, conv_scale: fl
     t, kk = inds.shape
     hidden = x.shape[-1]
     segs = inds if t == 1 else segments(inds)
-    y13 = grouped_matvec(x.astype(mx.bfloat16), segs, experts.w13, t, kk)
-    act = softcapped_swiglu(y13, *experts.caps)
+    act = grouped_matvec(x.astype(mx.bfloat16), segs, experts.w13, t, kk, act_caps=experts.caps)
+    if act.dtype != mx.bfloat16:
+        act = softcapped_swiglu(act, *experts.caps)
     z = grouped_matvec(act, segs, experts.w2, t, kk, pair_input=True, post=False)
     z = z.reshape(t * kk, -1)
     nvfp4 = experts.w2.mode == "nvfp4"

@@ -340,23 +340,33 @@ _NORM_SOURCE = """
 """
 
 
-def norm_rows(y: mx.array, weights: mx.array, shared: bool):
+def norm_rows(y: mx.array, weights: mx.array, shared: bool, stacked: bool = False):
     """``y`` [N, T, H] FP32 -> N arrays [T, H] BF16 (``rms_norm`` with row
-    ``n`` of ``weights``, or row 0 for all when ``shared``)."""
+    ``n`` of ``weights``, or row 0 for all when ``shared``); with
+    ``stacked`` one [N, T, H] array (one projection call serves all rows)."""
     n, tokens, hidden = y.shape
-    outs = [f"out{i}" for i in range(n)]
-    source = _NORM_SOURCE if n == 3 else _NORM_SOURCE.replace(
-        "device bfloat* dst = input == 0 ? out0 : (input == 1 ? out1 : out2);",
-        "device bfloat* dst = out0;",
-    )
-    k = _kernel(f"mtplx_inkling2_norm_rows_{n}", ["y", "nw"], outs, source, _HEADER)
+    if stacked:
+        outs = ["out0"]
+        source = _NORM_SOURCE.replace(
+            "device bfloat* dst = input == 0 ? out0 : (input == 1 ? out1 : out2);",
+            "device bfloat* dst = out0 + (size_t)input * T * H;",
+        )
+        shapes = [(n, tokens, hidden)]
+    else:
+        outs = [f"out{i}" for i in range(n)]
+        source = _NORM_SOURCE if n == 3 else _NORM_SOURCE.replace(
+            "device bfloat* dst = input == 0 ? out0 : (input == 1 ? out1 : out2);",
+            "device bfloat* dst = out0;",
+        )
+        shapes = [(tokens, hidden)] * n
+    k = _kernel(f"mtplx_inkling2_norm_rows_{n}_{int(stacked)}", ["y", "nw"], outs, source, _HEADER)
     return k(
         inputs=[y, weights],
         template=[("H", hidden), ("N", n), ("SHARED", int(shared))],
         grid=(1024 * n * tokens, 1, 1),
         threadgroup=(1024, 1, 1),
-        output_shapes=[(tokens, hidden)] * n,
-        output_dtypes=[mx.bfloat16] * n,
+        output_shapes=shapes,
+        output_dtypes=[mx.bfloat16] * len(outs),
     )
 
 
