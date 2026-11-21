@@ -681,6 +681,59 @@ LAGUNA_AR_DESCRIPTOR = BackendDescriptor(
 )
 
 
+INKLING2_AR_DESCRIPTOR = BackendDescriptor(
+    backend_id="inkling2_ar",
+    architecture_id="inkling2-ar",
+    model_family="inkling2",
+    display_name="Inkling 2 Mini target-only (step engine)",
+    artifact_layout="single_folder_target_only_ar",
+    runtime_capabilities=("target_logits", "target_only_ar"),
+    sampler_defaults=SamplerDefaults(temperature=1.0, top_p=1.0, top_k=0),
+    # The generate loop re-expresses Inkling's message tokens as <think> and
+    # <tool_call> markup, so the Qwen-style codec splits them.
+    reasoning_codec=ReasoningCodec(
+        parser="qwen3",
+        display_name="Inkling messages as think tags",
+        default_mode="on",
+        supported=True,
+        modes=("auto", "on", "off"),
+        history_policy="preserve_when_enabled",
+    ),
+    draft_semantics=DraftSemantics(
+        request_field="depth",
+        display_label="Draft depth",
+        default=1,
+        minimum=1,
+        maximum=1,
+        unit="depth",
+    ),
+    uses_external_assistant=False,
+    uses_draft_lm_head=False,
+    tune_policy=TunePolicy(
+        supported=False,
+        supported_families=(),
+        unsupported_reason="Inkling 2 runs on its own step engine.",
+    ),
+    kv_quant_policy=KVQuantPolicy(supported=False),
+    context_window_policy=ContextWindowPolicy(
+        maximum=1_048_576,
+        default=65_536,
+        source="inkling2_config",
+    ),
+    default_max_response_tokens=32_768,
+    default_tool_prompt_mode="native",
+    required_tool_prompt_mode="native",
+    required_chat_template_profile="tokenizer",
+    allows_chat_template_path=False,
+    validation_status="target_exact_ar",
+    status="target_exact_ar",
+    notes=(
+        "MTPLX's own Inkling 2 model: compiled step engine with fused Metal kernels.",
+        "Attention projections and the LM head are re-quantized to 8 bits at load.",
+    ),
+)
+
+
 MLX_LM_AR_DESCRIPTOR = BackendDescriptor(
     backend_id="mlx_lm_ar",
     architecture_id="mlx-lm-ar-family",
@@ -1080,6 +1133,7 @@ GEMMA4_ASSISTANT_DESCRIPTOR = BackendDescriptor(
 DESCRIPTORS_BY_BACKEND_ID: dict[str, BackendDescriptor] = {
     QWEN3_NEXT_DESCRIPTOR.backend_id: QWEN3_NEXT_DESCRIPTOR,
     LAGUNA_AR_DESCRIPTOR.backend_id: LAGUNA_AR_DESCRIPTOR,
+    INKLING2_AR_DESCRIPTOR.backend_id: INKLING2_AR_DESCRIPTOR,
     MLX_LM_AR_DESCRIPTOR.backend_id: MLX_LM_AR_DESCRIPTOR,
     NATIVE_CONTRACT_DESCRIPTOR.backend_id: NATIVE_CONTRACT_DESCRIPTOR,
     GEMMA4_ASSISTANT_DESCRIPTOR.backend_id: GEMMA4_ASSISTANT_DESCRIPTOR,
@@ -1457,6 +1511,8 @@ def reasoning_policy_for_model(
         return DEEPSEEK_MTP_DESCRIPTOR.reasoning_codec
     if family == "laguna":
         return LAGUNA_AR_DESCRIPTOR.reasoning_codec
+    if family == "inkling2":
+        return INKLING2_AR_DESCRIPTOR.reasoning_codec
     if family == "lfm2":
         return MLX_LM_AR_LFM2_DESCRIPTOR.reasoning_codec
     return ReasoningCodec(

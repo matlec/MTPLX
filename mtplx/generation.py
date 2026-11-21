@@ -9631,6 +9631,26 @@ def generate_ar(
     store_prefix_snapshot: bool | None = None,
 ) -> GenerationOutput:
     reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_ar")
+    if getattr(rt, "backend_id", None) == "inkling2_ar":
+        if constraint is not None:
+            raise ValueError("constrained decoding is not supported on the inkling2_ar backend")
+        from .backends.inkling2_ar import generate_inkling2_ar
+
+        return generate_inkling2_ar(
+            rt,
+            prompt_ids,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            seed=seed,
+            stop_token_ids=stop_token_ids,
+            token_callback=token_callback,
+            trace_label=trace_label,
+            trace_metadata=trace_metadata,
+            prefill_callback=prefill_callback,
+            repetition_stop=repetition_stop,
+            first_token_logprobs_top_k=first_token_logprobs_top_k,
+            abort_check=abort_check,
+        )
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
         if constraint is not None:
             raise ValueError(

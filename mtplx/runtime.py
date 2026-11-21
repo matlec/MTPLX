@@ -677,6 +677,12 @@ def load(
             return runtime
         path = Path(gemma4_pair["target_model"])
     config = load_config(path)
+    from .backends.inkling2_ar import is_inkling2_config, load_inkling2_runtime
+
+    if is_inkling2_config(config):
+        # MTPLX's own model and step engine; the bundled DSpark drafter is
+        # not a native MTP head, so ``mtp`` is ignored here.
+        return load_inkling2_runtime(path, config)
     _export_derived_model_geometry(config)
     from .a3b_whole_moe import validate_a3b_whole_moe_load_options
 

@@ -18,6 +18,7 @@ _LOG = logging.getLogger(__name__)
 RUNTIME_CONTRACT_FILE = "mtplx_runtime.json"
 SUPPORTED_ARCH_IDS = {
     "laguna-s-2.1-ar",
+    "inkling2-ar",
     "deepseek-v4",
     "qwen4-next",
     "qwen3-next-mtp",
@@ -148,6 +149,27 @@ ARCHITECTURE_CATALOG: dict[str, ArchitectureSupport] = {
             "Target-only AR runtime for the exact mlx-community Laguna-S-2.1-oQ4e "
             "checkpoint; the artifact has no native MTP head and must be loaded "
             "with mtp=False."
+        ),
+    ),
+    "inkling2-ar": ArchitectureSupport(
+        arch_id="inkling2-ar",
+        display_name="Inkling 2 Mini (looped MoE)",
+        family="inkling2",
+        backend="inkling2_ar",
+        support_level="verified-native-ar-only",
+        runtime_compatibility="native-ar-only",
+        can_run_verified=True,
+        aliases=("inkling2", "Inkling2LoopForConditionalGeneration"),
+        config_markers=(),
+        family_gate="inkling2-model-type",
+        references=(
+            "https://huggingface.co/thinkingmachines/Inkling-2-Mini",
+            "https://github.com/jundot/omlx/tree/v0.8.2/omlx/patches/inkling2",
+        ),
+        notes=(
+            "Target-only runtime on MTPLX's own Inkling 2 model and step engine "
+            "(mtplx/models/inkling2). The bundled DSpark drafter is not a native "
+            "MTP head; the checkpoint loads with mtp=False."
         ),
     ),
     "lfm2-moe-ar": ArchitectureSupport(
@@ -894,7 +916,14 @@ def _detect_arch_id(inspection: Any) -> str | None:
     return None
 
 
+_INKLING2_MODEL_TYPES = {"inkling2", "inkling2_loop", "inkling2_text", "inkling2_loop_text"}
+
+
 def _has_mtp_markers(inspection: Any) -> bool:
+    if _text(getattr(inspection, "model_type", None)) in _INKLING2_MODEL_TYPES:
+        # Inkling 2's mtp.safetensors is a DSpark block drafter, not a native
+        # MTP head; the checkpoint is served target-only.
+        return False
     mtp = getattr(inspection, "mtp", None)
     return bool(
         int(getattr(inspection, "mtp_num_hidden_layers", 0) or 0) > 0
@@ -1263,7 +1292,15 @@ _DECLARED_MODULES_LOWERED = {
 # deliberately absent: its runnability is decided by the pinned-artifact
 # geometry/sidecar gate on its catalog row (supply-chain fence), never by
 # model_type alone.
-_INTREE_MODEL_TYPES = {"deepseek_v4", "qwen4_exp", "qwen4_exp_text"}
+_INTREE_MODEL_TYPES = {
+    "deepseek_v4",
+    "qwen4_exp",
+    "qwen4_exp_text",
+    "inkling2",
+    "inkling2_loop",
+    "inkling2_text",
+    "inkling2_loop_text",
+}
 
 # Families whose catalog family_gate is an artifact-integrity fence (pinned
 # geometry + pinned sidecars). A gate failure here refuses outright and is
@@ -1423,6 +1460,11 @@ def _passes_family_runtime_gate(arch_id: str, inspection: Any, tensor_gate: bool
         return _passes_mlx_lm_ar_gate(inspection)
     if arch_id == "deepseek-v4":
         return _passes_deepseek_v4_gate(inspection)
+    if arch_id == "inkling2-ar":
+        # Inspection reports text_config.model_type (``*_text``).
+        return _text(getattr(inspection, "model_type", None)) in _INKLING2_MODEL_TYPES and (
+            _trunk_weights_present(inspection)
+        )
     if arch_id == "laguna-s-2.1-ar":
         return bool(
             getattr(inspection, "laguna_s_2_1_mlx_4bit_match", False)
