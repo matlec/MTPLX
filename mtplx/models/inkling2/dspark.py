@@ -2,8 +2,8 @@
 #
 # Vendored from jundot/omlx v0.8.2 (5eeec7757f83bfc99eeb87abe49686d00a0bba1f),
 # omlx/patches/inkling2/dspark.py. Copyright the oMLX authors, Apache-2.0.
-# Adaptations: MTPLX imports; the oMLX batched-drafter wrappers are replaced by
-# ``spec.py``.
+# Adaptations: MTPLX imports; 8-bit Markov fold; the oMLX batched-drafter
+# wrappers are replaced by ``spec.py``.
 """Bundled DSpark drafter for Inkling 2 (``mtp.safetensors``).
 
 A small block drafter. Each layer mixes the target's context taps (the
@@ -221,7 +221,9 @@ class Inkling2MarkovHead(nn.Module):
             rows.append((head @ proj).astype(mx.bfloat16))
             biases.append((head @ bias).astype(mx.bfloat16))
             mx.eval(rows[-1], biases[-1])
-        self._fold_weight = mx.concatenate(rows, axis=0)
+        # 8-bit fold: each step reads the [V, rank] matrix once, so its width
+        # is the drafter's largest per-token read (~100 MB in BF16).
+        self._fold_weight = mx.quantize(mx.concatenate(rows, axis=0), group_size=64, bits=8)
         self._fold_bias = mx.concatenate(biases, axis=0)
         mx.eval(self._fold_weight, self._fold_bias)
 
@@ -263,7 +265,11 @@ class Inkling2MarkovHead(nn.Module):
         blend = ((1.0 - gate) * mx.tanh(proj[:, r : 2 * r]).astype(dtype)).astype(dtype)
         self._state = kept + blend
         latent = mx.tanh(proj[:, 2 * r :]).astype(dtype)
-        bias = latent @ self._fold_weight.T + self._fold_bias
+        w, scales, biases = self._fold_weight
+        bias = (
+            mx.quantized_matmul(latent, w, scales, biases, transpose=True, group_size=64, bits=8)
+            + self._fold_bias
+        )
         self._step += 1
         logits = base_logits.astype(mx.float32) + bias.astype(mx.float32)
         if self._softcap:

@@ -40,34 +40,7 @@ class DraftState:
     last_row: mx.array | None = None  # newest raw context row [1, 1, T*H]
 
 
-def markov_latent(markov, prev_tokens: mx.array, step: int) -> mx.array:
-    """One RNN step of the Markov head: advances its state and returns the
-    [1, rank] latent (``Inkling2MarkovHead.apply_step_logits`` without the
-    full-vocabulary projection)."""
-    state = markov._state
-    dtype = state.dtype
-    inputs = mx.concatenate(
-        [
-            state,
-            markov.markov_w1(prev_tokens.reshape(-1)).astype(dtype),
-            markov._hidden[:, step].astype(dtype),
-            markov._rows_f.astype(dtype),
-        ],
-        axis=-1,
-    )
-    proj = markov.rnn_proj(inputs).astype(mx.float32)
-    r = markov.rank
-    gate = mx.sigmoid(proj[:, :r]).astype(dtype)
-    kept = (gate * state).astype(dtype)
-    blend = ((1.0 - gate) * mx.tanh(proj[:, r : 2 * r]).astype(dtype)).astype(dtype)
-    markov._state = kept + blend
-    return mx.tanh(proj[:, 2 * r :]).astype(dtype)
-
-
 class DSparkDrafter:
-    # Candidates the Markov head re-ranks per position (0: whole vocabulary).
-    candidates = 0
-
     def __init__(self, model: Inkling2DSparkModel):
         self.model = model
         cfg = model.config
@@ -159,25 +132,9 @@ class DSparkDrafter:
         markov._step = 0
         prev = mx.array([anchor], dtype=mx.int32)
         tokens = []
-        if self.candidates:
-            # The Markov bias only re-ranks: score the base logits' top
-            # candidates instead of the whole vocabulary (the fold matrix is
-            # V x rank, ~100 MB per step otherwise). Proposals only steer the
-            # verify; acceptance stays exact.
-            kc = self.candidates
-            cand = mx.argpartition(-logits[0, :count], kc - 1, axis=-1)[:, :kc]
-            base = mx.take_along_axis(logits[0, :count], cand, axis=-1)
-            fold_w = markov._fold_weight[cand]  # [count, kc, rank]
-            fold_b = markov._fold_bias[cand].astype(mx.float32)
         for step in range(count):
-            if not self.candidates:
-                step_logits = markov.apply_step_logits(logits[:, step], prev)
-                prev = mx.argmax(step_logits, axis=-1)
-            else:
-                latent = markov_latent(markov, prev, step)
-                bias = (fold_w[step] @ latent[0]).astype(mx.float32) + fold_b[step]
-                pick = mx.argmax(base[step] + bias)
-                prev = cand[step, pick].reshape(1)
+            step_logits = markov.apply_step_logits(logits[:, step], prev)
+            prev = mx.argmax(step_logits, axis=-1)
             tokens.append(prev)
         out = mx.concatenate(tokens) if tokens else mx.zeros((0,), dtype=mx.int32)
         return [int(t) for t in np.array(out).tolist()]
