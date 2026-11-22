@@ -76,13 +76,30 @@ def load_inkling2_runtime(path: Path, config: dict[str, Any]) -> Inkling2ARRunti
         attn = None
     if head in {"bf16", "none"}:
         head = None
-    model, _config = load_model(path, attn=attn, head=head)
+    vision = os.environ.get("MTPLX_INKLING2_VISION", "1") not in {"", "0", "false"}
+    model, _config = load_model(path, attn=attn, head=head, vision=vision)
     tokenizer = _load_tokenizer_resilient(path, config)
     template = path / "chat_template.jinja"
     if not getattr(tokenizer, "chat_template", None) and template.is_file():
         tokenizer.chat_template = template.read_text()
     runtime = Inkling2ARRuntime(model, tokenizer, path, False, MTPContract())
     runtime.engine = StepEngine(model)
+    runtime.vision_spec = None
+    if getattr(model, "vision_tower", None) is not None:
+        import json
+        from types import SimpleNamespace
+
+        from mtplx.models.inkling2.vision import Inkling2ImageProcessor
+
+        proc = {}
+        if (path / "processor_config.json").is_file():
+            proc = json.loads((path / "processor_config.json").read_text())
+        token = proc.get("image_token", "<|unused_200054|>")
+        runtime.image_processor = Inkling2ImageProcessor(**proc.get("image_processor", {}))
+        runtime.vision_spec = SimpleNamespace(
+            family="inkling2",
+            image_token_id=int(tokenizer.convert_tokens_to_ids(token)),
+        )
     runtime.prompt_cache = PromptCache(
         max_bytes=int(float(os.environ.get("MTPLX_INKLING2_PROMPT_CACHE_GB", "8")) * (1 << 30))
     )
@@ -271,7 +288,31 @@ class PromptCache:
 _ENGINE_SUFFIX_TOKENS = 32
 
 
-def _prefill(runtime, prompt_ids, prefill_callback, abort_check, chunk: int = 4096):
+def cache_key_ids(prompt_ids: list[int], vision_splice=None) -> list[int] | None:
+    """Prompt-cache key: the ids, with every image placeholder replaced by a
+    surrogate derived from its image's content digest and its row within
+    the image, so two prompts that differ only in an image never share a
+    snapshot. None (no caching) when the images carry no digests."""
+    if vision_splice is None:
+        return list(prompt_ids)
+    digests = getattr(vision_splice, "image_digests", None)
+    counts = getattr(vision_splice, "pad_counts", None)
+    if digests is None or counts is None:
+        return None
+    pad = int(vision_splice.image_pad_token_id)
+    out, image, row = [], 0, 0
+    for token in prompt_ids:
+        if token != pad:
+            out.append(int(token))
+            continue
+        out.append((1 << 62) + (int(digests[image]) % (1 << 40)) * (1 << 20) + row)
+        row += 1
+        if row >= counts[image]:
+            image, row = image + 1, 0
+    return out
+
+
+def _prefill(runtime, prompt_ids, prefill_callback, abort_check, chunk: int = 4096, vision_splice=None):
     import mlx.core as mx
 
     from mtplx.models.inkling2.decode import MAX_STEP_TOKENS, StepCache
@@ -282,8 +323,12 @@ def _prefill(runtime, prompt_ids, prefill_callback, abort_check, chunk: int = 40
     dstate = drafter.new_state() if drafter is not None else None
     started = time.perf_counter()
     total = len(prompt_ids)
+    pad = int(vision_splice.image_pad_token_id) if vision_splice is not None else None
+    key_ids = cache_key_ids(prompt_ids, vision_splice)
     prompt_cache = getattr(runtime, "prompt_cache", None)
-    hit = prompt_cache.lookup(prompt_ids) if prompt_cache is not None and drafter is None else None
+    if key_ids is None:
+        prompt_cache = None
+    hit = prompt_cache.lookup(key_ids) if prompt_cache is not None and drafter is None else None
     cached = 0
     if hit is not None:
         cached = len(hit[0])
@@ -291,7 +336,7 @@ def _prefill(runtime, prompt_ids, prefill_callback, abort_check, chunk: int = 40
         suffix = prompt_ids[cached:]
         if not suffix:
             return step_cache, hit[2], dstate, time.perf_counter() - started, cached
-        if len(suffix) <= _ENGINE_SUFFIX_TOKENS:
+        if len(suffix) <= _ENGINE_SUFFIX_TOKENS and (pad is None or pad not in suffix):
             logits = None
             for i in range(0, len(suffix), MAX_STEP_TOKENS):
                 logits, _ = runtime.engine.step(step_cache, suffix[i : i + MAX_STEP_TOKENS])
@@ -307,14 +352,27 @@ def _prefill(runtime, prompt_ids, prefill_callback, abort_check, chunk: int = 40
     for start in range(start0, total, chunk):
         piece = prompt_ids[start : start + chunk]
         ids = mx.array([piece], dtype=mx.int32)
+        embeddings = None
+        if pad is not None and pad in piece:
+            # This chunk's image rows: the placeholders before it consumed
+            # the rows ahead of them, in prompt order.
+            first = sum(1 for t in prompt_ids[:start] if t == pad)
+            count = sum(1 for t in piece if t == pad)
+            embeddings = model.embed_inputs(
+                ids, features=vision_splice.embeddings[first : first + count]
+            )
         if drafter is not None and total - start - len(piece) < drafter.slots:
-            out = model.forward(ids, cache, capture_layer_ids=capture_ids, last_logits_only=True)
+            out = model.forward(
+                ids, cache, embeddings, capture_layer_ids=capture_ids, last_logits_only=True
+            )
             drafter.feed(dstate, out.hidden_states)
             logits = out.logits[0, -1:]
         else:
             if drafter is not None:
                 dstate.fed += len(piece)
-            logits = model(ids, cache=cache, last_logits_only=True)[0, -1:]
+            logits = model(
+                ids, cache=cache, input_embeddings=embeddings, last_logits_only=True
+            )[0, -1:]
         mx.eval(logits)
         if prefill_callback is not None:
             try:
@@ -337,6 +395,29 @@ def _prefill(runtime, prompt_ids, prefill_callback, abort_check, chunk: int = 40
     return step_cache, logits, dstate, time.perf_counter() - started, cached
 
 
+def encode_images(runtime, images: list[bytes]):
+    """Image-token embedding rows [rows * cols, H] for each encoded image."""
+    import io
+
+    import mlx.core as mx
+    from PIL import Image
+
+    model = runtime.model
+    if getattr(model, "vision_tower", None) is None:
+        raise ValueError("this Inkling 2 runtime was loaded without its vision tower")
+    out = []
+    for raw in images:
+        with Image.open(io.BytesIO(raw)) as image:
+            image.load()
+            processed = runtime.image_processor.preprocess([image])
+        rows = model.encode_image(
+            mx.array(processed["pixel_values"]), processed["image_grid_thw"]
+        )
+        mx.eval(rows)
+        out.append(rows)
+    return out
+
+
 def generate_inkling2_ar(
     runtime,
     prompt_ids: list[int],
@@ -352,6 +433,7 @@ def generate_inkling2_ar(
     repetition_stop: bool = False,
     first_token_logprobs_top_k: int | None = None,
     abort_check: Callable[[], bool] | None = None,
+    vision_splice: Any | None = None,
     **_unused: Any,
 ):
     import mlx.core as mx
@@ -391,11 +473,14 @@ def generate_inkling2_ar(
         except Exception:
             pass
     cache, logits, dstate, prefill_s, cached = _prefill(
-        runtime, prompt_ids, prefill_callback, abort_check
+        runtime, prompt_ids, prefill_callback, abort_check, vision_splice=vision_splice
     )
+    key_ids = cache_key_ids(prompt_ids, vision_splice)
     prompt_cache = getattr(runtime, "prompt_cache", None)
+    if key_ids is None:
+        prompt_cache = None
     if prompt_cache is not None and dstate is None:
-        prompt_cache.store(prompt_ids, cache, logits)
+        prompt_cache.store(key_ids, cache, logits)
     if prefill_callback is not None:
         try:
             prefill_callback(
@@ -486,7 +571,7 @@ def generate_inkling2_ar(
             flush=True,
         )
     if prompt_cache is not None and dstate is None and cache.offset == len(prompt_ids) + len(generated):
-        prompt_cache.store(list(prompt_ids) + generated, cache, last_logits)
+        prompt_cache.store(key_ids + generated, cache, last_logits)
     elapsed = time.perf_counter() - started_all
     text_tokens = list(wire)
     stats = GenerationStats(

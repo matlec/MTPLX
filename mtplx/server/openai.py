@@ -5651,6 +5651,12 @@ def _server_vision_spec(state: Any) -> Any | None:
     if cached != "unset":
         return cached
     spec = None
+    runtime = getattr(state, "runtime", None)
+    if getattr(runtime, "backend_id", None) == "inkling2_ar":
+        # Inkling encodes its images itself (backends.inkling2_ar).
+        spec = getattr(runtime, "vision_spec", None)
+        state._vision_spec_cache = spec
+        return spec
     try:
         from mtplx.vision import vision_spec_for_model_dir
 
@@ -5683,14 +5689,22 @@ def _image_bytes_from_url(url: str) -> bytes:
 
 def _vision_extract_and_flatten(
     messages: list[dict[str, Any]],
+    *,
+    keep_parts: bool = False,
 ) -> tuple[list[dict[str, Any]], list[bytes]]:
     """Replace image content parts with the vision placeholder text.
 
     Returns the flattened messages plus the raw image payloads in prompt
     order. Reserved image-control literals in caller text are escaped before
     inserting the real placeholders. Other text stays byte-identical.
+
+    ``keep_parts``: keep the content part lists and turn each image part
+    into ``{"type": "image"}`` (templates that render their own image
+    markers, such as Inkling 2's).
     """
 
+    if keep_parts:
+        return _vision_extract_keep_parts(messages)
     images: list[bytes] = []
     flattened: list[Any] = []
     for message in messages:
@@ -5740,6 +5754,36 @@ def _vision_extract_and_flatten(
             updated = message.model_copy(update={"content": text})
         flattened.append(updated)
     return flattened, images
+
+
+def _vision_extract_keep_parts(
+    messages: list[Any],
+) -> tuple[list[Any], list[bytes]]:
+    images: list[bytes] = []
+    out: list[Any] = []
+    for message in messages:
+        is_mapping = isinstance(message, dict)
+        content = message.get("content") if is_mapping else getattr(message, "content", None)
+        if not isinstance(content, list):
+            out.append(message)
+            continue
+        parts: list[Any] = []
+        for item in content:
+            if isinstance(item, dict) and (
+                str(item.get("type") or "") == "image_url" or "image_url" in item
+            ):
+                image_url = item.get("image_url")
+                url = image_url.get("url") if isinstance(image_url, dict) else image_url
+                images.append(_image_bytes_from_url(str(url or "")))
+                parts.append({"type": "image"})
+            else:
+                parts.append(item)
+        out.append(
+            dict(message, content=parts)
+            if is_mapping
+            else message.model_copy(update={"content": parts})
+        )
+    return out, images
 
 
 def _expand_image_pads(
@@ -6173,6 +6217,25 @@ def _materialize_vision_splice(
     spec = _server_vision_spec(state)
     if spec is None:
         raise ValueError("model has no vision tower")
+    if getattr(state.runtime, "backend_id", None) == "inkling2_ar":
+        from mtplx.backends.inkling2_ar import encode_images
+
+        digests = [_image_content_digest(raw) for raw in images]
+        rows = encode_images(state.runtime, images)
+        pad_counts = [int(r.shape[0]) for r in rows]
+        expanded_ids = _expand_image_pads(
+            prompt_ids, image_pad_id=int(spec.image_token_id), pad_counts=pad_counts
+        )
+        import mlx.core as _mx
+
+        embeddings = rows[0] if len(rows) == 1 else _mx.concatenate(rows, axis=0)
+        _mx.eval(embeddings)
+        return expanded_ids, VisionSplice(
+            image_pad_token_id=int(spec.image_token_id),
+            embeddings=embeddings,
+            image_digests=tuple(digests),
+            pad_counts=tuple(pad_counts),
+        )
     model_dir = _Path(str(state.args.model))
     preprocessor_config = _json.loads(
         (model_dir / "preprocessor_config.json").read_text(encoding="utf-8")
@@ -14123,6 +14186,18 @@ def _message_to_template_dict(
 ) -> dict[str, Any] | None:
     if not message.role:
         return None
+    if isinstance(message.content, list) and any(
+        isinstance(part, dict) and part.get("type") == "image" for part in message.content
+    ):
+        # Bare image parts come from _vision_extract_keep_parts (templates
+        # that render their own image blocks): keep the part list.
+        parts = [
+            {"type": "image"}
+            if isinstance(part, dict) and part.get("type") == "image"
+            else {"type": "text", "text": _content_to_text([part])}
+            for part in message.content
+        ]
+        return {"role": message.role, "content": parts}
     content = _content_to_text(message.content)
     if message.role == "assistant":
         content = (
@@ -32304,6 +32379,11 @@ def _run_generation(
                                 capture_final_state=session_bank is not None,
                                 abort_check=_prefill_abort_check,
                                 store_prefix_snapshot=store_prefix_snapshot,
+                                **(
+                                    {"vision_splice": vision_splice}
+                                    if vision_splice is not None
+                                    else {}
+                                ),
                             )
                         else:
                             adaptive_policy = _make_adaptive_policy(
@@ -38808,7 +38888,8 @@ def create_app(state: ServerState) -> FastAPI:
             # #186 phase 3); only the batched AR pump is bypassed.
         try:
             messages_for_generation, vision_images = _vision_extract_and_flatten(
-                messages_for_generation
+                messages_for_generation,
+                keep_parts=getattr(state.runtime, "backend_id", None) == "inkling2_ar",
             )
         except ValueError as vision_error:
             raise HTTPException(status_code=400, detail=str(vision_error))
@@ -38822,7 +38903,9 @@ def create_app(state: ServerState) -> FastAPI:
                         "not supported for it"
                     ),
                 )
-            if str(request_generation_mode or "") == "ar":
+            if str(request_generation_mode or "") == "ar" and (
+                getattr(state.runtime, "backend_id", None) != "inkling2_ar"
+            ):
                 raise HTTPException(
                     status_code=400,
                     detail="image content requires MTP generation mode",

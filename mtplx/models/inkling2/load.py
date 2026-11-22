@@ -21,7 +21,7 @@ def read_config(path: Path) -> dict[str, Any]:
     return config
 
 
-def _model_args(config: dict[str, Any]):
+def _model_args(config: dict[str, Any], vision: bool = False):
     from .model import ModelArgs
 
     quant = config.get("quantization")
@@ -30,7 +30,7 @@ def _model_args(config: dict[str, Any]):
     return ModelArgs(
         model_type=config["model_type"],
         text_config=config["text_config"],
-        vision_config=None,
+        vision_config=config.get("vision_config") if vision else None,
         mtp_config=config.get("mtp_config"),
         eos_token_id=config.get("eos_token_id", 200006),
         image_token_id=config.get("image_token_id", 200054),
@@ -87,14 +87,16 @@ def load_model(
     lazy: bool = False,
     attn: str | None = None,
     head: str | None = None,
+    vision: bool = False,
 ):
     """Returns ``(model, config)``. ``attn``/``head`` re-quantize the BF16
-    attention projections / LM head in memory (``quantize_in_memory``)."""
+    attention projections / LM head in memory (``quantize_in_memory``);
+    ``vision`` also loads the vision tower (BF16, ~0.6 GB)."""
     from .model import Model
 
     path = Path(path)
     config = read_config(path)
-    model = Model(_model_args(config))
+    model = Model(_model_args(config, vision=vision and bool(config.get("vision_config"))))
     weights: dict[str, mx.array] = {}
     for shard in sorted(glob.glob(str(path / "model*.safetensors"))):
         weights.update(mx.load(shard))

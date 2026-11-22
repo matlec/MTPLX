@@ -133,9 +133,14 @@ class ModelArgs(BaseModelArgs):
 
     def __post_init__(self):
         self.text = TextArgs.from_dict(self.text_config or {})
-        # Text-only: the vision tower is not loaded (its weights are skipped
-        # by ``sanitize_weights``).
-        self.vision = None
+        # The vision tower is built only when a vision_config is passed (the
+        # loader passes it on request; ``sanitize_weights`` skips its weights
+        # otherwise).
+        from .vision import VisionArgs
+
+        self.vision = (
+            VisionArgs.from_dict(self.vision_config) if self.vision_config else None
+        )
 
 
 def _unit_rms(x: mx.array, eps: float = 1e-6) -> mx.array:
@@ -863,6 +868,10 @@ class Model(nn.Module):
         self.lm_head = nn.Linear(
             args.text.hidden_size, args.text.vocab_size, bias=False
         )
+        if args.vision is not None:
+            from .vision import VisionTower
+
+            self.vision_tower = VisionTower(args.vision, args.text.hidden_size)
         self._softcap = args.text.final_logit_softcapping
         vocab = args.text.vocab_size
         unpadded = args.text.unpadded_vocab_size

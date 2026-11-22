@@ -196,3 +196,19 @@ def test_translator_maps_messages_to_qwen_markup():
     )
     out = "".join(chr(c) for token in stream for c in t(token))
     assert out == "<think>r</think>\n\na<tool_call>\n{}\n</tool_call>"
+
+
+def test_cache_keys_separate_images():
+    from types import SimpleNamespace
+
+    from mtplx.backends.inkling2_ar import cache_key_ids
+
+    ids = [5, 9, 9, 9, 7, 9, 9, 3]
+    a = SimpleNamespace(image_pad_token_id=9, image_digests=(11, 22), pad_counts=(3, 2))
+    b = SimpleNamespace(image_pad_token_id=9, image_digests=(11, 23), pad_counts=(3, 2))
+    ka, kb = cache_key_ids(ids, a), cache_key_ids(ids, b)
+    # Same first image: same key up to the second image, then they differ.
+    assert ka[:5] == kb[:5] and ka[5] != kb[5]
+    assert len(set(ka[1:4])) == 3 and ka[0] == 5 and ka[4] == 7
+    assert cache_key_ids(ids, None) == ids
+    assert cache_key_ids(ids, SimpleNamespace(image_pad_token_id=9, image_digests=None, pad_counts=None)) is None
