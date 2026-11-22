@@ -29826,6 +29826,10 @@ def _ar_batch_unavailable_reason(runtime: Any) -> str | None:
     lane serve the requests one at a time.
     """
 
+    if getattr(runtime, "backend_id", None) == "inkling2_ar":
+        # Inkling owns its generate loop (step engine, prompt cache, message
+        # token translation); the batch generator would bypass all of it.
+        return "the inkling2_ar backend generates through its own step engine"
     # Probe exactly what the batch generator builds for a fresh request:
     # mlx-lm's make_prompt_cache on the runtime's model object. This is not
     # runtime.make_cache(): that one asks the inner language model and, for
