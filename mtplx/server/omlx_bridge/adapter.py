@@ -237,6 +237,13 @@ def normalize_messages_for_template(
         if role == "developer":
             role = "system"
         content = _message_content(message)
+        if isinstance(content, list) and any(
+            isinstance(part, dict) and part.get("type") == "image" for part in content
+        ):
+            # Bare image parts (templates that render their own image
+            # blocks, e.g. Inkling 2): pass the part list through.
+            processed.append({"role": role, "content": list(content)})
+            continue
         reasoning = _reasoning_for_message(message)
         content_text, reasoning_out = _apply_reasoning_reconstruction(
             role=role,

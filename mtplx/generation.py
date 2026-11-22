@@ -10049,6 +10049,7 @@ def generate_ar(
     first_token_logprobs_top_k: int | None = None,
     store_prefix_snapshot: bool | None = None,
     commit_prompt_state_to_bank: bool = False,
+    vision_splice: Any | None = None,
 ) -> GenerationOutput:
     reject_non_k1_a3b_whole_moe_request(rt, entrypoint="generate_ar")
     if getattr(rt, "backend_id", None) == "gemma4_assistant":
@@ -10058,6 +10059,8 @@ def generate_ar(
             )
         from .backends.gemma4_assistant import generate_gemma4_ar
 
+        if vision_splice is not None:
+            raise ValueError("image input is not supported on the gemma4_assistant backend")
         return generate_gemma4_ar(
             rt,
             prompt_ids,
@@ -10112,6 +10115,7 @@ def generate_ar(
         abort_check=abort_check,
         capture_hidden=ar_return_hidden,
         store_prefix_snapshot=store_prefix_snapshot,
+        vision_splice=vision_splice,
     )
     prompt_state_total_time_s = time.perf_counter() - _prompt_state_started
     # The prompt-prefix commit generate_mtpk makes, under the same conditions:
@@ -10134,9 +10138,15 @@ def generate_ar(
             )
         )
     ):
+        bank_commit_ids = prompt_ids
+        if vision_splice is not None:
+            # The content-keyed view restore_or_prefill_prompt_state matched.
+            from mtplx.vision.splice import vision_bank_key_ids
+
+            bank_commit_ids = vision_bank_key_ids(prompt_ids, vision_splice) or prompt_ids
         prompt_prefix_bank_commit = _commit_ar_prompt_state(
             rt,
-            prompt_ids,
+            bank_commit_ids,
             prompt_state,
             session_bank=session_bank,
             session_id=session_id,

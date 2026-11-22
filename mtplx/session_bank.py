@@ -341,6 +341,19 @@ class CacheMissReason(str, Enum):
     OVERSIZED_SNAPSHOT_SKIPPED = "oversized_snapshot_skipped"
 
 
+def _report_unfit_snapshot(exc: Exception) -> None:
+    """A banked snapshot this cache layout cannot take (an SSD entry an older
+    build wrote: an Inkling 2 sliding window with an empty meta state failed
+    every request sharing its prefix, across restarts) is served as a miss."""
+
+    print(
+        f"[mtplx] session-bank snapshot does not fit the cache ({exc!r}); "
+        "re-reading the prompt",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def token_prefix_hash(token_ids: list[int] | tuple[int, ...]) -> str:
     h = hashlib.sha256()
     for token in token_ids:
@@ -2998,12 +3011,17 @@ class SessionBank:
             _factory_started = time.perf_counter()
             cache = cache_factory() if cache_factory is not None else runtime.make_cache()
             _install_started = time.perf_counter()
-            restore_cache(
-                cache,
-                entry.cache_snapshot,
-                restore_meta_state=cache_factory is None,
-                clone_states=not entry.lazy_kv,
-            )
+            try:
+                restore_cache(
+                    cache,
+                    entry.cache_snapshot,
+                    restore_meta_state=cache_factory is None,
+                    clone_states=not entry.lazy_kv,
+                )
+            except (TypeError, ValueError) as exc:
+                _report_unfit_snapshot(exc)
+                self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
+                return None
             _trim_started = time.perf_counter()
             if not trim_to_target(cache):
                 self.last_miss_reason = CacheMissReason.NO_SNAPSHOT_COVERAGE.value
@@ -3016,18 +3034,23 @@ class SessionBank:
             # Overwrite recurrent (non-trimmable) states with the interior
             # boundary capture; trimmable entries are None in these snapshots.
             _overwrite_started = time.perf_counter()
-            restore_cache(
-                cache,
-                boundary_snapshot,
-                # Prefix-decoded cold entries intentionally omitted the
-                # full-entry meta state.  Their recurrent metadata must come
-                # from the selected boundary together with its state.  A
-                # custom factory only changes how the target cache is made;
-                # it must not suppress this boundary-specific metadata.
-                restore_meta_state=(
-                    getattr(entry, "cache_snapshot_prefix_len", None) is not None
-                ),
-            )
+            try:
+                restore_cache(
+                    cache,
+                    boundary_snapshot,
+                    # Prefix-decoded cold entries intentionally omitted the
+                    # full-entry meta state.  Their recurrent metadata must come
+                    # from the selected boundary together with its state.  A
+                    # custom factory only changes how the target cache is made;
+                    # it must not suppress this boundary-specific metadata.
+                    restore_meta_state=(
+                        getattr(entry, "cache_snapshot_prefix_len", None) is not None
+                    ),
+                )
+            except (TypeError, ValueError) as exc:
+                _report_unfit_snapshot(exc)
+                self.last_miss_reason = CacheMissReason.SNAPSHOT_DESYNC.value
+                return None
             if _mnt is not None:
                 _mnt["recurrent_overwrite_s"] = (
                     time.perf_counter() - _overwrite_started

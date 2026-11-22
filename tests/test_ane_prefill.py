@@ -40,10 +40,17 @@ def _exact(mlp, x):
 def installed():
     import os
 
+    previous = os.environ.get("MTPLX_ANE_PREFILL")
     os.environ["MTPLX_ANE_PREFILL"] = "1"
     ap.install(None)
     yield
-    ap._STATE["disabled"] = False
+    # The patches stay installed for the process: later modules run (and read
+    # the prefill chunk defaults) with the split off.
+    ap._STATE["disabled"] = True
+    if previous is None:
+        os.environ.pop("MTPLX_ANE_PREFILL", None)
+    else:
+        os.environ["MTPLX_ANE_PREFILL"] = previous
 
 
 def test_split_is_close_to_the_gpu(installed):

@@ -12,7 +12,9 @@ block residuals, and the looped layers mix in messages from the previous pass.
 
 Changes against the mlx-lm port:
 
-* Text only. The vision tower's weights are dropped at load.
+* The vision tower (``model.visual.*``, ``mtplx.models.inkling2_vision``)
+  loads in BF16 unless ``MTPLX_INKLING2_VISION=0``; its weights are dropped
+  then. Image features replace the normalized embeddings of the image tokens.
 * The pinned MLX has no ``global_scale`` on ``gather_qmm``: the per-expert
   NVFP4 factor ``amax / outer_scale_denominator`` multiplies the expert
   outputs instead (``ExpertLinear``), which is the same product.
@@ -1907,6 +1909,23 @@ class Model(nn.Module):
         self.model = Inkling2Model(args)
         text = args.text
         self.lm_head = nn.Linear(text.hidden_size, text.vocab_size, bias=False)
+        if args.vision_config and _env_int("MTPLX_INKLING2_VISION", 1) == 1:
+            from .inkling2_vision import VisionArgs, VisionTower
+
+            self.vision_tower = VisionTower(
+                VisionArgs.from_dict(args.vision_config), text.hidden_size
+            )
+
+    def embed_tokens(self, inputs: mx.array) -> mx.array:
+        """The trunk's input rows for token ids (normalized embeddings): what
+        image features replace at the image tokens (mtplx.vision.splice)."""
+        return self.model.language_model.embed(inputs)
+
+    def encode_image(self, pixel_values: mx.array, image_grid_thw) -> mx.array:
+        """Image-token rows [rows * cols, hidden] for the processor's pixel blocks."""
+        if getattr(self, "vision_tower", None) is None:
+            raise ValueError("this Inkling 2 model was loaded without its vision tower")
+        return self.vision_tower(pixel_values, image_grid_thw)
 
     def __call__(
         self,
@@ -1935,6 +1954,8 @@ class Model(nn.Module):
         sanitized = {}
         for k, v in weights.items():
             if k.startswith("model.visual."):
+                if getattr(self, "vision_tower", None) is not None:
+                    sanitized["vision_tower." + k[len("model.visual.") :]] = v
                 continue
             if k.startswith("model.llm."):
                 k = _rename(k)
@@ -2022,6 +2043,8 @@ class Model(nn.Module):
         for path, module in self.named_modules():
             if not isinstance(module, (nn.Linear, nn.Embedding)):
                 continue
+            if path.startswith("vision_tower."):
+                continue
             if path.endswith(_PROJ_SUFFIXES):
                 bits = proj_bits
             elif path in ("lm_head", "model.language_model.embed_tokens"):
@@ -2050,6 +2073,10 @@ class Model(nn.Module):
     @property
     def cast_predicate(self):
         def predicate(k: str) -> bool:
+            # The vision tower stays BF16 (the reference's precision; it
+            # runs once per image, not per token).
+            if k.startswith("vision_tower."):
+                return False
             return not k.endswith(
                 (
                     ".query",

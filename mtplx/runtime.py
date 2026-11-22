@@ -86,6 +86,13 @@ def _preflight_laguna_system_memory(config: dict[str, Any]) -> None:
     )
 
 
+def _call_takes(model: Any, name: str) -> bool:
+    try:
+        return name in py_inspect.signature(model.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 @dataclass
 class MTPLXRuntime:
     model: Any
@@ -155,6 +162,10 @@ class MTPLXRuntime:
     def embed_tokens(self, input_ids):
         """Embed token ids with the text model's embedding table."""
 
+        if callable(getattr(type(self.model), "embed_tokens", None)):
+            # Models whose trunk input is not the raw table row (Inkling 2
+            # normalizes it) define the method themselves.
+            return self.model.embed_tokens(input_ids)
         text_model = getattr(self.model, "language_model", self.model)
         return text_model.model.embed_tokens(input_ids)
 
@@ -171,7 +182,14 @@ class MTPLXRuntime:
         self._count("forward_ar_hidden_calls" if return_hidden else "forward_ar_plain_calls")
         if not self.mtp_enabled and return_hidden:
             raise RuntimeError("return_hidden requires an MTP-patched runtime")
-        if input_embeddings is not None and not self.mtp_enabled:
+        # A plain model that takes input rows itself (Inkling 2) splices on
+        # the AR lane; it is called without the MTP wrapper's return_hidden.
+        own_embeddings = (
+            input_embeddings is not None
+            and not self.mtp_enabled
+            and _call_takes(self.model, "input_embeddings")
+        )
+        if input_embeddings is not None and not self.mtp_enabled and not own_embeddings:
             raise RuntimeError("vision splice requires the MTP-patched runtime")
         kwargs = {}
         if hidden_variant is not None:
@@ -222,6 +240,8 @@ class MTPLXRuntime:
                 return compiled(input_ids, cache)
             if not kwargs:
                 return self.model(input_ids, cache=cache)
+        if own_embeddings and not return_hidden:
+            return self.model(input_ids, cache=cache, **kwargs)
         return self.model(
             input_ids,
             cache=cache,
