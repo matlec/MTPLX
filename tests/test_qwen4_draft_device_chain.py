@@ -268,7 +268,8 @@ def _install(monkeypatch, *, predict=None):
 
 @pytest.mark.parametrize("seed", [0, 1, 2, 3, 4])
 def test_chain_is_token_identical_to_the_serial_sampled_lane(monkeypatch, seed):
-    monkeypatch.delenv("MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN", raising=False)
+    # Off explicitly: unset, it defaults on for M1 when the in-place append is built.
+    monkeypatch.setenv("MTPLX_QWEN4_SAMPLED_DRAFT_CHAIN", "0")
     baseline = _generate(seed)
     assert baseline.stats.sampled_draft_chain_status == "off"
     _install(monkeypatch)
