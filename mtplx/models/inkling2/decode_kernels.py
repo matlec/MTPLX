@@ -760,17 +760,65 @@ _ROUTER_SOURCE = """
 """
 
 
-_ROUTER_LOGITS_SOURCE = """
-    // One simdgroup per (row, expert): FP32 dot of the BF16 row with the
-    // (BF16-valued) router row.
+_ROUTER_SOURCE_1 = """
+    // Router logits and top-k in one launch. Each threadgroup computes 8
+    // expert logits (one simdgroup each) for one row; the threadgroup that
+    // finishes a row last (an atomic count per row) selects its top K.
     const uint lane = thread_index_in_simdgroup;
-    const uint e = thread_position_in_grid.x / 32;
-    const uint t = thread_position_in_grid.y;
-    if (e >= E) return;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint e = threadgroup_position_in_grid.x * 8 + sg;
+    const uint t = threadgroup_position_in_grid.y;
+    const uint ntg = threadgroups_per_grid.x;
     float acc = 0.0f;
     for (uint i = lane; i < H; i += 32) acc += float(x[(size_t)t * H + i]) * float(w[(size_t)e * H + i]);
     acc = simd_sum(acc);
-    if (lane == 0) logits[t * E + e] = acc;
+    // Atomic store / load: other threadgroups' plain writes need not be
+    // visible to the one that finishes last.
+    if (lane == 0) atomic_store_explicit((device atomic_float*)&logits[t * E + e], acc, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_device);
+    threadgroup uint last;
+    if (thread_position_in_threadgroup.x == 0) {
+        const uint done = atomic_fetch_add_explicit(
+            (device atomic_uint*)&count[t], 1u, memory_order_relaxed);
+        last = done == ntg - 1 ? 1u : 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!last || sg != 0) return;
+    constexpr uint PER = E / 32;
+    float sc[PER], key[PER];
+    for (uint j = 0; j < PER; ++j) {
+        const uint ex = lane + 32 * j;
+        const float lg = atomic_load_explicit((device atomic_float*)&logits[t * E + ex], memory_order_relaxed);
+        const float s = 1.0f / (1.0f + metal::exp(-lg));
+        sc[j] = s;
+        key[j] = s + bias[ex];
+    }
+    float picked[K];
+    uint chosen[K];
+    float total = 0.0f;
+    for (uint k = 0; k < K; ++k) {
+        float best = -INFINITY;
+        uint bj = 0;
+        for (uint j = 0; j < PER; ++j) {
+            if (key[j] > best) { best = key[j]; bj = j; }
+        }
+        const float top = simd_max(best);
+        const uint mine = (best == top) ? (lane + 32 * bj) : 0xFFFFFFFFu;
+        const uint win = simd_min(mine);
+        float s = (lane == win % 32) ? sc[win / 32] : 0.0f;
+        s = simd_sum(s);
+        if (lane == win % 32) key[win / 32] = -INFINITY;
+        picked[k] = s;
+        chosen[k] = win;
+        total += s;
+    }
+    if (lane == 0) {
+        const float nrm = route_scale[0] / (total + 1e-20f);
+        for (uint k = 0; k < K; ++k) {
+            inds[t * K + k] = chosen[k];
+            weights[t * K + k] = picked[k] * nrm;
+        }
+    }
 """
 
 
@@ -780,17 +828,26 @@ def route(moe, x: mx.array):
 
     tokens, hidden = x.shape
     experts = int(moe.router_weight.shape[0])
+    if experts % 32:
+        logits = x.astype(mx.float32) @ moe.router_weight.T
+        return K.route_topk(logits, moe.router_bias, moe.top_k, moe.route_scale)
     w = const(("router", id(moe)), lambda: moe.router_weight.astype(mx.bfloat16))
-    k = _kernel("mtplx_inkling2_step_router_logits", ["x", "w"], ["logits"], _ROUTER_LOGITS_SOURCE)
-    logits = k(
-        inputs=[x, w],
-        template=[("E", experts), ("H", hidden)],
+    k = _kernel(
+        "mtplx_inkling2_step_router_1",
+        ["x", "w", "bias", "route_scale"],
+        ["logits", "count", "inds", "weights"],
+        _ROUTER_SOURCE_1,
+    )
+    _, _, inds, weights = k(
+        inputs=[x, w, moe.router_bias, K._scalar(float(moe.route_scale))],
+        template=[("E", experts), ("H", hidden), ("K", moe.top_k)],
         grid=(experts * 32, tokens, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[(tokens, experts)],
-        output_dtypes=[mx.float32],
-    )[0]
-    return K.route_topk(logits, moe.router_bias, moe.top_k, moe.route_scale)
+        output_shapes=[(tokens, experts), (tokens,), (tokens, moe.top_k), (tokens, moe.top_k)],
+        output_dtypes=[mx.float32, mx.uint32, mx.uint32, mx.float32],
+        init_value=0,
+    )
+    return inds, weights
 
 
 # --------------------------------------------------------------------------
