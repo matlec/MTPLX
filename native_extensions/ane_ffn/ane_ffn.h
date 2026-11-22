@@ -3,6 +3,7 @@
 // mtplx/ane_prefill.py. Program layout adapted from Splash (runtime/ops/AneFfn.cpp, Apache-2.0).
 #pragma once
 #include <memory>
+#include <string>
 #include <vector>
 #include "ane_client.h"
 #include "mlx/ops.h"
@@ -13,6 +14,12 @@ namespace MTL { class Buffer; }
 
 namespace mtplx_ane {
 
+// MLX quantization modes the weight staging decodes (ids shared with the Metal kernels):
+// affine (code * scale + bias, scales/biases fp16), mxfp4 (e2m1 codes, e8m0 scales), nvfp4 (e2m1 codes,
+// e4m3 scales), mxfp8 (e4m3 codes, e8m0 scales). The fp modes carry no biases.
+enum class QuantMode : uint32_t { affine = 0, mxfp4 = 1, nvfp4 = 2, mxfp8 = 3 };
+QuantMode quant_mode(const std::string& name, int bits, int group);
+
 class AneFfn {
  public:
   AneFfn(int hidden, int channels, std::vector<int> rows, bool w8 = false);
@@ -22,11 +29,12 @@ class AneFfn {
   // Returns a 1-element array to evaluate before run().
   mx::array stage(const mx::array& xq, const mx::array& tx, const mx::array& wg, const mx::array& wu,
                   const mx::array& wd);
-  // Stages the ANE's channels from the packed affine weights directly: g/u/d are (w, scales, biases) of
+  // Stages the ANE's channels from the packed quantized weights directly: g/u/d are (w, scales, biases) of
   // gate/up [C, H] and down [H, C]; dequantized, rotated in 512-blocks and written in one kernel each.
+  // For the modes without biases, pass any array in the biases slot (it is not read).
   mx::array stage_weights_q(const std::vector<mx::array>& g, const std::vector<mx::array>& u,
                             const std::vector<mx::array>& d, int bits, int group,
-                            const std::vector<mx::array>& row_scales = {});
+                            const std::vector<mx::array>& row_scales = {}, const std::string& mode = "affine");
   // Rotates, quantizes and stages an fp16 input [R, 5120] in one kernel (replaces the MLX-side prep + stage_input).
   mx::array stage_x(const mx::array& x);
   // Stages only the input (weights kept from an earlier stage of the same layer).
@@ -62,6 +70,7 @@ class AneStage : public mx::Primitive {
   bool is_equivalent(const mx::Primitive&) const override { return false; }
   bool quantized_ = false, prep_x_ = false;
   int bits_ = 4, group_ = 32;
+  QuantMode mode_ = QuantMode::affine;
 
  private:
   AneFfn* ffn_;
@@ -76,10 +85,12 @@ class AneLinear {
   // independent weight sets share the one compiled program (one per layer keeps every layer's weights resident).
   AneLinear(int hidden, int out, std::vector<int> rows, int slots = 1);
   ~AneLinear();
-  // weights: (w, scales, biases) triples of packed affine rows; triple j lands at output row row_offsets[j] of
-  // weight slot `slot`. An empty list stages the input only (the slot's weights stay as last staged).
+  // weights: (w, scales, biases) triples of packed quantized rows (`mode` as for AneFfn::stage_weights_q);
+  // triple j lands at output row row_offsets[j] of weight slot `slot`. An empty list stages the input only
+  // (the slot's weights stay as last staged).
   mx::array stage(const mx::array& xq, const mx::array& tx, const std::vector<mx::array>& weights,
-                  const std::vector<int>& row_offsets, int bits, int group, int slot = 0);
+                  const std::vector<int>& row_offsets, int bits, int group, int slot = 0,
+                  const std::string& mode = "affine");
   int run(int rows, int slot = 0);
   int slots() const { return slots_; }
   mx::array output();  // [N, max_rows] fp16
@@ -97,8 +108,10 @@ class AneLinear {
 
 class AneLinStage : public mx::Primitive {
  public:
-  AneLinStage(mx::Stream s, AneLinear* lin, std::vector<int> offsets, int bits, int group, int slot = 0)
-      : mx::Primitive(s), lin_(lin), offsets_(std::move(offsets)), bits_(bits), group_(group), slot_(slot) {}
+  AneLinStage(mx::Stream s, AneLinear* lin, std::vector<int> offsets, int bits, int group, int slot = 0,
+              QuantMode mode = QuantMode::affine)
+      : mx::Primitive(s), lin_(lin), offsets_(std::move(offsets)), bits_(bits), group_(group), slot_(slot),
+        mode_(mode) {}
   void eval_cpu(const std::vector<mx::array>&, std::vector<mx::array>&) override;
   void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
   const char* name() const override { return "AneLinStage"; }
@@ -108,6 +121,7 @@ class AneLinStage : public mx::Primitive {
   AneLinear* lin_;
   std::vector<int> offsets_;
   int bits_, group_, slot_;
+  QuantMode mode_;
 };
 
 }  // namespace mtplx_ane

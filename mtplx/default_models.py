@@ -294,7 +294,7 @@ def _is_complete_local_model(path: Path) -> bool:
     has_weights = any(path.glob("model-*.safetensors")) or (path / "model.safetensors").is_file()
     has_mtp = any(
         (path / rel).is_file()
-        for rel in ("mtp.safetensors", "mtp/weights.safetensors", "model-mtp.safetensors")
+        for rel in ("mtp.safetensors", "mtp/weights.safetensors", "model-mtp.safetensors", "mtp/model.safetensors")
     )
     return has_weights and has_mtp
 

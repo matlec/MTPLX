@@ -770,6 +770,10 @@ def verify_shaped_qmm(x, w_q_in, scales, biases, *, bits, group_size):
         if (
             _m1_mma8_min_rows() <= m8 <= 8
             and x.dtype == mx.float16
+            # The kernel reads half scales/biases; a bf16 pack's take the lanes below.
+            and scales.dtype == mx.float16
+            and biases is not None
+            and biases.dtype == mx.float16
             and k8 % 128 == 0
             and n8 % 16 == 0
             and group_size in (32, 64, 128)
@@ -982,6 +986,9 @@ def install_nax_qlinear_patch() -> dict[str, object]:
             nax_qlinear_fallback_counts["exact_t0"] = (
                 nax_qlinear_fallback_counts.get("exact_t0", 0) + 1
             )
+            return original(self, x)
+        if getattr(self, "mode", "affine") != "affine":
+            # Every lane below decodes affine codes; mxfp4/nvfp4/mxfp8 run the stock qmm.
             return original(self, x)
         y = verify_shaped_qmm(
             x, self["weight"], self["scales"], self["biases"],

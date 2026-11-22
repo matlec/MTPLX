@@ -812,6 +812,11 @@ def _detach_exception_frames(exc: BaseException) -> BaseException:
     caches; queued as raised it kept 4.95 GB active after a refusal, and the
     retry met it (2026-10-01)."""
 
+    # The rendered traceback is text (no frames): kept for the operator's log.
+    try:
+        exc._mtplx_traceback_text = "".join(traceback.format_exception(exc))
+    except Exception:
+        pass
     seen: set[int] = set()
     pending: list[BaseException] = [exc]
     while pending:
@@ -20976,6 +20981,10 @@ def _http_exception_detail_payload(exc: HTTPException) -> dict[str, Any] | None:
 # Seconds between two per-chunk reads of the Mac's memory during a prefill.
 _PREFILL_SYSTEM_CHECK_INTERVAL_S = 0.2
 
+# The per-chunk lines whose arithmetic carries the next forward's reserve: a
+# narrower forward can clear them (_PrefillSystemGuard._narrow_chunk).
+_NARROWABLE_PREFILL_REASONS = frozenset({"under_abort_floor", "engine_limit"})
+
 
 def _generation_call_site(max_depth: int = 12) -> str | None:
     """``function:line`` of the generation frame that asked the per-chunk
@@ -21081,9 +21090,20 @@ class _PrefillSystemGuard:
         forward_rows_bytes: int | None = None,
         restore_bytes: int = 0,
         own_session_shed: Callable[[str], Mapping[str, Any] | None] | None = None,
+        narrower_chunk_reserves: Sequence[tuple[int, int]] = (),
     ) -> None:
         self.state = state
         self.chunk_reserve_bytes = max(0, int(chunk_reserve_bytes))
+        # The narrower forwards this request may fall back to, widest first
+        # (width, reserve), and the width it was narrowed to: the prefill
+        # loops cut their remaining spans to ``chunk_cap``
+        # (generation._capped_prefill_spans).
+        self.narrower_chunk_reserves = sorted(
+            ((int(w), max(0, int(r))) for w, r in narrower_chunk_reserves),
+            reverse=True,
+        )
+        self.chunk_cap: int | None = None
+        self.narrowed: dict[str, Any] | None = None
         self.tokens_done: int | None = None
         # The closest the engine came to its line (scalars only).
         self.engine_margin_min: dict[str, Any] | None = None
@@ -21197,8 +21217,19 @@ class _PrefillSystemGuard:
             # same prompt: 2.26 GB released against a 1.29 GB target, the
             # floor still missed with 9.1 GB banked), so the same check
             # sheds again while rounds still free memory.
+            overhang_before = verdict["fields"].get("host_overhang_bytes")
+            if overhang_before is None:
+                overhang_before = _host_overhang_bytes_now()
             receipt = self._shed_reusable_memory(verdict)
             if receipt.get("released_bytes") or receipt.get("pool_bytes"):
+                # What the shed gave back reaches the Mac's free pages only
+                # once the kernel takes it (_await_footprint_release): read at
+                # once, a 16-token Pi turn on a 78K conversation was aborted
+                # with 5.3 GiB just released and free pages still at 0.6 GiB
+                # (2026-10-28).
+                waited = _await_footprint_release(overhang_before)
+                if waited is not None:
+                    receipt["footprint_release_wait_s"] = round(waited, 3)
                 verdict = self._evaluate()
             receipt["request_continued"] = verdict["reason"] is None
             receipt["reason_before"] = receipt.pop("_reason_before", None)
@@ -21218,6 +21249,8 @@ class _PrefillSystemGuard:
                 )
             except Exception:
                 pass
+        if verdict["reason"] in _NARROWABLE_PREFILL_REASONS:
+            verdict = self._narrow_chunk(verdict)
         if verdict["reason"] is None:
             return False
         reading = verdict["reading"]
@@ -21249,13 +21282,64 @@ class _PrefillSystemGuard:
             ),
             "checks": int(self.checks),
             "shed_before_abort": dict(self.shed) if self.shed is not None else None,
+            "narrowed": dict(self.narrowed) if self.narrowed is not None else None,
         }
         return True
 
-    def _evaluate(self) -> dict[str, Any]:
-        """Read the engine and the Mac once and name the line crossed, if any."""
+    def _narrow_chunk(self, verdict: dict[str, Any]) -> dict[str, Any]:
+        """Run the rest of the prefill at the widest narrower chunk that fits
+        instead of stopping it, when the line crossed is one the chunk's own
+        reserve decides. A 58K pi turn (2026-10-28) was stopped with 3.5 GiB
+        free and reclaimable after the shed, against a 2,048-row chunk priced
+        at 2.4 GiB and a 2.3 GiB floor; a 512-row chunk fit. Returns the
+        verdict at the width chosen, or the one it was given."""
 
-        reserve = self.chunk_reserve_bytes
+        if self.prefill_done_by is not None:
+            return verdict
+        for width, reserve in self.narrower_chunk_reserves:
+            if self.chunk_cap is not None and width >= self.chunk_cap:
+                continue
+            if reserve >= self.chunk_reserve_bytes:
+                continue
+            candidate = self._evaluate(reserve=reserve)
+            if candidate["reason"] is not None:
+                if candidate["reason"] not in _NARROWABLE_PREFILL_REASONS:
+                    return candidate
+                continue
+            self.narrowed = {
+                "action": "prefill_chunk_narrowed",
+                "reason_before": verdict["reason"],
+                "chunk_tokens_before": self.chunk_cap,
+                "chunk_tokens": int(width),
+                "chunk_reserve_bytes_before": int(self.chunk_reserve_bytes),
+                "chunk_reserve_bytes": int(reserve),
+                "tokens_done": self.tokens_done,
+                "system_available_bytes": (
+                    int(candidate["reading"].available_bytes)
+                    if candidate["reading"] is not None
+                    else None
+                ),
+                "abort_floor_bytes": candidate["abort_floor"],
+                "engine_bytes": candidate["engine"],
+            }
+            self.chunk_cap = int(width)
+            self.chunk_reserve_bytes = int(reserve)
+            _record_guard_event(self.state, dict(self.narrowed))
+            try:
+                print(
+                    "[mtplx] memory guard " + json.dumps(self.narrowed, default=str),
+                    flush=True,
+                )
+            except Exception:
+                pass
+            return candidate
+        return verdict
+
+    def _evaluate(self, reserve: int | None = None) -> dict[str, Any]:
+        """Read the engine and the Mac once and name the line crossed, if any
+        (with ``reserve`` in place of the chunk's when given)."""
+
+        reserve = self.chunk_reserve_bytes if reserve is None else int(reserve)
         stats = _mlx_memory_stats_live()
         failure = _allocator_reading_failure(stats)
         # Without the allocator's account the engine line cannot run; the
@@ -21631,6 +21715,44 @@ def _prefill_chunk_reserve_bytes(
     )
 
 
+def _prefill_narrower_chunk_reserves(
+    state: Any,
+    *,
+    prompt_tokens: int,
+    chunk_tokens: int | None,
+    priced: Mapping[str, Any] | None = None,
+) -> list[tuple[int, int]]:
+    """(width, reserve) for each narrower chunk the per-chunk check may fall
+    back to mid-prefill, widest first: the admission's own narrow rungs
+    (``_admission_narrow_widths``) below the width the request runs, each
+    priced as the admission prices a forward. Empty for a family that keeps
+    its own widths, a prompt forwarded whole, or when pricing fails."""
+
+    runtime = getattr(state, "runtime", None)
+    prompt_tokens = max(1, int(prompt_tokens))
+    width: int | None = None
+    if isinstance(priced, Mapping) and priced.get("prefill_chunk_tokens") is not None:
+        width = int(priced["prefill_chunk_tokens"])
+    else:
+        width = _admission_prefill_widths(runtime, prompt_tokens, chunk_tokens)[0]
+    if width is None:
+        return []
+    new_tokens = prompt_tokens
+    if isinstance(priced, Mapping) and priced.get("miss_tokens") is not None:
+        new_tokens = max(1, int(priced["miss_tokens"]))
+    out: list[tuple[int, int]] = []
+    for narrow in _admission_narrow_widths(runtime, [width]):
+        bill = _prefill_forward_bill(
+            state,
+            new_tokens=new_tokens,
+            width=narrow,
+            prompt_tokens=prompt_tokens,
+            geometry=_admission_geometry(state, prefill_width=narrow),
+        )
+        out.append((int(narrow), int(bill["chunk_bytes"])))
+    return out
+
+
 def _prefill_after_forward_plan(
     state: Any,
     *,
@@ -21945,6 +22067,76 @@ def _footprint_floor(
     fields["host_allowance_bytes"] = int(allowance)
     fields["host_overhang_charged_bytes"] = int(charged)
     return int(allocator_bytes) + int(charged), fields
+
+
+# Memory MLX hands back (arrays freed, then clear_cache) leaves the process
+# footprint, and reaches the Mac's free pages, asynchronously: ~0.2 s for
+# 2 GiB on an M1 Max (2026-10-27), mx.synchronize() or not. Measured straight
+# after reclamation, the freed bytes read as host memory outside MLX and the
+# Mac as no freer: an 81,862-token Pi prompt gave back 4.9 GiB, the
+# footprint had dropped 0.5 GiB, and it was refused 0.3 GiB short.
+_FOOTPRINT_RELEASE_TIMEOUT_S = 2.0
+_FOOTPRINT_RELEASE_POLL_S = 0.02
+_FOOTPRINT_RELEASE_SLACK_BYTES = 64 << 20
+
+
+def _footprint_release_timeout_s() -> float:
+    raw = os.environ.get("MTPLX_FOOTPRINT_RELEASE_WAIT_S", "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return _FOOTPRINT_RELEASE_TIMEOUT_S
+
+
+def _host_overhang_bytes_now() -> int | None:
+    """This process's footprint past MLX's account (active + cache) now, or
+    None when the footprint cannot be read."""
+
+    try:
+        import mlx.core as _mx
+
+        footprint = phys_footprint_bytes()
+        if not footprint:
+            return None
+        return max(
+            0, int(footprint) - int(_mx.get_active_memory()) - int(_mx.get_cache_memory())
+        )
+    except Exception:
+        return None
+
+
+def _await_footprint_release(host_overhang_bytes: int | None) -> float | None:
+    """Wait, bounded, until this process's footprint is back within
+    ``host_overhang_bytes`` (the overhang read before memory was given back)
+    of MLX's account. Returns the seconds waited, or None when nothing was
+    pending or the footprint cannot be read."""
+
+    if host_overhang_bytes is None:
+        return None
+    timeout = _footprint_release_timeout_s()
+    if timeout <= 0:
+        return None
+    try:
+        import mlx.core as _mx
+    except Exception:
+        return None
+    target = int(host_overhang_bytes) + _FOOTPRINT_RELEASE_SLACK_BYTES
+    start = time.monotonic()
+    waited = False
+    while True:
+        footprint = phys_footprint_bytes()
+        if not footprint:
+            return None
+        allocator = int(_mx.get_active_memory()) + int(_mx.get_cache_memory())
+        elapsed = time.monotonic() - start
+        if int(footprint) - allocator <= target:
+            return elapsed if waited else None
+        if elapsed >= timeout:
+            return elapsed
+        waited = True
+        time.sleep(_FOOTPRINT_RELEASE_POLL_S)
 
 
 def _prefill_admission_shed_enabled() -> bool:
@@ -23792,6 +23984,11 @@ def _run_prefill_admission(
     if limit <= 0:
         return None
     allow_swap = bool(getattr(state, "allow_swap", False))
+    # The overhang read before anything is given back: what reclamation
+    # frees is waited out of the footprint (_await_footprint_release) before
+    # the next reading.
+    release_baseline: dict[str, Any] = {}
+    release_waits: list[float] = []
 
     def measure() -> dict[str, Any]:
         # #456 / two kernel panics: active + cache is MLX's own account and
@@ -23802,6 +23999,10 @@ def _run_prefill_admission(
         # growth reuses them, so counting the pool as a need only cleared a
         # warm allocator for nothing. The Mac is read again as well: what
         # the engine gives back lands in the free pages.
+        if "overhang" in release_baseline:
+            waited = _await_footprint_release(release_baseline["overhang"])
+            if waited is not None:
+                release_waits.append(waited)
         stats = _mlx_memory_stats_live()
         failure = _allocator_reading_failure(stats)
         if failure is not None:
@@ -23826,6 +24027,7 @@ def _run_prefill_admission(
     now = measure()
     if now["active"] <= 0:
         return None
+    release_baseline["overhang"] = now["fields"].get("host_overhang_bytes")
     geometry = _admission_geometry(state)
     threshold = int(limit * _PREFILL_ADMISSION_PRESSURE_FRACTION)
     runtime = getattr(state, "runtime", None)
@@ -24754,6 +24956,8 @@ def _run_prefill_admission(
     receipt["prefill_chunk_tokens"] = chosen
     receipt["growth"] = dict(current)
     receipt["reclamation_steps"] = steps
+    if release_waits:
+        receipt["footprint_release_wait_s"] = round(sum(release_waits), 3)
     if session_bank is not None:
         try:
             receipt["bank_bytes_after"] = int(session_bank.total_nbytes)
@@ -27477,6 +27681,12 @@ def _bank_history_policy(state: "ServerState") -> str:
     return bank_history_policy_family()
 
 
+def _fp16_body_fingerprint() -> str:
+    from mtplx.fp16_body import fingerprint
+
+    return fingerprint()
+
+
 def _policy_fingerprint(
     state: ServerState,
     *,
@@ -27521,6 +27731,9 @@ def _policy_fingerprint(
         _reasoning_history_fingerprint_component(state),
         f"openai_bridge={_OPENAI_BRIDGE_POLICY_VERSION}",
         f"tool_prompt_mode={effective_tool_prompt_mode}",
+        # A bf16 pack served as fp16 (mtplx/fp16_body.py) banks fp16 state; a
+        # restart with MTPLX_M1_FP16_BODY=0 must not restore it, nor the reverse.
+        _fp16_body_fingerprint(),
         # Per-request steering that rides a TRANSIENT TRAILING user turn --
         # forced tool_choice, the post-tool answer contract, the read-only
         # force-answer contract, the Pi convergence contract -- is excluded
@@ -32632,6 +32845,12 @@ def _run_generation(
                 if _pressure_abort_requested(state):
                     return True
                 return prefill_system_guard()
+
+            # The width the check narrowed the rest of the prefill to, read
+            # by the prefill loops (generation._capped_prefill_spans).
+            _prefill_abort_check.prefill_chunk_cap = (  # type: ignore[attr-defined]
+                lambda: prefill_system_guard.chunk_cap
+            )
 
             # The generation's prefill progress also tells the per-chunk
             # check when the forwards are done.
@@ -41901,6 +42120,19 @@ def create_app(state: ServerState) -> FastAPI:
                         message = str(exc)
                         status_code = 500
                         error_code = type(exc).__name__
+                        # The client only gets str(exc); keep the traceback for
+                        # the operator (an int(None) after a pi compaction
+                        # reached the client and left nothing in the log).
+                        # Queued errors arrive detached from their frames
+                        # (_detach_exception_frames), with the text kept.
+                        logging.getLogger("mtplx.server").error(
+                            "stream request %s failed: %s: %s\n%s",
+                            response_id,
+                            type(exc).__name__,
+                            exc,
+                            getattr(exc, "_mtplx_traceback_text", None)
+                            or "".join(traceback.format_exception(exc)),
+                        )
                     payload = {
                         "id": response_id,
                         "object": "chat.completion.chunk",

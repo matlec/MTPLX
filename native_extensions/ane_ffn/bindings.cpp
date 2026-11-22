@@ -14,7 +14,7 @@ NB_MODULE(_ext, m) {
       .def(nb::init<int, int, std::vector<int>, bool>(), "hidden"_a, "channels"_a, "rows"_a, "w8"_a = false)
       .def("stage", &mtplx_ane::AneFfn::stage, "xq"_a, "tx"_a, "wg"_a, "wu"_a, "wd"_a)
       .def("stage_weights_q", &mtplx_ane::AneFfn::stage_weights_q, "g"_a, "u"_a, "d"_a, "bits"_a, "group"_a,
-           "row_scales"_a = std::vector<mx::array>{})
+           "row_scales"_a = std::vector<mx::array>{}, "mode"_a = "affine")
       .def("stage_input", &mtplx_ane::AneFfn::stage_input, "xq"_a, "tx"_a)
       .def("stage_x", &mtplx_ane::AneFfn::stage_x, "x"_a)
       .def("run", &mtplx_ane::AneFfn::run, "rows"_a, nb::call_guard<nb::gil_scoped_release>())
@@ -24,7 +24,7 @@ NB_MODULE(_ext, m) {
   nb::class_<mtplx_ane::AneLinear>(m, "AneLinear")
       .def(nb::init<int, int, std::vector<int>, int>(), "hidden"_a, "out"_a, "rows"_a, "slots"_a = 1)
       .def("stage", &mtplx_ane::AneLinear::stage, "xq"_a, "tx"_a, "weights"_a, "row_offsets"_a, "bits"_a, "group"_a,
-           "slot"_a = 0)
+           "slot"_a = 0, "mode"_a = "affine")
       .def("run", &mtplx_ane::AneLinear::run, "rows"_a, "slot"_a = 0, nb::call_guard<nb::gil_scoped_release>())
       .def_prop_ro("slots", &mtplx_ane::AneLinear::slots)
       .def("output", &mtplx_ane::AneLinear::output)
