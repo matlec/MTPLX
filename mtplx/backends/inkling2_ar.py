@@ -216,24 +216,50 @@ class PromptCache:
         self.entries: list[tuple[tuple[int, ...], Any]] = []
 
     def lookup(self, prompt_ids: list[int]):
+        """Longest entry ``(tokens, cache, logits)`` that is a prefix of the
+        prompt. A whole-prompt match needs the stored next-token logits."""
         best = None
         for entry in self.entries:
             tokens = entry[0]
             n = len(tokens)
-            # At least one prompt token must run to produce the next logits.
-            if n >= len(prompt_ids) or (best is not None and n <= len(best[0])):
+            if n > len(prompt_ids) or (n == len(prompt_ids) and entry[2] is None):
+                continue
+            if best is not None and n <= len(best[0]):
                 continue
             if tuple(prompt_ids[:n]) == tokens:
                 best = entry
         if best is not None:
             self.entries.remove(best)
             self.entries.append(best)
+        elif self.entries and os.environ.get("MTPLX_INKLING2_TRACE"):
+            import sys
+
+            def lcp(a, b):
+                n = 0
+                for x, y in zip(a, b):
+                    if x != y:
+                        break
+                    n += 1
+                return n
+
+            best_e = max(self.entries, key=lambda e: lcp(prompt_ids, e[0]))
+            common = lcp(prompt_ids, best_e[0])
+            print(
+                f"[inkling2] prompt cache miss: longest shared prefix {common} of "
+                f"{len(prompt_ids)} tokens; entries {[len(e[0]) for e in self.entries]}; "
+                f"new {list(prompt_ids[max(0, common - 3) : common + 3])} "
+                f"cached {list(best_e[0][max(0, common - 3) : common + 3])}",
+                file=sys.stderr,
+                flush=True,
+            )
         return best
 
-    def store(self, tokens: list[int], cache) -> None:
+    def store(self, tokens: list[int], cache, logits=None) -> None:
+        """``logits``: the next-token logits after ``tokens`` ([1, V]), so an
+        identical prompt (a regenerate) needs no forward at all."""
         key = tuple(int(t) for t in tokens)
         self.entries = [e for e in self.entries if e[0] != key]
-        self.entries.append((key, cache.snapshot()))
+        self.entries.append((key, cache.snapshot(), logits))
         while len(self.entries) > self.max_entries or (
             len(self.entries) > 1 and sum(e[1].nbytes() for e in self.entries) > self.max_bytes
         ):
@@ -263,6 +289,8 @@ def _prefill(runtime, prompt_ids, prefill_callback, abort_check, chunk: int = 40
         cached = len(hit[0])
         step_cache = hit[1].snapshot()
         suffix = prompt_ids[cached:]
+        if not suffix:
+            return step_cache, hit[2], dstate, time.perf_counter() - started, cached
         if len(suffix) <= _ENGINE_SUFFIX_TOKENS:
             logits = None
             for i in range(0, len(suffix), MAX_STEP_TOKENS):
@@ -367,7 +395,7 @@ def generate_inkling2_ar(
     )
     prompt_cache = getattr(runtime, "prompt_cache", None)
     if prompt_cache is not None and dstate is None:
-        prompt_cache.store(prompt_ids, cache)
+        prompt_cache.store(prompt_ids, cache, logits)
     if prefill_callback is not None:
         try:
             prefill_callback(
@@ -438,6 +466,7 @@ def generate_inkling2_ar(
         if counts is not None:
             counts = counts.at[pending].add(1.0)
         lg, _ = engine.step(cache, pending)
+        last_logits = lg[-1:]
         steps += 1
         nxt = _sample_lazy(mx, lg[-1:], sampler, counts)
         mx.async_eval(nxt)
@@ -457,7 +486,7 @@ def generate_inkling2_ar(
             flush=True,
         )
     if prompt_cache is not None and dstate is None and cache.offset == len(prompt_ids) + len(generated):
-        prompt_cache.store(list(prompt_ids) + generated, cache)
+        prompt_cache.store(list(prompt_ids) + generated, cache, last_logits)
     elapsed = time.perf_counter() - started_all
     text_tokens = list(wire)
     stats = GenerationStats(
